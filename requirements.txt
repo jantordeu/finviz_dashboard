@@ -1,0 +1,19 @@
+# Finviz Dashboard — bibliothèques Python nécessaires
+# Installation : pip install -r requirements.txt
+# Lancement    : streamlit run finviz_dashboard.py
+
+# Interface et calculs
+streamlit>=1.66.0
+pandas>=2.0
+
+# Lecture des pages web (Finviz, OpenInsider, Dataroma, pages Zonebourse enregistrées)
+beautifulsoup4>=4.12
+cloudscraper>=1.2.71
+requests>=2.31
+
+# Lecture du fichier de positions Excel (.xlsx)
+openpyxl>=3.1
+python-calamine>=0.2
+
+# Sentiment des actualités (onglet « Sentiment »)
+vaderSentiment>=3.3
