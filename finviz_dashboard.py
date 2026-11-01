@@ -723,6 +723,11 @@ def build_facts(raw):
         f["dcfx"] = dcfx_from_finviz(IA, BA, CA, sn)
     except Exception:
         f["dcfx"] = None
+    if f["dcfx"] and cash_unrepresentative(f, IA, CA, g):
+        # flux d'exploitation faussés (créances cédées classées en investissement, appels de marge…) : le DCF
+        # repart du résultat d'exploitation (NOPAT + amortissements − investissements), BFR standard
+        f["dcfx"] = dict(f["dcfx"], ocf0=None, ocf_hist=[], nwc_k=0.05,
+                         src=f["dcfx"]["src"] + ", flux reconstruits depuis le résultat")
     f["sbc"] = stmt(IA, "Stock Option Compensation Expense") or 0.0
     f["cfo"], f["capex"] = stmt(CA, "Cash from Operating Activities"), abs(stmt(CA, "Capital Expenditures") or 0)
     f["fcf_hist"] = [x for x in (stmt(CA, "Free Cash Flow", i) for i in range(4)) if x is not None]
@@ -732,6 +737,7 @@ def build_facts(raw):
         f["capex"] = None
         if not f["fcf_hist"] and g("P/FCF"):
             f["fcf_hist"] = [f["mcap"] / g("P/FCF")]
+    f["cash_unrep"] = cash_unrepresentative(f, IA, CA, g)
     if f["rev"] is None and g("Sales"):
         f["rev"] = g("Sales") / 1e6
     if f["ebitda"] is None and f["ev"] and g("EV/EBITDA"):
@@ -1062,6 +1068,24 @@ def _med(xs):
         return None
     n = len(xs)
     return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+def cash_unrepresentative(f, IA, CA, g=None):
+    """Société rentable dont les flux de trésorerie publiés ne reflètent pas l'activité (ex. Constellation : créances
+    cédées encaissées en « investissement », appels de marge) : flux d'exploitation des 3 derniers exercices
+    < 40 % de (résultat + amortissements) ; fiche seule : flux libre des 12 derniers mois < 30 % du résultat."""
+    if f.get("bank"):
+        return False
+    if CA and IA:
+        cfo = [stmt(CA, "Cash from Operating Activities", i) for i in (1, 2, 3)]
+        ni = [stmt(IA, "Net Income", i) for i in (1, 2, 3)]
+        da = [stmt(CA, "Depreciation", i) or 0.0 for i in (1, 2, 3)]
+        if None in cfo or None in ni or sum(ni) <= 0:
+            return False
+        return sum(cfo) < 0.4 * (sum(ni) + sum(da))
+    earn = (f.get("eps_ttm") or 0) * (f.get("shares") or 0)
+    fcf0 = (f.get("fcf_hist") or [None])[0]
+    return bool(earn > 0 and fcf0 is not None and fcf0 < 0.3 * earn)
 
 
 def dcfx_from_finviz(IA, BA, CA, sn):
@@ -1461,6 +1485,10 @@ def fair_value(f, p):
                             f"an 1 {res['g_rev'] * 100:.0f} %, 3 scénarios 25/50/25, valeur terminale moyenne croissance "
                             f"perpétuelle {res['tg'] * 100:.1f} % / multiple de sortie {res['exit_mult']:.1f}x EBITDA ; "
                             f"fourchette P10–P90 de 2 000 simulations")
+        if f.get("cash_unrep"):
+            out["notes"].append("⚠️ flux de trésorerie publiés non représentatifs (flux d'exploitation des 3 derniers "
+                                "exercices < 40 % du résultat + amortissements) : flux du DCF reconstruits depuis le "
+                                "résultat d'exploitation, P/FCF exclu des comparables")
         if asset_light(f["dcfx"]):
             out["notes"].append(f"amortissements ({f['dcfx']['da_pct'] * 100:.1f} % du CA) surtout d'incorporels "
                                 f"rachetés : investissements d'entretien = investissements réels "
@@ -1468,6 +1496,10 @@ def fair_value(f, p):
         if res.get("gap_tv") and res["gap_tv"] > 0.3:
             out["notes"].append(f"⚠️ valeurs terminales divergentes ({res['gap_tv'] * 100:.0f} %) : hypothèses à vérifier")
     hist = [] if res else f["fcf_hist"]
+    if hist and f.get("cash_unrep"):
+        out["notes"].append("⚠️ flux de trésorerie publiés non représentatifs de l'activité (flux libre très inférieur "
+                            "au résultat) : pas de DCF sur le flux libre, ni de P/FCF dans les comparables")
+        hist = []
     if hist:
         fcf = min(hist[0], sum(hist) / len(hist)) if f["cyclical"] else hist[0]   # cyclique : jamais au-dessus du flux actuel
         if f["cyclical"]:
@@ -1535,7 +1567,7 @@ def fair_value(f, p):
                 pe_i = min(pe_i, p["pe_cyc"] * 1.25)
             parts.append(eps * pe_i)
         fcf_ps = (f["fcf_hist"][0] - (f["sbc"] if p["sbc"] else 0)) / f["shares"] if f["fcf_hist"] and f["shares"] else None
-        if fcf_ps and fcf_ps > 0 and im.get("pfcf") and not f["cyclical"]:
+        if fcf_ps and fcf_ps > 0 and im.get("pfcf") and not f["cyclical"] and not f.get("cash_unrep"):
             parts.append(fcf_ps * clamp(im["pfcf"], 8.0, 25.0))
         if parts:
             c = sum(parts) / len(parts)
