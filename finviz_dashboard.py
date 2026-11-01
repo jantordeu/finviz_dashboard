@@ -498,6 +498,12 @@ def raws_from_finviz_pages(pages):
     return raws
 
 
+# industries Zonebourse cycliques par nature (semi-conducteurs, matériel/mémoire, auto, pétrole, matériaux…) :
+# pas d'exception « redressement durable » même si le consensus reste haussier
+CYCLICAL_ZB = re.compile(r"materiel-informatique|semi|automobile|combustible-fossile|materiaux|chimi|metau|mine|"
+                         r"mineraux|acier|papier|maritime|transport-aerien")
+
+
 def num_fr(v):
     """Nombre au format français de Zonebourse : '28 905' ; '-612,8' ; '1,19x' ; '12,4 %'."""
     if v is None:
@@ -674,6 +680,18 @@ def parse_zonebourse(htmls, name=""):
     hist_eps = [bna[y] for y in act[-6:] if bna.get(y) is not None]
     relapse = any(a_ > 0 and b_ < 0 for i_, a_ in enumerate(hist_eps) for b_ in hist_eps[i_ + 1:])
     f["cyclical"] = bool((f["eps_this_y_pct"] or 0) > 150 or relapse) and not f["bank"]
+    # exception : redressement / croissance durable — le consensus prévoit encore un BNA en hausse ≥ 10 % par an en
+    # N+1 et N+2, une marge d'EBITDA qui progresse jusqu'en N+2 et un CA en croissance ≥ 5 % par an (un pic de cycle
+    # se lit au contraire par un BNA qui plafonne ou recule après N)
+    mg = [g(eb, y) / g(ca, y) if g(eb, y) is not None and g(ca, y) else None for y in (N, N + 1, N + 2)]
+    sec_m = re.search(r"/secteurs/([a-z0-9\-]+/[a-z0-9\-]+)/", "".join(htmls))
+    f["zb_sector"] = sec_m.group(1) if sec_m else ""
+    f["turnaround"] = bool(
+        f["cyclical"] and not CYCLICAL_ZB.search(f["zb_sector"]) and e0 and e1 and e2 and e0 > 0 and e1 >= 1.10 * e0 and e2 >= 1.10 * e1
+        and None not in mg and mg[0] < mg[1] < mg[2]
+        and g(ca, N) and g(ca, N + 2) and (g(ca, N + 2) / g(ca, N)) ** 0.5 - 1 >= 0.05)
+    if f["turnaround"]:
+        f["cyclical"] = False
     # croissance du CA (dernier exercice publié -> N+2) : plafonne la croissance du DCF
     c2 = g(ca, N + 2) or g(ca, N + 1)
     f["sales_cagr"] = ((c2 / g(ca, L)) ** (1 / (3 if g(ca, N + 2) else 2)) - 1) * 100 if c2 and g(ca, L) else None
@@ -1454,6 +1472,9 @@ def fair_value(f, p):
     if capped:
         out["notes"].append(f"croissance du BNA ramenée à {g5:.0f} % (CA + 10 points ; consensus 5 ans "
                             f"{f['eps_5y']:.0f} %)")
+    if f.get("turnaround") and not f.get("cyclical"):
+        out["notes"].append("redressement durable : bond du BNA mais consensus encore en hausse en N+1 et N+2 (marges et CA "
+                            "en progression) → non classée cyclique (correction possible dans « Forcer le classement cyclique »)")
     if f.get("low_fpe"):
         out["notes"].append(f"PER prévisionnel {f['fwd_pe']:.1f} < 7 : bénéfices traités comme un haut de cycle")
     # --- 1. DCF d'entreprise (états financiers disponibles) : méthode centrale ---
@@ -3293,7 +3314,11 @@ risque + 1,5 point, impôt 25 %) mais n'entre pas dans le calcul.
 complété d'un vocabulaire financier (upgrade, beat, downgrade, miss…) ; mentions Reddit via ApeWisdom (gratuit, sans clé).
 C'est un indicateur d'ambiance, pas un signal d'achat : à croiser avec la juste valeur.
 
-**Cyclique** : croissance du BNA de l'année > 150 % (bénéfices probablement proches d'un pic).
+**Cyclique** : croissance du BNA de l'année > 150 % (bénéfices probablement proches d'un pic), ou retour à la perte
+après un exercice bénéficiaire. Exception (pages Zonebourse) : **redressement durable** si le consensus prévoit encore un
+BNA en hausse d'au moins 10 % par an en N+1 et N+2, une marge d'EBITDA en progression et un CA en hausse d'au moins 5 % par
+an — un pic de cycle se lit au contraire par un BNA qui plafonne ou recule. L'exception ne s'applique pas aux industries
+cycliques par nature (semi-conducteurs et matériel informatique, automobile, pétrole et gaz, matériaux, chimie, mines).
 Une valeur cyclique est valorisée sur un flux normalisé et 8x le BNA N+1, et ses scénarios supposent un plateau en N+2.
 
 **Initiés** : signal 🟢🟢 = achats groupés (au moins 2 dirigeants en 30 jours) ou achats du PDG / directeur financier (≥ 0,25 M$) ;
