@@ -1,30 +1,49 @@
 # ============================================================
-#  Finviz Dashboard — portefeuille US (Streamlit)
+#  Finviz Dashboard — portefeuille US et valeurs à étudier (Streamlit)
 #
-#  Installation : pip install streamlit pandas beautifulsoup4 cloudscraper openpyxl python-calamine
+#  Installation : pip install -r requirements.txt
 #  Lancement    : streamlit run finviz_dashboard.py
 #
-#  Sources (en ligne) :
-#   - finviz.com : fiche (ratios, consensus, analystes, initiés), états financiers (API JSON),
-#                  chaîne d'options (rapport Put/Call sur plusieurs échéances)
+#  Sources :
+#   - finviz.com (en ligne) : fiche (ratios, consensus, analystes, initiés, actualités), états financiers
+#     (API JSON), chaîne d'options, sociétés comparables, multiples d'industrie, screener
 #   - openinsider.com : achats / ventes des dirigeants sur 12 mois (formulaires 4 SEC)
 #   - dataroma.com : positions et mouvements des « super investors » (13F, trimestriels)
-#  Les pages récupérées sont mises en cache dans ./cache_finviz (valables 2 h). Le fichier de positions
-#  n'est jamais mis en cache : il reste dans la session du navigateur.
+#   - apewisdom.io : actions les plus citées sur Reddit (24 h)
+#   - Zonebourse : uniquement des pages enregistrées (Cmd+S) et déposées par l'utilisateur
+#     (Prévisions/Finances + Valorisation) : consensus sur 3 ans, PER historique, objectif
+#  Cache : ./cache_finviz (2 h) + pages HTML en mémoire ; case « Utiliser le cache » et bouton
+#  « Vider le cache ». Le fichier de positions n'est jamais mis en cache.
 #
-#  Onglet « Valeurs à étudier » : glisser-déposer de pages enregistrées (Cmd+S) Finviz (fiche, options)
-#  ou Zonebourse (onglet Finances) pour évaluer des actions avant achat.
+#  Onglets :
+#   - Portefeuille : valeurs en USD du fichier de positions (+ tickers ajoutés), combinées avec les
+#     pages Zonebourse déposées pour la même valeur (📄)
+#   - Valeurs à étudier : pages Finviz / Zonebourse déposées (doublons ignorés) + valeurs envoyées par
+#     le Screener JV ; prix d'entrée si la valeur est en portefeuille
+#   - Sentiment : ton des actualités (VADER + lexique financier), rang Reddit
+#   - Sentiment screener : actions les plus citées sur Reddit à l'actualité positive
+#   - Screener JV : lecture d'un screener Finviz, exclusion d'industries, juste valeur rapide,
+#     envoi en analyse complète
+#   - Screener initiés : superinvestors (Dataroma) × achats des dirigeants (OpenInsider), sentiment des
+#     initiés comparé, exports ; modules analyse.py, openinsider.py, dataroma_scraper.py, exports.py
+#     dans le même dossier
+#   - Méthode : explication des calculs
 #
-#  Pour chaque valeur US du fichier de positions (symboles :xnys / :xnas) :
-#   1. Juste valeur : DCF sur flux de trésorerie libre (après rémunération en actions)
-#      + PER cible lié à la croissance ; fourchette basse / centrale / haute
-#   2. Initiés (Finviz) et super investors (Dataroma)
-#   3. Recommandations des analystes
-#   4. Rapport Put/Call (encours et volumes, toutes échéances jusqu'à N jours)
-#   5. Scénarios pessimiste / central / optimiste : BNA, EBITDA, capex, dette nette
+#  Juste valeur :
+#   - DCF d'entreprise (FCFF sur 10 ans, CMPC avec bêta ajusté, valeur terminale = moyenne croissance
+#     perpétuelle / multiple de sortie, 3 scénarios 25/50/25, Monte Carlo P10–P90), consensus
+#     Zonebourse pour les premières années si les pages sont déposées
+#   - JV = 50 % DCF + 50 % médiane des multiples (PER cible, comparables, PER historique), réglable
+#   - Banques / courtiers / assureurs : actif net × P/B justifié + PER bancaire
+#   - Valeurs cycliques (⟳) : PER réduit, croissance plafonnée, marge ramenée à la médiane du cycle
+#   - Précision JV (écart DCF / multiples), lecture de l'écart, DCF inversé (croissance implicite /
+#     attendue sur 5 ans)
+#  Aussi : initiés et super investors, analystes, rapport Put/Call, scénarios BNA / EBITDA / capex /
+#  dette nette, export Excel (synthèse, scénarios, modèles DCF).
 #
 #  Ce n'est pas un conseil en investissement.
 # ============================================================
+import copy
 import hashlib
 import io
 import json
@@ -334,6 +353,55 @@ def add_peers(raw, t, s=None, log=print):
     return raw
 
 
+ONLINE_KEYS = ("IA", "BA", "CA", "options", "dataroma", "insiders", "insider_source", "peers_data")
+
+
+def clear_caches():
+    """Vide tous les caches : fichiers du dossier de cache, pages lues en mémoire, multiples d'industrie, Reddit."""
+    n = 0
+    if os.path.isdir(CACHE_DIR):
+        for fn in os.listdir(CACHE_DIR):
+            if fn.endswith(".json"):
+                try:
+                    os.remove(os.path.join(CACHE_DIR, fn))
+                    n += 1
+                except OSError:
+                    pass
+    for fn_ in (parse_zonebourse_cached, raws_from_finviz_pages_cached, fetch_apewisdom):
+        try:
+            fn_.clear()
+        except Exception:
+            pass
+    _IND.update(data=None, t=0.0)
+    return n
+
+
+def complete_online_cached(raw, t, max_days=200, use_cache=True, log=print, openinsider=True):
+    """Compléments en ligne d'une fiche Finviz déposée, mis en cache 2 h par valeur : redéposer ou ajouter des
+    pages ne relance pas les téléchargements déjà faits (le cours et la fiche restent ceux de la page)."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, f"{t}_complements{'_oi' if openinsider else ''}_{max_days}.json")
+    if use_cache and os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_HOURS * 3600:
+        with open(path, encoding="utf-8") as fh:
+            raw.update(json.load(fh))
+        return raw, True
+    complete_online(raw, t, max_days, log, None, openinsider)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({k: raw.get(k) for k in ONLINE_KEYS if k in raw}, fh)
+    return raw, False
+
+
+@st.cache_data(show_spinner=False, max_entries=300)
+def parse_zonebourse_cached(htmls, name=""):
+    """Lecture des pages Zonebourse, gardée en mémoire : une page déjà lue (même contenu) n'est pas relue."""
+    return parse_zonebourse(list(htmls), name)
+
+
+@st.cache_data(show_spinner=False, max_entries=300)
+def raws_from_finviz_pages_cached(pages):
+    return raws_from_finviz_pages(list(pages))
+
+
 def complete_online(raw, t, max_days=200, log=print, s=None, openinsider=True):
     """Ajoute en ligne ce qui manque : états financiers, initiés (OpenInsider), options, super investors."""
     s = s or _session()
@@ -449,6 +517,40 @@ def zb_company(html):
     return re.split(r"\s*:", m.group(1).strip())[0].strip() if m else ""
 
 
+def page_identity(name, html):
+    """Identité d'une page déposée : même société + même onglet = même page, quel que soit le nom du fichier
+    (« … (1).html », version plus récente…)."""
+    kind = page_kind(name, html)
+    m = re.search(r"<title>(.*?)</title>", html, re.S)
+    title = re.sub(r"\s+", " ", m.group(1)).strip() if m else name
+    if kind == "zonebourse":
+        onglet = "valorisation" if "Ratios de Valorisation" in title else "finances" if "Prévisions" in title else title
+        return ("zb", zb_company(html), onglet)
+    if kind == "finviz":
+        return ("fv", title, hashlib.md5(html[:2000].encode("utf-8", "ignore")).hexdigest()
+                if "Options" in title else "")
+    return ("autre", name)
+
+
+def dedupe_pages(pages):
+    """Garde une seule version de chaque page (la plus récente selon l'heure de cotation Zonebourse, sinon la
+    dernière déposée) -> (pages, noms ignorés)."""
+    best, order = {}, []
+    for i, (name, html) in enumerate(pages):
+        k = page_identity(name, html)
+        rank = (zb_stamp(html), i)
+        if k not in best:
+            order.append(k)
+            best[k] = (rank, name, html, [])
+        elif rank > best[k][0]:
+            best[k] = (rank, name, html, best[k][3] + [best[k][1]])
+        else:
+            best[k][3].append(name)
+    kept = [(best[k][1], best[k][2]) for k in order]
+    dups = [n for k in order for n in best[k][3]]
+    return kept, dups
+
+
 def zb_stamp(html):
     """Horodatage de la cotation dans l'en-tête Zonebourse (« 16:39:53 27/10/2026 ») -> (aaaa, mm, jj, hh:mm:ss)."""
     m = re.search(r"(\d{2}:\d{2}:\d{2})\s+(\d{2})/(\d{2})/(\d{4})", html)
@@ -546,6 +648,8 @@ def parse_zonebourse(htmls, name=""):
          "zb": {"N": N, "L": L, "bna": bna, "ebitda": eb, "capex": capex, "fcf": fcf, "nd": net_debt,
                 "div": div, "titres": titres, "bvps": bvps, "roe": roe, "rn": rn}}
     f["fx_note"] = fx_note
+    st_ = zb_stamp(htmls[0])                       # date de la page la plus récente (en-tête Zonebourse)
+    f["zb_date"] = f"{st_[2]}/{st_[1]}/{st_[0]}" if st_[0] else None
     # multiples historiques (onglet Valorisation) : PER médian des exercices publiés
     pe_h = sorted(v for y, v in ser("PER").items() if y in act and v and 0 < v < 60)
     f["pe_hist"] = pe_h[len(pe_h) // 2] if len(pe_h) >= 3 else None
@@ -676,21 +780,26 @@ def build_facts(raw):
 def merge_facts(fv, zb):
     """Action US avec fiche Finviz ET pages Zonebourse : Finviz pour le marché (cours, bêta, initiés, options,
     actualités, analystes) ; Zonebourse pour les prévisions pluriannuelles (BNA, EBITDA, capex, flux, dette),
-    le PER historique et la normalisation du flux ; BNA N et N+1 = moyenne des deux consensus."""
+    le PER historique et la normalisation du flux. BNA homogène avec chaque multiple : BNA Finviz (consensus ajusté,
+    même base que les PER prévisionnels) pour le PER cible et les comparables ; BNA Zonebourse pour le PER historique
+    (même base que les PER publiés par Zonebourse) ; jamais de moyenne des deux."""
     f = dict(fv)
     notes = []
+    f["merged"] = True
     f["bank"] = bool(fv.get("bank") or zb.get("bank"))
     for k in ("eps_this_y", "eps_next_y"):
         a, b = fv.get(k), zb.get(k)
-        if a and b and a > 0 and b > 0:
-            f[k] = (a + b) / 2
-            notes.append(f"{'BNA N' if k == 'eps_this_y' else 'BNA N+1'} : Finviz {a:.2f} · Zonebourse {b:.2f} "
-                         f"(écart {abs(a / b - 1) * 100:.0f} %) → moyenne {f[k]:.2f}")
-        elif b and not a:
-            f[k] = b
+        if not (a and a > 0) and b:
+            f[k] = b                                      # pas de consensus Finviz : Zonebourse
+    a, b = fv.get("eps_next_y"), zb.get("eps_next_y")
+    if b and b > 0:
+        f["eps_next_y_zb"] = b
+        if a and a > 0 and abs(a / b - 1) > 0.03:
+            notes.append(f"BNA N+1 : Finviz {a:.2f} (consensus ajusté) pour le PER cible et les comparables · "
+                         f"Zonebourse {b:.2f} (écart {(a / b - 1) * 100:+.0f} %) pour le PER historique")
     if f.get("eps_this_y") and f.get("eps_next_y") and f["eps_this_y"] > 0:
         f["eps_next_y_pct"] = (f["eps_next_y"] / f["eps_this_y"] - 1) * 100
-    for k in ("pe_hist", "pb_hist", "sales_cagr", "fcf_norm", "zb", "n_analysts"):
+    for k in ("pe_hist", "pb_hist", "sales_cagr", "fcf_norm", "zb", "n_analysts", "zb_date"):
         if zb.get(k) is not None:
             f[k] = zb[k]
     if f.get("capex") is None and zb.get("capex") is not None:      # page Finviz sans états financiers
@@ -699,7 +808,55 @@ def merge_facts(fv, zb):
         f["dataroma"] = {"n": None, "rows": []}
     f["cyclical"] = bool(fv.get("cyclical") or zb.get("cyclical"))
     if fv.get("dcfx") and (zb.get("dcfx") or {}).get("fc"):          # DCF Finviz + consensus Zonebourse (CA, marges, capex)
-        f["dcfx"] = dict(fv["dcfx"], fc=zb["dcfx"]["fc"], src=fv["dcfx"]["src"] + " + consensus Zonebourse")
+        fc = dict(zb["dcfx"]["fc"])
+        revs = fc.get("rev") or []
+        x0, zx = fv["dcfx"], zb["dcfx"]
+        if revs and x0["rev0"] and zx.get("rev0"):
+            # calendrier : le CA des 12 derniers mois Finviz se situe entre le dernier exercice clos (L) et
+            # l'exercice N ; on interpole le consensus (en log) aux dates « 12 derniers mois + 1, + 2… an(s) »
+            import math
+            pts = [zx["rev0"]] + revs                               # L, N, N+1, N+2
+            q = 0.0
+            if pts[1] > pts[0] > 0 and x0["rev0"] > pts[0]:
+                q = clamp(math.log(x0["rev0"] / pts[0]) / math.log(pts[1] / pts[0]), 0.0, 1.0)
+            ms = [zx["m0"]] + [m if m is not None else zx["m0"] for m in fc["m"]]
+
+            def at(arr, tpos, log=True):                            # tpos : années depuis L
+                i = min(int(tpos), len(arr) - 2)
+                w_ = tpos - i
+                a, b = arr[i], arr[i + 1]
+                return math.exp(math.log(a) * (1 - w_) + math.log(b) * w_) if log and a > 0 and b > 0 \
+                    else a * (1 - w_) + b * w_
+            n = len(revs) - (1 if q > 0 else 0)                     # années complètes couvertes
+            # scission / cession : le consensus ne compte plus l'activité sortie, les 12 derniers mois si -> le DCF
+            # repart du CA et des marges du consensus de l'exercice N (pro forma)
+            spin = (x0.get("disc_ops") and not f["cyclical"] and len(revs) >= 2 and revs[0] < 0.97 * x0["rev0"]
+                    and revs[1] > revs[0])
+            if spin:
+                notes.append(f"⚠️ scission ou cession détectée : CA prévu N {revs[0]:,.0f} < 12 derniers mois "
+                             f"{x0['rev0']:,.0f} M → DCF recalé sur le consensus (pro forma) ; dette nette du dernier "
+                             f"bilan publié".replace(",", " "))
+                fc["g"] = [revs[i + 1] / revs[i] - 1 for i in range(len(revs) - 1)]
+                fc["m"] = ms[2:2 + len(fc["g"])]
+                fc["capex"] = (fc.get("capex") or [])[1:1 + len(fc["g"])]
+                fc["fcf_m"] = [None] * len(fc["g"])
+                f["dcfx"] = dict(x0, fc=fc, rev0=revs[0], m0=ms[1], src=x0["src"] + " + consensus Zonebourse (pro forma)")
+            else:
+                prev, g, m_ = x0["rev0"], [], []
+                # marges : l'EBITDA « ajusté » du consensus peut différer de celui des états Finviz -> on applique
+                # l'évolution prévue (rapport à la dernière marge publiée Zonebourse) à la marge Finviz actuelle
+                m_q = at(ms, q, log=False)                              # marge Zonebourse à la date des 12 derniers mois
+                scale = x0["m0"] / m_q if m_q and m_q > 0 and x0["m0"] > 0 else 1.0
+                for k in range(1, n + 1):
+                    rv = at(pts, q + k)
+                    g.append(rv / prev - 1)
+                    prev = rv
+                    m_.append(at(ms, q + k, log=False) * scale)
+                fc["g"], fc["m"] = g, m_
+                fc["capex"] = (fc.get("capex") or [])[:n]
+                fc["fcf_m"] = [None] * n                                # flux : marge de trésorerie Finviz × marges
+        if "pro forma" not in f["dcfx"].get("src", ""):
+            f["dcfx"] = dict(fv["dcfx"], fc=fc, src=fv["dcfx"]["src"] + " + consensus Zonebourse")
     elif not fv.get("dcfx") and zb.get("dcfx"):
         f["dcfx"] = zb["dcfx"]
     if zb.get("target") and fv.get("target"):
@@ -823,7 +980,7 @@ def synthese(out, methods):
 
 def add_hist_pe(f, out):
     """3e méthode si l'onglet Valorisation Zonebourse est chargé : BNA N+1 × PER médian de la société."""
-    eps, pe = f["eps_next_y"], f.get("pe_hist")
+    eps, pe = f.get("eps_next_y_zb") or f["eps_next_y"], f.get("pe_hist")   # même base que les PER Zonebourse
     if eps and eps > 0 and pe:
         out.update({"PER hist. bas": eps * pe * 0.85, "PER hist.": eps * pe, "PER hist. haut": eps * pe * 1.15})
         out["notes"].append(f"PER historique médian {pe:.1f}x" + (f" (P/B historique médian {f['pb_hist']:.2f})"
@@ -951,7 +1108,26 @@ def dcfx_from_finviz(IA, BA, CA, sn):
             "net_debt": debt - cash, "minority": s(BA, "Accumulated Minority Interest") or 0.0,
             "interest": s(IA, "Interest Expense") or 0.0, "ebit": s(IA, "Operating Income"),
             "ev_ebitda": num(sn.get("EV/EBITDA")) if sn else None, "fc": None,
-            "ocf0": ocf_m[0] if ocf_m else None, "ocf_hist": ocf_m[1:]}
+            "ocf0": ocf_m[0] if ocf_m else None, "ocf_hist": ocf_m[1:],
+            "intang": pct(s(BA, "Intangible Assets"), s(BA, "Total Assets")) or 0.0,
+            "disc_ops": disc_ops(IA)}
+
+
+def disc_ops(IA):
+    """Activités abandonnées (scission, cession) : bénéfice net ≠ bénéfice des activités poursuivies (12 derniers mois
+    ou dernier exercice)."""
+    for i in (0, 1):
+        a, b = stmt(IA, "Net Income", i), stmt(IA, "Net Income From Continuing Operations", i)
+        if a is not None and b and abs(a - b) > 0.005 * abs(b):
+            return True
+    return False
+
+
+def asset_light(x):
+    """Société peu consommatrice d'investissements dont les amortissements sont surtout ceux d'incorporels rachetés
+    (incorporels ≥ 40 % de l'actif, investissements < 3 % du CA et < la moitié des amortissements)."""
+    cap = max(x.get("capex0") or 0.0, x.get("capex_norm") or 0.0)
+    return (x.get("intang") or 0) >= 0.4 and cap < 0.03 and (x.get("da_pct") or 0) > 2 * cap
 
 
 def dcfx_from_zonebourse(z, ca, eb, ebit, capex, nd, act, est, shares, fcf=None):
@@ -966,10 +1142,11 @@ def dcfx_from_zonebourse(z, ca, eb, ebit, capex, nd, act, est, shares, fcf=None)
     da_l = [(eb[y] - ebit[y]) / ca[y] for y in act[-5:]
             if eb.get(y) is not None and ebit.get(y) is not None and ca.get(y) and eb[y] - ebit[y] > 0]
     fcf = fcf or {}
-    fc = {"g": [], "m": [], "capex": [], "fcf_m": []}
+    fc = {"g": [], "m": [], "capex": [], "fcf_m": [], "rev": []}
     prev = rev0
     for y in est[:3]:
         if ca.get(y) and prev:
+            fc["rev"].append(ca[y])
             fc["g"].append(ca[y] / prev - 1)
             fc["m"].append(pct(eb.get(y), ca[y]))
             fc["capex"].append(pct(abs(capex[y]) if capex.get(y) is not None else None, ca[y]))
@@ -1001,7 +1178,7 @@ def wacc_calc(f, x, p):
     return {"ke": ke, "kd": kd, "spread": spread, "E": e, "D": d, "wacc": max(w, p["tg"] + 0.03), "how": how}
 
 
-def dcfx_project(x, g0, dm, wacc, tg, exit_mult, cyclical, g_shift=0.0, years=DCF_YEARS):
+def dcfx_project(x, g0, dm, wacc, tg, exit_mult, cyclical, g_shift=0.0, years=DCF_YEARS, fc_shift=0.5):
     """Projection sur 10 ans -> valeur des fonds propres (croissance perpétuelle / multiple de sortie) et tableau.
     g0 : croissance du CA en année 1 (sans consensus) ; avec le consensus Zonebourse, ses croissances sont
     reprises pour les premières années, décalées de g_shift (scénario) ; dm : décalage de marge EBITDA."""
@@ -1010,6 +1187,8 @@ def dcfx_project(x, g0, dm, wacc, tg, exit_mult, cyclical, g_shift=0.0, years=DC
     m_norm = _med(x["m_hist"]) if x["m_hist"] else x["m0"]
     m_base = m_norm if cyclical else x["m0"]
     capex_term = max(x["da_pct"] * 1.05, min(x["capex0"], x["capex_norm"]))
+    if asset_light(x):        # amortissements = incorporels rachetés, pas des investissements à renouveler
+        capex_term = max(x["capex0"], x["capex_norm"]) * 1.25
     # marge de trésorerie d'exploitation (états Finviz) : 12 derniers mois et médiane des 3 derniers exercices,
     # médiane sur 5 ans pour une valeur cyclique ; sinon (Zonebourse) FCFF reconstruit depuis l'EBITDA
     ocf = None
@@ -1024,7 +1203,7 @@ def dcfx_project(x, g0, dm, wacc, tg, exit_mult, cyclical, g_shift=0.0, years=DC
     g_start = (fg[-1] if fg else g0)
     for t in range(1, years + 1):
         if t <= nf:                                           # années couvertes par le consensus
-            g = fg[t - 1] + g_shift * 0.5
+            g = fg[t - 1] + g_shift * fc_shift
             m = (fm[t - 1] if fm[t - 1] is not None else m_base) + dm
             cpx = fcap[t - 1] if t - 1 < len(fcap) and fcap[t - 1] is not None else x["capex0"]
         else:
@@ -1045,7 +1224,9 @@ def dcfx_project(x, g0, dm, wacc, tg, exit_mult, cyclical, g_shift=0.0, years=DC
         ebit = ebitda - new * da
         ffm = (fc.get("fcf_m") or [])
         if ocf is not None:
-            fcff = new * (ocf + dm * (ocf_ratio if x["m0"] and x["m0"] > 0 else 1.0)) - new * cpx
+            # marges prévues par le consensus : la trésorerie d'exploitation suit l'EBITDA (conversion constante)
+            ocf_t = ocf * (m - dm) / m_base if fm and m_base and m_base > 0 else ocf
+            fcff = new * (ocf_t + dm * (ocf_ratio if x["m0"] and x["m0"] > 0 else 1.0)) - new * cpx
         elif t <= nf and t - 1 < len(ffm) and ffm[t - 1] is not None:      # flux libre du consensus
             fcff = new * (ffm[t - 1] + dm * (x.get("conv") or 0.5))
         elif ffm and ffm[-1] is not None:
@@ -1143,17 +1324,22 @@ def dcfx_implied_growth(f, p, x, res):
         return None
     w, tg, em, cyc = res["wacc"]["wacc"], res["tg"], res["exit_mult"], bool(f.get("cyclical"))
     g_ref = res["g_rev"]
-    v = lambda g: (lambda r: (r["eq_perp"] + r["eq_exit"]) / 2 / sh)(
-        dcfx_project(x, g, 0.0, w, tg, em, cyc, g_shift=g - g_ref))
-    lo, hi = -0.30, 0.80
+    # même écart de croissance appliqué à toutes les années (consensus compris)
+    proj = lambda d: dcfx_project(x, g_ref + d, 0.0, w, tg, em, cyc, g_shift=d, fc_shift=1.0)
+    v = lambda d: (lambda r: (r["eq_perp"] + r["eq_exit"]) / 2 / sh)(proj(d))
+    avg5 = lambda r: sum(row["Croissance CA (%)"] for row in r["rows"][:5]) / 5
+    lo, hi = -0.40, 0.60
     if v(lo) > pr:
-        return lo
-    if v(hi) < pr:
-        return hi
-    for _ in range(40):
-        mid = (lo + hi) / 2
-        lo, hi = (mid, hi) if v(mid) < pr else (lo, mid)
-    return (lo + hi) / 2
+        d = lo
+    elif v(hi) < pr:
+        d = hi
+    else:
+        for _ in range(40):
+            mid = (lo + hi) / 2
+            lo, hi = (mid, hi) if v(mid) < pr else (lo, mid)
+        d = (lo + hi) / 2
+    # croissance annuelle moyenne du CA sur 5 ans : supposée par le cours / scénario central
+    return avg5(proj(d)) / 100, avg5(proj(0.0)) / 100
 
 
 def revenue_growth(f):
@@ -1267,13 +1453,18 @@ def fair_value(f, p):
         if res.get("prob_up") is not None:
             out["Probabilité JV DCF > cours (%)"] = res["prob_up"]
         out["_dcfx"] = res
-        gi = dcfx_implied_growth(f, p, f["dcfx"], res)
-        if gi is not None:
-            out["g implicite (%)"], out["g attendue (%)"] = gi * 100, res["g_rev"] * 100
+        gg = dcfx_implied_growth(f, p, f["dcfx"], res)
+        if gg is not None:
+            out["g implicite (%)"], out["g attendue (%)"] = gg[0] * 100, gg[1] * 100
+            out["_g5"] = True                         # moyennes sur 5 ans
         out["notes"].append(f"DCF d'entreprise ({res['src']}) : CMPC {res['wacc']['wacc'] * 100:.1f} %, croissance du CA "
                             f"an 1 {res['g_rev'] * 100:.0f} %, 3 scénarios 25/50/25, valeur terminale moyenne croissance "
                             f"perpétuelle {res['tg'] * 100:.1f} % / multiple de sortie {res['exit_mult']:.1f}x EBITDA ; "
                             f"fourchette P10–P90 de 2 000 simulations")
+        if asset_light(f["dcfx"]):
+            out["notes"].append(f"amortissements ({f['dcfx']['da_pct'] * 100:.1f} % du CA) surtout d'incorporels "
+                                f"rachetés : investissements d'entretien = investissements réels "
+                                f"({max(f['dcfx']['capex0'], f['dcfx']['capex_norm']) * 100:.1f} % du CA, +25 %)")
         if res.get("gap_tv") and res["gap_tv"] > 0.3:
             out["notes"].append(f"⚠️ valeurs terminales divergentes ({res['gap_tv'] * 100:.0f} %) : hypothèses à vérifier")
     hist = [] if res else f["fcf_hist"]
@@ -1438,7 +1629,7 @@ def divergence_txt(f, fv):
                                       f"{w['how'].split('(')[0].strip()})"))
                 gi, ga = fv.get("g implicite (%)"), fv.get("g attendue (%)")
                 if gi is not None and ga is not None and gi - ga >= 8:
-                    causes.append((3.2, f"le cours anticipe une croissance du CA de {gi:.0f} % (retenue : {ga:.0f} %)"))
+                    causes.append((3.2, f"le cours anticipe une croissance du CA de {gi:.0f} %/an sur 5 ans (retenue : {ga:.0f} %)"))
                 eb = x["rev0"] * x["m0"]
                 if eb > 0 and x["net_debt"] / eb > 3:
                     causes.append((2.5, f"dette nette élevée ({x['net_debt'] / eb:.1f}× l'EBITDA) déduite de la valeur"))
@@ -1460,8 +1651,8 @@ def divergence_txt(f, fv):
                                         f"(+{max(x['fc']['g']) * 100:.0f} %) intégrée au DCF"))
                 gi, ga = fv.get("g implicite (%)"), fv.get("g attendue (%)")
                 if gi is not None and ga is not None and ga - gi >= 8:
-                    causes.append((3, "le cours suppose un recul durable du CA (≤ −30 % la 1re année)" if gi <= -29.9
-                                   else f"le cours n'anticipe que {gi:.0f} % de croissance du CA (retenue : {ga:.0f} %)"))
+                    causes.append((3, f"le cours n'anticipe que {gi:+.0f} %/an de croissance du CA sur 5 ans "
+                                      f"(retenue : {ga:+.0f} %)"))
                 if res["wacc"]["wacc"] <= 0.085:
                     causes.append((1.5, f"taux d'actualisation bas (CMPC {res['wacc']['wacc'] * 100:.1f} %)"))
         else:                                          # fiche seule : DCF simplifié (flux libre des 12 derniers mois)
@@ -2139,8 +2330,229 @@ def render_screener(p, use_cache, max_days, use_oi):
         st.rerun()
 
 
+# ---------- Screener initiés : superinvestors (Dataroma) × achats des dirigeants (OpenInsider)
+# Modules fournis à part, dans le même dossier : analyse.py, openinsider.py, dataroma_scraper.py, exports.py
+def _ins_modules():
+    try:
+        import analyse as an_
+        import openinsider as oi_
+        from dataroma_scraper import GRIDS as grids_
+        return an_, oi_, grids_
+    except ImportError as e:
+        return None, None, str(e)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _ins_load(grid, min_si, with_dr, scope, days, compare):
+    an_, oi_, _ = _ins_modules()
+    bar = st.progress(0.0, text="Grille Dataroma…")
+    base = an_.sp500(grid)
+    uni = an_.universe(grid, min_si, base)
+    oi_uni = base if scope == "sp500" else uni
+    dr_df = None
+    if with_dr:
+        dr_df = an_.run_dataroma(uni, progress=lambda i, n, t: bar.progress(i / n * 0.9, text=f"Dataroma {i}/{n} – {t}"))
+    raw_tx, log = an_.fetch_openinsider(oi_uni, days, progress=lambda i, n, t: bar.progress(
+        0.9 + i / n * 0.05, text=f"OpenInsider {i}/{n}"))
+    prev_tx = None
+    if compare != "aucune":
+        prev_tx, log_prev = an_.fetch_openinsider(
+            oi_uni, days, years_back=int(compare == "an"), periods_back=int(compare == "precedente"),
+            progress=lambda i, n, t: bar.progress(0.95 + i / n * 0.05, text=f"OpenInsider comparaison {i}/{n}"))
+        log = log + [dict(e, periode=an_.COMPARE[compare]) for e in log_prev]
+    bar.empty()
+    return uni, oi_uni, dr_df, raw_tx, log, prev_tx
+
+
+def render_insider_screener(max_days, use_cache, use_oi):
+    """Onglet « Screener initiés » : valeurs du S&P 500 suivies par les superinvestors (Dataroma) et/ou achetées
+    par leurs dirigeants (OpenInsider, levées d'options exclues) ; sentiment des initiés comparé ; exports."""
+    an, oi, grids = _ins_modules()
+    if an is None:
+        st.error(f"Modules du screener initiés introuvables ({grids}) : placez analyse.py, openinsider.py, "
+                 "dataroma_scraper.py et exports.py dans le même dossier que finviz_dashboard.py.")
+        return
+    st.caption("Univers : valeurs du S&P 500 suivies par les superinvestors (dataroma.com), ou tout le S&P 500 pour "
+               "OpenInsider. Deux analyses séparées : résumé initiés 6 mois de Dataroma, et transactions OpenInsider "
+               "(levées d'options exclues).")
+    with st.expander("⚙️ Réglages", expanded="ins_data" not in st.session_state):
+        c = st.columns(3)
+        with c[0]:
+            st.markdown("**Univers**")
+            grid = st.selectbox("Page Dataroma", list(grids), format_func=lambda k: grids[k], key="ins_grid")
+            min_si = st.number_input("Nb minimum de superinvestors", 1, 50, 1, key="ins_min_si")
+            with_dr = st.checkbox("A. Lire le résumé initiés de chaque fiche Dataroma (≈ 1 min 30)", value=True,
+                                  key="ins_with_dr", help="Porte uniquement sur les valeurs suivies par les superinvestors.")
+        with c[1]:
+            st.markdown("**B. OpenInsider**")
+            scope = st.radio("Valeurs analysées", ["si", "sp500"], index=1, key="ins_scope",
+                             format_func=lambda k: {"si": "Suivies par les superinvestors",
+                                                    "sp500": "Tout le S&P 500 (500 valeurs, ≈ 5 s)"}[k])
+            days = st.select_slider("Période (jours de déclaration)", [30, 60, 90, 120, 180], 90, key="ins_days")
+            compare = st.radio("Sentiment comparé à (≈ +5 s)", list(an.COMPARE), format_func=lambda k: an.COMPARE[k],
+                               key="ins_compare", help="L'an dernier : même saison, même calendrier de résultats. "
+                                                       "Période précédente : tendance récente.")
+        with c[2]:
+            st.markdown("**Filtres (instantanés)**")
+            criterion = st.radio("Critère", list(oi.CRITERIA), format_func=lambda k: oi.CRITERIA[k], key="ins_crit")
+            min_value = st.select_slider(
+                "Montant minimum par achat ($)", [0, 25_000, 50_000, 90_000, 100_000, 250_000, 500_000, 1_000_000],
+                an.DEFAULT_MIN_BUY, key="ins_min_value",
+                format_func=lambda v: "aucun" if v == 0 else f"{v:,.0f} $".replace(",", " "),
+                help="Ignore les achats plus petits ; les ventes sont toutes comptées. 90 000 $ ≈ achat médian ; "
+                     "500 000 $ = forte conviction (peut casser les achats groupés).")
+            excl10 = st.checkbox("Exclure les actionnaires >10 %", value=False, key="ins_excl10",
+                                 help="Ex. Berkshire Hathaway, déclaré initié chez Lennar.")
+            min_delta = st.slider("ΔOwn minimum d'un acheteur (%)", 0, 100, 0, 5, key="ins_delta",
+                                  help="50 % = un dirigeant a augmenté sa position de moitié.")
+            cluster_only = st.checkbox("Seulement les achats groupés (≥ 2 acheteurs en 30 j)", key="ins_cluster")
+        go = st.button("Lancer l'analyse", type="primary", key="ins_go")
+    if go:
+        try:
+            if not use_cache:
+                _ins_load.clear()
+            st.session_state["ins_data"] = _ins_load(grid, int(min_si), with_dr, scope, int(days), compare)
+            st.session_state["ins_cmp"] = compare
+            st.session_state.pop("ins_dr_extra", None)
+            st.session_state["ins_p"] = (grid, int(min_si), with_dr, int(days), scope)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Erreur : {e}")
+    if "ins_data" not in st.session_state:
+        st.info("Réglez les paramètres puis cliquez sur **Lancer l'analyse**.")
+        return
+
+    uni, oi_uni, dr_df, raw_tx, log, prev_raw = st.session_state["ins_data"]
+    g, m, wdr, d, sc = st.session_state["ins_p"]
+    tx = an.filter_tx(raw_tx, excl10, min_value)
+    oi_df = oi.summarize(tx, oi_uni["ticker"].tolist())
+    extra = st.session_state.get("ins_dr_extra")
+    dr_all = dr_df if extra is None or dr_df is None else pd.concat([dr_df, extra], ignore_index=True)
+    final = an.combine(oi_uni, dr_all, oi_df, criterion, min_delta, cluster_only, dr_universe=set(uni["ticker"]))
+    prev_tx = an.filter_tx(prev_raw, excl10, min_value) if prev_raw is not None else None
+    s_now = oi.sentiment(tx)
+    s_prev = oi.sentiment(prev_tx) if prev_tx is not None else None
+    cmp_mode = st.session_state.get("ins_cmp", "an")
+    sent = an.sentiment_table(s_now, s_prev, d, cmp_mode)
+    p_prev = an.compare_range(d, cmp_mode)
+
+    if raw_tx.empty:
+        st.warning("OpenInsider n'a renvoyé aucune transaction : voir l'onglet **Diagnostic**.")
+    c = st.columns(5)
+    c[0].metric("Univers OpenInsider" if sc == "sp500" else "Univers", len(oi_uni))
+    c[1].metric("Retenues Dataroma", int(final["dr_ok"].sum()))
+    c[2].metric("Retenues OpenInsider", int(final["oi_ok"].sum()))
+    c[3].metric("Les deux", int((final["dr_ok"] & final["oi_ok"]).sum()))
+    c[4].metric("Achats groupés", int((final["cluster"] >= 2).sum()))
+
+    money = {an.LABELS[k]: st.column_config.NumberColumn(format="$%d")
+             for k in ("ins_buy_usd", "ins_sell_usd", "dr_balance_usd", "buy_usd", "sell_usd", "balance_usd")}
+    cfg = money | {an.LABELS["url"]: st.column_config.LinkColumn(display_text="fiche"),
+                   an.LABELS["oi_url"]: st.column_config.LinkColumn(display_text="fiche"),
+                   an.LABELS["oi_signal"]: st.column_config.TextColumn(width="large"),
+                   an.LABELS["max_delta_own"]: st.column_config.NumberColumn(format="%.0f %%")}
+
+    with st.container(border=True):
+        st.markdown(f"**Sentiment des initiés** · {'tout le S&P 500' if sc == 'sp500' else 'univers superinvestors'}"
+                    f" · {d} derniers jours" + (f" · comparé au {p_prev[0]:%d/%m/%Y} → {p_prev[1]:%d/%m/%Y}"
+                                                f" ({an.COMPARE[cmp_mode].lower()})" if s_prev and p_prev else ""))
+
+        def _metric(col, label, key, fmt="{:.3f}"):
+            a = s_now.get(key)
+            b = s_prev.get(key) if s_prev else None
+            delta = f"{(a / b - 1):+.0%} {an.COMPARE_SHORT.get(cmp_mode, '')}" if a is not None and b else None
+            col.metric(label, "–" if a is None else fmt.format(a), delta,
+                       help=None if b is None else f"Période de comparaison : {fmt.format(b)}")
+        k = st.columns(4)
+        _metric(k[0], "Acheteurs / vendeurs", "ratio_ins")
+        _metric(k[1], "Nb achats / nb ventes", "ratio_tx")
+        _metric(k[2], "Montants achats / ventes", "ratio_usd")
+        _metric(k[3], "Valeurs acheteurs > vendeurs", "valeurs_pos", "{:.0f}")
+        st.caption("Les ventes dépassent toujours largement les achats dans les grandes capitalisations : "
+                   "c'est l'évolution qui compte, pas le niveau.")
+        with st.expander("Détail"):
+            st.dataframe(sent, hide_index=True, width="stretch",
+                         column_config={"Variation": st.column_config.NumberColumn(format="percent")})
+
+    views = {"union": ("Au moins une source", final["dr_ok"] | final["oi_ok"]),
+             "both": ("Les deux sources", final["dr_ok"] & final["oi_ok"]),
+             "oi": ("OpenInsider", final["oi_ok"]), "dr": ("Dataroma", final["dr_ok"])}
+    which = st.segmented_control("Afficher", list(views), default="union", key="ins_view",
+                                 format_func=lambda k: f"{views[k][0]} ({int(views[k][1].sum())})")
+    view = final[views[which or "union"][1]]
+    pick = st.multiselect("Secteur", sorted(final["sector"].dropna().unique()), key="ins_sector")
+    if pick:
+        view = view[view["sector"].isin(pick)]
+
+    t1, t2, t3, t4, t5 = st.tabs(["Tableau final", "A. Dataroma", "B. OpenInsider", "Transactions", "Diagnostic"])
+    with t1:
+        if dr_df is not None and "ins_buy_n" in view:
+            missing = view.loc[view["ins_buy_n"].isna() & ~view["ticker"].isin(uni["ticker"]), "ticker"]
+            if len(missing):
+                c1, c2 = st.columns([3, 1])
+                c1.caption(f"Colonnes « DR » vides pour {len(missing)} valeur(s) hors univers superinvestors : "
+                           "leur fiche Dataroma n'est pas lue par défaut.")
+                if c2.button(f"Lire leur fiche Dataroma (≈ {max(1, round(len(missing) * 0.7))} s)", key="ins_dr_more"):
+                    with st.spinner("Lecture des fiches Dataroma…"):
+                        new = an.run_dataroma(pd.DataFrame({"ticker": missing.tolist()}))
+                    st.session_state["ins_dr_extra"] = new if extra is None else pd.concat([extra, new], ignore_index=True)
+                    st.rerun()
+        st.dataframe(an.display(view), width="stretch", hide_index=True, column_config=cfg)
+        st.caption("🟢🟢 achats groupés et plus d'acheteurs que de vendeurs · 🟢 plus d'acheteurs · 🟠 autant ou plus "
+                   "de vendeurs · ⚪ aucune transaction. Cas atypique : actionnaire >10 %, entité ou montant ≥ 50 M$.")
+    with t2:
+        if dr_df is None:
+            st.info("Analyse Dataroma désactivée dans les réglages.")
+        else:
+            cols = ["ticker", "name", "sector", "si_count", "ins_buy_n", "ins_buy_usd", "ins_sell_n", "ins_sell_usd",
+                    "dr_balance_usd", "url"]
+            st.dataframe(an.display(final[final["dr_ok"]][cols]), width="stretch", hide_index=True, column_config=cfg)
+    with t3:
+        cols = ["ticker", "name", "si_count", "oi_signal", "buyers", "sellers", "buy_tx", "sell_tx", "buy_usd",
+                "sell_usd", "balance_usd", "max_delta_own", "cluster", "atypical", "buyer_names", "oi_url"]
+        st.dataframe(an.display(final[final["oi_ok"]][cols]), width="stretch", hide_index=True, column_config=cfg)
+    with t4:
+        tk = st.selectbox("Valeur", ["(toutes)"] + (sorted(tx["ticker"].unique()) if not tx.empty else []),
+                          key="ins_tx_tk")
+        st.dataframe(an.display_tx(tx if tk == "(toutes)" else tx[tx["ticker"] == tk]), width="stretch", hide_index=True)
+    with t5:
+        st.write(f"{len(raw_tx)} transactions OpenInsider lues, {len(tx)} après filtres.")
+        st.dataframe(pd.DataFrame(log), width="stretch", hide_index=True)
+
+    # envoi vers l'analyse complète (même mécanisme que le Screener JV)
+    sel = st.multiselect("Envoyer en analyse complète (onglet « Valeurs à étudier »)", list(view["ticker"]),
+                         default=list(view["ticker"])[:5], key="ins_sel")
+    if st.button("➜ Analyse complète", key="ins_full", disabled=not sel):
+        wl, errs = dict(st.session_state.get("wl_scr") or {}), list(st.session_state.get("wl_errs_scr") or [])
+        bar = st.progress(0.0)
+        for i, t in enumerate(sel):
+            bar.progress((i + 1) / len(sel), text=t)
+            try:
+                f = build_facts(fetch_ticker(t, max_days, use_cache, log=errs.append, openinsider=use_oi))
+                f["source"] = "Screener initiés + Finviz en ligne"
+                wl[t] = f
+            except Exception as e:
+                errs.append(f"{t} : {type(e).__name__} — {e}")
+        bar.empty()
+        st.session_state["wl_scr"], st.session_state["wl_errs_scr"] = wl, errs
+        st.success(f"{len(sel)} valeur(s) ajoutée(s) à l'onglet « 🛒 Valeurs à étudier ».")
+        st.rerun()
+
+    note = an.make_note(g, m, d, criterion, excl10, wdr, sc, min_value)
+    stamp = f"{TODAY:%Y%m%d}"
+    b = st.columns(3)
+    b[0].download_button("⬇️ Page HTML", an.export_html(view, "Superinvestors × initiés", note).encode("utf-8"),
+                         f"selection_{stamp}.html", "text/html", width="stretch", key="ins_dl_html")
+    b[1].download_button("⬇️ Excel (3 onglets)", an.export_excel(final, tx, note, sent), f"selection_{stamp}.xlsx",
+                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch",
+                         key="ins_dl_xlsx")
+    b[2].download_button("⬇️ CSV", an.display(view).to_csv(index=False).encode("utf-8-sig"), f"selection_{stamp}.csv",
+                         "text/csv", width="stretch", key="ins_dl_csv")
+    st.caption(note + " Informations à titre indicatif, pas un conseil en investissement.")
+
+
 def reverse_txt(fv):
-    """« 🟢 −3 % / +12 % » : croissance que suppose le cours (DCF inversé) / croissance attendue."""
+    """« 🟢 −3 % / +12 % » : croissance que suppose le cours (DCF inversé) / croissance attendue
+    (DCF d'entreprise : croissance annuelle moyenne du CA sur 5 ans)."""
     gi, ga = fv.get("g implicite (%)"), fv.get("g attendue (%)")
     if gi is None or ga is None:
         return "n.d."
@@ -2186,7 +2598,8 @@ def analyze(f, p, ov=None):
            "BNA N": round(f["eps_this_y"], 2) if f["eps_this_y"] is not None else None,
            "BNA N+1 (évol.)": bna_evol(f["eps_this_y"], f["eps_next_y"]),
            "Dette nette/EBITDA": lev,                                # actuel (dette nette du jour / EBITDA 12 mois)
-           "Résultats": f["earnings"]}
+           "Résultats": f["earnings"],
+           "Pages Zonebourse": ("📄 " + (f.get("zb_date") or "")) if f.get("zb") else ""}
     return row, {"fv": fv, "an": an, "si": si, "pc": pc, "ins": ins, "sc": sc}
 
 
@@ -2212,9 +2625,10 @@ FMT = {
              "méthode à plus de 50 % de la médiane, exclue du calcul — signal de risque (ex. multiples élevés que le "
              "flux de trésorerie ne justifie pas)."),
     "Croissance implicite / attendue": st.column_config.TextColumn(
-        help="DCF inversé : croissance annuelle du flux libre que suppose le cours actuel / croissance attendue "
-             "(BNA 5 ans du consensus, plafonnée au CA + 10 pts). 🟢 attendue ≥ implicite + 5 pts : le marché est "
-             "pessimiste ; 🔴 le cours suppose plus que prévu ; ⚪ cohérent."),
+        help="DCF inversé. Avec états financiers : croissance annuelle moyenne du CA sur 5 ans que suppose le cours / "
+             "celle du scénario central (consensus Zonebourse compris). Fiche seule : croissance du flux libre / du BNA "
+             "plafonnée. 🟢 attendue ≥ implicite + 5 pts : le marché est pessimiste ; 🔴 le cours suppose plus que "
+             "prévu ; ⚪ cohérent."),
     "Initiés (12 m)": st.column_config.TextColumn(width="large", help="🟢🟢 achats groupés (≥ 2 dirigeants en 30 j) ou du PDG/DAF ; 🟢 achats ; 🟠 ventes importantes (hors levées d'options) ; ⚪ peu de mouvements. Les ventes sont souvent programmées : un achat est plus parlant."),
     "Super investors": st.column_config.TextColumn(width="large", help="Dataroma (13F, trimestre précédent) : 🟢🟢 plus d'entrées/renforcements que d'allègements avec un gérant convaincu (≥ 5 % de son portefeuille) ou ≥ 2 nouveaux ; 🟢 majorité d'achats ; 🟠 majorité d'allègements. % = poids de la ligne dans le portefeuille du gérant."),
     "Put/Call (total / ±10 %)": st.column_config.TextColumn(help="encours puts / calls ; >1 prudence, <0,7 optimisme"),
@@ -2227,6 +2641,20 @@ FMT = {
 def _base(t):
     """« ARGX (EUR) » -> « ARGX »."""
     return t.split(" ")[0].upper()
+
+
+def portfolio_facts(raws, zb_store):
+    """Valeurs du portefeuille : fiche Finviz, combinée avec les pages Zonebourse déposées pour la même valeur
+    (même ticker, même devise) — prévisions sur 3 ans, PER historique, consensus."""
+    out = {}
+    for t, r in raws.items():
+        f = build_facts(r)
+        zf = zb_store.get(t.upper())
+        if zf and zf.get("zb") and zf.get("currency", "USD") == f.get("currency", "USD"):
+            f = merge_facts(f, zf)
+            f["source"] = (r.get("source") or "Finviz en ligne") + " + pages Zonebourse du " + (zf.get("zb_date") or "?")
+        out[t] = f
+    return out
 
 
 def label(t, f):
@@ -2257,6 +2685,8 @@ def evaluate(facts, p, ov, pf=None):
     df = pd.DataFrame(rows).sort_values("Écart JV (%)", ascending=False, na_position="last")
     if (df["Devise"] == "USD").all():
         df = df.drop(columns="Devise")
+    if "Pages Zonebourse" in df and not df["Pages Zonebourse"].astype(bool).any():
+        df = df.drop(columns="Pages Zonebourse")
     return df, det, {label(t, det[t][0]): t for t in det}
 
 
@@ -2514,7 +2944,14 @@ def main():
             st.success("Fichier de positions modifié — " + " ; ".join(
                 x for x in (f"ajoutées : {', '.join(add)}" if add else "", f"retirées : {', '.join(rem)}" if rem else "") if x))
         max_days = st.slider("Options : échéances jusqu'à (jours)", 30, 400, 200, 10)
-        use_cache = st.checkbox(f"Utiliser le cache ({CACHE_HOURS} h)", value=True)
+        use_cache = st.checkbox(f"Utiliser le cache ({CACHE_HOURS} h)", value=True,
+                                help="Décoché : tout est relu et retéléchargé — données Finviz en ligne, compléments "
+                                     "des fiches déposées, et pages HTML (Finviz et Zonebourse).")
+        if st.button("🧹 Vider le cache", help="Efface les données téléchargées (dossier cache_finviz) et les pages HTML "
+                                              "gardées en mémoire. Les résultats affichés restent jusqu'à la prochaine "
+                                              "récupération ou analyse."):
+            n = clear_caches()
+            st.success(f"Cache vidé ({n} fichier(s) supprimé(s)).")
         use_oi = st.checkbox("Initiés via OpenInsider (12 mois complets)", value=True,
                              help="Sinon : les ~20 dernières transactions de la fiche Finviz")
         go = st.button("📡 Récupérer les données", type="primary") or auto
@@ -2538,7 +2975,7 @@ def main():
                                                           "les valeurs envoyées par le Screener JV restent")
         if clear:
             st.session_state["wl_n"] = n_wl + 1
-            for k in ("wl_pages", "wl_errs_pages"):        # pages HTML seulement (valeurs du screener gardées)
+            for k in ("wl_pages", "wl_errs_pages", "zb_store"):   # pages HTML seulement (valeurs du screener gardées)
                 st.session_state.pop(k, None)
             st.rerun()
         if run and not ups:
@@ -2604,9 +3041,14 @@ def main():
     if run and ups:
         facts, errs = {}, []
         # même fichier déposé plusieurs fois : seule la dernière version est gardée
-        pages = list({u.name: (u.name, u.getvalue().decode("utf-8", errors="ignore")) for u in ups}.values())
+        pages = [(u.name, u.getvalue().decode("utf-8", errors="ignore")) for u in ups]
+        pages, dups = dedupe_pages(pages)
+        if dups:
+            errs.append(f"{len(dups)} page(s) en double ignorée(s) (la plus récente est gardée) : " + ", ".join(dups)
+                        + ". Retirez-les de la liste avec la croix ✕, ou « 🗑️ Vider » avant de redéposer.")
         fv_pages = [x for x in pages if page_kind(*x) == "finviz"]
         groups = {}
+        zb_store = {}
         for name, html in pages:
             kind = page_kind(name, html)
             if kind == "zonebourse":
@@ -2615,23 +3057,27 @@ def main():
                 errs.append(f"{name} : ni Finviz ni Zonebourse")
         for comp, grp in groups.items():
             try:
-                f = parse_zonebourse([h for _, h in grp], grp[0][0])
+                hs_ = tuple(h for _, h in grp)
+                f = (copy.deepcopy(parse_zonebourse_cached(hs_, grp[0][0])) if use_cache
+                     else parse_zonebourse(list(hs_), grp[0][0]))     # cache décoché : relecture complète
                 f["source"] = "Zonebourse : " + ", ".join(n for n, _ in grp)
                 facts[f["ticker"]] = f
+                zb_store[f["ticker"]] = f             # gardées pour enrichir le portefeuille
                 if f["missing_finances"]:
                     errs.append(f"{comp} : onglet Finances non chargé — pas de consensus ni d'actif net ; "
                                 "ajoutez-le pour une analyse complète.")
             except Exception as e:
                 errs.append(f"{comp} : {e}")
-        fraws = raws_from_finviz_pages(fv_pages)
+        fraws = (copy.deepcopy(raws_from_finviz_pages_cached(tuple(fv_pages))) if use_cache
+                 else raws_from_finviz_pages(fv_pages))
         if fv_pages and not fraws:
             errs.append("Aucune fiche Finviz (page « quote ») reconnue parmi les pages Finviz déposées.")
         for t, r in fraws.items():
             if online:
                 with st.spinner(f"{t} : compléments en ligne…"):
                     try:
-                        complete_online(r, t, max_days, log=errs.append, openinsider=use_oi)
-                        r["source"] = "page Finviz + compléments en ligne"
+                        _, hit = complete_online_cached(r, t, max_days, use_cache, log=errs.append, openinsider=use_oi)
+                        r["source"] = "page Finviz + compléments en ligne" + (" (cache)" if hit else "")
                     except Exception as e:
                         errs.append(f"{t} : compléments en ligne impossibles ({e})")
             fvf = build_facts(r)
@@ -2647,7 +3093,7 @@ def main():
                 facts[t] = merge_facts(fvf, zf) if zf and zf.get("zb") else fvf
         # action US déposée seulement en pages Zonebourse : fiche Finviz récupérée en ligne puis combinée
         for t, zf in list(facts.items()):
-            if online and zf.get("zb") and not zf.get("merge_notes") and zf.get("currency") == "USD":
+            if online and zf.get("zb") and not zf.get("merged") and zf.get("currency") == "USD":
                 with st.spinner(f"{t} : fiche Finviz en ligne…"):
                     try:
                         fvf = build_facts(fetch_ticker(t, max_days, use_cache, log=errs.append, openinsider=use_oi))
@@ -2659,20 +3105,22 @@ def main():
                     except Exception as e:
                         errs.append(f"{t} : Finviz en ligne indisponible ({e}) — analyse Zonebourse seule.")
         st.session_state["wl_pages"], st.session_state["wl_errs_pages"] = facts, errs
+        st.session_state["zb_store"] = zb_store
 
     # « Valeurs à étudier » = pages HTML analysées + valeurs envoyées par le Screener JV
     st.session_state["wl"] = {**(st.session_state.get("wl_scr") or {}), **(st.session_state.get("wl_pages") or {})}
     st.session_state["wl_errs"] = list(st.session_state.get("wl_errs_pages") or []) + \
         list(st.session_state.get("wl_errs_scr") or [])
 
-    tab1, tab2, tab4, tab5, tab6, tab3 = st.tabs(["📋 Portefeuille", "🛒 Valeurs à étudier", "📰 Sentiment",
-                                                  "🔥 Sentiment screener", "🔎 Screener JV", "ℹ️ Méthode"])
+    tab1, tab2, tab4, tab5, tab6, tab7, tab3 = st.tabs(["📋 Portefeuille", "🛒 Valeurs à étudier", "📰 Sentiment",
+                                                        "🔥 Sentiment screener", "🔎 Screener JV", "👥 Screener initiés",
+                                                        "ℹ️ Méthode"])
 
     # ---------- calculs (avant les onglets : une erreur n'empêche pas l'affichage des autres onglets)
     pf_res, pf_err = None, None
     if raws:
         try:
-            pf_res = evaluate({t: build_facts(r) for t, r in raws.items()}, p, ov, pf)
+            pf_res = evaluate(portfolio_facts(raws, st.session_state.get("zb_store") or {}), p, ov, pf)
         except Exception as e:
             pf_err = e
     wl_res, wl_err, wl_notes = None, None, []
@@ -2703,7 +3151,8 @@ def main():
         else:
             df, det, keys = pf_res
             st.dataframe(df, hide_index=True, width="stretch", column_config=FMT)
-            st.caption("⟳ = valeur cyclique (bénéfices proches d'un pic). Survolez les en-têtes pour la définition des colonnes.")
+            st.caption("⟳ = valeur cyclique (bénéfices proches d'un pic). 📄 = combinée avec les pages Zonebourse déposées "
+                       "dans « Valeurs à étudier » (date des pages). Survolez les en-têtes pour la définition des colonnes.")
             buf = io.BytesIO()
             with pd.ExcelWriter(buf) as xw:
                 df.to_excel(xw, sheet_name="Synthèse", index=False)
@@ -2725,7 +3174,7 @@ def main():
             st.warning(e)
         if st.session_state.get("wl_scr"):
             c1, c2 = st.columns([3, 1])
-            c1.caption("Venues du Screener JV : " + ", ".join(st.session_state["wl_scr"]))
+            c1.caption("Venues des screeners (JV, initiés) : " + ", ".join(st.session_state["wl_scr"]))
             if c2.button("🗑️ Retirer les valeurs du screener", key="scr_rm"):
                 for k in ("wl_scr", "wl_errs_scr"):
                     st.session_state.pop(k, None)
@@ -2754,6 +3203,9 @@ def main():
 
     with tab6:
         render_screener(p, use_cache, max_days, use_oi)
+
+    with tab7:
+        render_insider_screener(max_days, use_cache, use_oi)
 
     with tab3:
         st.markdown("""
@@ -2835,7 +3287,14 @@ le flux de trésorerie d'une banque ou d'un courtier dépend des mouvements de s
 
 **Action US avec fiche Finviz et pages Zonebourse** déposées ensemble : les deux sont combinées. Finviz fournit le cours,
 le bêta (taux d'actualisation), les initiés, les options, les actualités et les analystes ; Zonebourse les prévisions sur 3 ans
-(scénarios), le PER historique (3e méthode) et la normalisation du flux libre. BNA N et N+1 = moyenne des deux consensus.
+(scénarios), le PER historique (3e méthode) et la normalisation du flux libre. BNA homogène avec chaque multiple : BNA
+Finviz (consensus ajusté) pour le PER cible et les comparables, BNA Zonebourse pour le PER historique (mêmes bases que leurs
+PER). Scission ou cession détectée (activités abandonnées dans les comptes Finviz et CA prévu inférieur de plus de 3 % aux 12
+derniers mois) : le DCF repart du CA et des marges du consensus (pro forma), sans l'activité sortie.
+
+**Portefeuille + pages Zonebourse** : les pages Zonebourse déposées dans « Valeurs à étudier » servent aussi aux valeurs du
+portefeuille (même ticker, même devise) : la fiche Finviz est alors combinée avec le consensus sur 3 ans, le PER historique et
+l'objectif Zonebourse (colonne « Pages Zonebourse » avec la date des pages). Sans page : Finviz seul.
 
 **Valeurs à étudier** : pages enregistrées, déposées dans la barre latérale (toujours visible, même avec un fichier de positions). Si la valeur est aussi dans le portefeuille, le prix d'entrée s'affiche avec « JV / prix d'entrée ». Une fiche Finviz seule donne le consensus, les analystes et les initiés ;
 cochez « compléter en ligne » pour les états financiers (capex), les options et Dataroma. Une page Zonebourse « Finances » donne
@@ -2844,6 +3303,13 @@ les prévisions du consensus sur 2 à 3 ans : le scénario central reprend ces p
 **🔎 Screener JV** : lit toutes les pages d'un screener Finviz (adresse collée), exclut les industries choisies
 (mines, acier, charbon… par défaut), calcule une juste valeur rapide sur la fiche Finviz seule et garde les actions
 dont la marge dépasse le seuil ; les meilleures partent en analyse complète dans « Valeurs à étudier ».
+
+**👥 Screener initiés** : univers = valeurs du S&P 500 de la grille Dataroma détenues par au moins N superinvestors
+(ou tout le S&P 500 pour OpenInsider). Deux analyses séparées : A. résumé initiés 6 mois de chaque fiche Dataroma (solde $ > 0) ;
+B. transactions OpenInsider sur la période choisie, levées d'options exclues (critère au choix : acheteurs distincts > vendeurs,
+nb d'achats > nb de ventes, ou solde $ > 0 ; achats sous le montant minimum ignorés, ventes toutes comptées). Une valeur est
+retenue dès qu'une des deux analyses la sélectionne. Le sentiment des initiés (ratios acheteurs/vendeurs, achats/ventes) est
+comparé à la même période l'an dernier ou à la période précédente : c'est l'évolution qui compte, pas le niveau.
 
 **🔥 Sentiment screener** : les actions les plus citées sur Reddit (ApeWisdom, 24 h, hors ETF) sont passées au crible du ton
 de leurs titres d'actualité Finviz ; sont retenues celles à l'actualité nettement positive (≥ 15 sur 30 j avec au moins 5 titres,
