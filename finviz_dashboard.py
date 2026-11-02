@@ -679,6 +679,19 @@ def parse_zonebourse(htmls, name=""):
     # une sortie de pertes continue (biotech qui devient rentable) n'est pas cyclique
     hist_eps = [bna[y] for y in act[-6:] if bna.get(y) is not None]
     relapse = any(a_ > 0 and b_ < 0 for i_, a_ in enumerate(hist_eps) for b_ in hist_eps[i_ + 1:])
+    # scission / cession (ex. Aptiv 2026) : CA prévu N < 80 % du dernier exercice publié alors que la marge d'EBITDA
+    # tient et que le CA repart en N+1 -> le dernier exercice n'est pas comparable : base = consensus N (pro forma)
+    mL = g(eb, L) / g(ca, L) if g(eb, L) is not None and g(ca, L) else None
+    mN = g(eb, N) / g(ca, N) if g(eb, N) is not None and g(ca, N) else None
+    f["spin"] = bool(g(ca, L) and g(ca, N) and g(ca, N + 1) and g(ca, N) < 0.8 * g(ca, L) and g(ca, N + 1) > g(ca, N)
+                     and mL and mN and mL > 0 and mN >= 0.9 * mL and not f.get("bank"))
+    if f["spin"]:
+        sp_ = lambda v: f"{v:,.0f}".replace(",", " ")
+        f["spin_note"] = (f"⚠️ scission ou cession détectée : CA prévu {N} {sp_(g(ca, N))} contre {sp_(g(ca, L))} en {L} "
+                          f"(marge d'EBITDA maintenue) → DCF, croissance et dette nette sur la base pro forma {N} ; "
+                          f"bond du BNA {L}→{N} non pris comme signal cyclique")
+        f["spin_short"] = f"scission/cession détectée : DCF sur la base pro forma {N}"
+        f["eps_this_y_pct"] = None                   # BNA publié et BNA pro forma non comparables
     f["cyclical"] = bool((f["eps_this_y_pct"] or 0) > 150 or relapse) and not f["bank"]
     # exception : redressement / croissance durable — le consensus prévoit encore un BNA en hausse ≥ 10 % par an en
     # N+1 et N+2, une marge d'EBITDA qui progresse jusqu'en N+2 et un CA en croissance ≥ 5 % par an (un pic de cycle
@@ -695,6 +708,8 @@ def parse_zonebourse(htmls, name=""):
     # croissance du CA (dernier exercice publié -> N+2) : plafonne la croissance du DCF
     c2 = g(ca, N + 2) or g(ca, N + 1)
     f["sales_cagr"] = ((c2 / g(ca, L)) ** (1 / (3 if g(ca, N + 2) else 2)) - 1) * 100 if c2 and g(ca, L) else None
+    if f["spin"]:                                    # croissance mesurée depuis la base pro forma N
+        f["sales_cagr"] = ((c2 / g(ca, N)) ** (1 / (2 if g(ca, N + 2) else 1)) - 1) * 100
     # flux libre irrégulier (acomptes clients, grands contrats…) : flux normalisé = médiane publiée + prévue
     act_fcf = [v for y, v in fcf.items() if y in act and v is not None][-5:]
     if len(act_fcf) >= 3:
@@ -709,8 +724,13 @@ def parse_zonebourse(htmls, name=""):
             eb1 = g(eb, N + 1) or g(eb, N)
             f["fcf_norm"] = min(norm, 0.8 * eb1) if eb1 else norm
     try:
+        a_, e_ = (list(act) + [N], [y for y in est if y != N]) if f["spin"] else (act, est)   # N = base pro forma
         f["dcfx"] = None if f.get("bank") else dcfx_from_zonebourse(
-            f["zb"], ca, eb, ser("Résultat d'exploitation"), capex, net_debt, act, est, shares, fcf)
+            f["zb"], ca, eb, ser("Résultat d'exploitation"), capex, net_debt, a_, e_, shares, fcf)
+        if f["spin"] and f["dcfx"]:
+            f["dcfx"]["src"] += f" — base pro forma {N}"
+            if g(net_debt, N) is not None:
+                f["net_debt"] = g(net_debt, N)
     except Exception:
         f["dcfx"] = None
     return f
@@ -860,6 +880,7 @@ def merge_facts(fv, zb):
                 notes.append(f"⚠️ scission ou cession détectée : CA prévu N {revs[0]:,.0f} < 12 derniers mois "
                              f"{x0['rev0']:,.0f} M → DCF recalé sur le consensus (pro forma) ; dette nette du dernier "
                              f"bilan publié".replace(",", " "))
+                f["spin_short"] = "scission/cession détectée : DCF sur la base pro forma du consensus"
                 fc["g"] = [revs[i + 1] / revs[i] - 1 for i in range(len(revs) - 1)]
                 fc["m"] = ms[2:2 + len(fc["g"])]
                 fc["capex"] = (fc.get("capex") or [])[1:1 + len(fc["g"])]
@@ -1242,7 +1263,9 @@ def dcfx_project(x, g0, dm, wacc, tg, exit_mult, cyclical, g_shift=0.0, years=DC
     ronic = max(wacc + 0.02, 0.10)                  # rentabilité des nouveaux investissements (prudente)
     rev, pv, rows = x["rev0"], 0.0, []
     nf = len(fg)
-    g_start = (fg[-1] if fg else g0)
+    # après le consensus : la décroissance vers la croissance perpétuelle part au plus de 25 % (même borne que la
+    # croissance de l'année 1 sans consensus) — une hyper-croissance prévue sur 3 ans n'est pas prolongée telle quelle
+    g_start = min(fg[-1], 0.25) if fg else g0
     for t in range(1, years + 1):
         if t <= nf:                                           # années couvertes par le consensus
             g = fg[t - 1] + g_shift * fc_shift
@@ -1472,7 +1495,13 @@ def fair_value(f, p):
     if capped:
         out["notes"].append(f"croissance du BNA ramenée à {g5:.0f} % (CA + 10 points ; consensus 5 ans "
                             f"{f['eps_5y']:.0f} %)")
+    out["_alerts"] = []
+    if f.get("spin_note"):
+        out["notes"].append(f["spin_note"])
+    if f.get("spin_short"):
+        out["_alerts"].append("⚠️ " + f["spin_short"])
     if f.get("turnaround") and not f.get("cyclical"):
+        out["_alerts"].append("ℹ️ redressement durable : non classée cyclique")
         out["notes"].append("redressement durable : bond du BNA mais consensus encore en hausse en N+1 et N+2 (marges et CA "
                             "en progression) → non classée cyclique (correction possible dans « Forcer le classement cyclique »)")
     if f.get("low_fpe"):
@@ -1488,6 +1517,18 @@ def fair_value(f, p):
         except Exception as e:
             out["notes"].append(f"DCF d'entreprise impossible ({type(e).__name__})")
             res = None
+        x_ = f["dcfx"]
+        boom = (res and not x_.get("fc") and not f.get("cyclical") and x_.get("capex0", 0) > 0.25
+                and x_.get("capex0", 0) > 3 * max(x_.get("da_pct") or 0, 0.01))
+        if boom:
+            # vague d'investissements (ex. Oracle : capex > CA, 7× les amortissements) sans consensus : le DCF
+            # prolonge la dépense sans voir le CA qu'elle doit produire -> non retenu ; JV = multiples
+            out["notes"].append(f"⚠️ investissements massifs ({x_['capex0'] * 100:.0f} % du CA, "
+                                f"{x_['capex0'] / max(x_['da_pct'], 0.01):.0f}× les amortissements) sans consensus "
+                                f"pluriannuel : DCF non significatif ({res['central']:.0f}), non retenu — déposez les "
+                                f"pages Zonebourse pour un DCF qui intègre le CA attendu de ces investissements")
+            out["_alerts"].append("⚠️ DCF non retenu : investissements massifs sans consensus (JV = multiples)")
+            res, f = None, dict(f, fcf_hist=[])
         if res and res["central"] <= 0:
             out["notes"].append("DCF d'entreprise négatif (flux trop faibles ou dette élevée) : non retenu")
             res = None
@@ -1507,6 +1548,7 @@ def fair_value(f, p):
                             f"perpétuelle {res['tg'] * 100:.1f} % / multiple de sortie {res['exit_mult']:.1f}x EBITDA ; "
                             f"fourchette P10–P90 de 2 000 simulations")
         if f.get("cash_unrep"):
+            out["_alerts"].append("⚠️ flux de trésorerie non représentatifs : DCF reconstruit depuis le résultat")
             out["notes"].append("⚠️ flux de trésorerie publiés non représentatifs (flux d'exploitation des 3 derniers "
                                 "exercices < 40 % du résultat + amortissements) : flux du DCF reconstruits depuis le "
                                 "résultat d'exploitation, P/FCF exclu des comparables")
@@ -1520,6 +1562,7 @@ def fair_value(f, p):
     if hist and f.get("cash_unrep"):
         out["notes"].append("⚠️ flux de trésorerie publiés non représentatifs de l'activité (flux libre très inférieur "
                             "au résultat) : pas de DCF sur le flux libre, ni de P/FCF dans les comparables")
+        out["_alerts"].append("⚠️ flux de trésorerie non représentatifs : pas de DCF sur le flux libre")
         hist = []
     if hist:
         fcf = min(hist[0], sum(hist) / len(hist)) if f["cyclical"] else hist[0]   # cyclique : jamais au-dessus du flux actuel
@@ -1652,6 +1695,12 @@ def precision(out, methods):
 
 def divergence_txt(f, fv):
     """Lecture de l'écart entre méthodes (précision 🟠 / 🔴) : causes probables, chiffrées, les plus fortes d'abord."""
+    alerts = " · ".join(fv.get("_alerts") or [])
+    why = _divergence_causes(f, fv)
+    return " · ".join(x for x in (alerts, why) if x)
+
+
+def _divergence_causes(f, fv):
     d = fv.get("Dispersion (%)")
     if not fv.get("JV centrale") or (d is not None and d <= 15 and not fv.get("_excl") and not fv.get("_peak_only")):
         return ""
@@ -2670,8 +2719,9 @@ FMT = {
     "JV / prix d'entrée (%)": st.column_config.NumberColumn(format="%+.0f %%", help="(JV centrale / prix d'entrée − 1) : positif = acheté sous la juste valeur"),
     "Écart JV (%)": st.column_config.NumberColumn(format="%+.0f %%", help="(JV centrale / cours − 1) : positif = cours sous la juste valeur"),
     "Lecture de l'écart": st.column_config.TextColumn(width="large",
-        help="Pour une précision 🟠 / 🔴 : pourquoi le DCF et les multiples divergent (causes probables, les deux "
-             "plus fortes), calculées à partir des données de la valeur."),
+        help="⚠️ / ℹ️ en tête : ajustement important du calcul (scission, flux de trésorerie non représentatifs, DCF non "
+             "retenu, redressement durable) — détail dans « 🔍 Détail ». Puis, pour une précision 🟠 / 🔴 : pourquoi le "
+             "DCF et les multiples divergent (causes probables, les deux plus fortes)."),
     "Précision JV": st.column_config.TextColumn(
         help="Concordance des méthodes retenues (DCF, PER, comparables…) : écart maximal à la JV centrale. "
              "🟢 ≤ 15 % : JV fiable ; 🟠 ≤ 35 % ; 🔴 au-delà : méthodes divergentes, JV incertaine. « DCF écarté » : "
@@ -2817,7 +2867,9 @@ def render_detail(f, d):
                 f"{d['an']['Potentiel (%)']:+.0f} %" if d["an"]["Potentiel (%)"] is not None else None)
     c[3].metric("P/C encours", d["pc"].get("P/C encours", "n.d."), d["pc"].get("Lecture P/C"), delta_color="off")
     st.caption(" · ".join(d["fv"]["notes"]))
-    why = divergence_txt(f, d["fv"])
+    for a_ in d["fv"].get("_alerts") or []:
+        st.warning(a_)
+    why = _divergence_causes(f, d["fv"])
     if why:
         st.warning("Écart entre méthodes — " + why)
     if f.get("merge_notes"):
@@ -3319,6 +3371,16 @@ après un exercice bénéficiaire. Exception (pages Zonebourse) : **redressement
 BNA en hausse d'au moins 10 % par an en N+1 et N+2, une marge d'EBITDA en progression et un CA en hausse d'au moins 5 % par
 an — un pic de cycle se lit au contraire par un BNA qui plafonne ou recule. L'exception ne s'applique pas aux industries
 cycliques par nature (semi-conducteurs et matériel informatique, automobile, pétrole et gaz, matériaux, chimie, mines).
+
+**Vague d'investissements sans consensus** (capex > 25 % du CA et > 3× les amortissements, sans pages Zonebourse) :
+le DCF prolongerait la dépense sans voir le CA qu'elle doit produire ; il n'est pas retenu et la JV repose sur les multiples.
+
+**Après le consensus** (années 4 à 10 du DCF) : la croissance du CA décroît linéairement vers la croissance perpétuelle
+en partant au plus de 25 % — une hyper-croissance prévue sur 3 ans (ex. Broadcom, +60 %/an) n'est pas prolongée telle quelle.
+
+**Scission ou cession** : avec Finviz (activités abandonnées dans les comptes) ou Zonebourse seul (CA prévu N < 80 % du
+dernier exercice alors que la marge d'EBITDA tient et que le CA repart en N+1), le DCF, la croissance et la dette nette
+repartent de la base pro forma N du consensus ; le bond du BNA entre l'exercice publié et N n'est pas lu comme un pic.
 Une valeur cyclique est valorisée sur un flux normalisé et 8x le BNA N+1, et ses scénarios supposent un plateau en N+2.
 
 **Initiés** : signal 🟢🟢 = achats groupés (au moins 2 dirigeants en 30 jours) ou achats du PDG / directeur financier (≥ 0,25 M$) ;
