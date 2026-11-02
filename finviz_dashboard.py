@@ -2785,6 +2785,16 @@ def label(t, f):
     return t + (" ⟳" if f["cyclical"] else "")
 
 
+def company_name(f, n=32):
+    """Nom court de la société (fiche Finviz, sinon titre de la page Zonebourse), sans forme juridique."""
+    import html as _h
+    nm = _h.unescape(str(f.get("company") or f.get("name") or "")).strip()
+    for _ in range(2):                                # « Holdings Inc », « Holdings Co. »
+        nm = re.sub(r",?\s+(Inc\.?|Corp\.?|Corporation|Co\.?|Ltd\.?|PLC|plc|N\.V\.|NV|SE|S\.A\.|SA|AG|Holdings?)$",
+                    "", nm).strip(" ,")
+    return nm[:n] + ("…" if len(nm) > n else "")
+
+
 def evaluate(facts, p, ov, pf=None):
     """facts : {ticker: faits} -> (tableau, détails, libellé -> ticker)."""
     rows, det = [], {}
@@ -2804,7 +2814,7 @@ def evaluate(facts, p, ov, pf=None):
             jvc = d["fv"].get("JV centrale")
             row = {"Cours": row.pop("Cours"), "Prix d'entrée": entry,
                    "JV / prix d'entrée (%)": (jvc / entry - 1) * 100 if jvc and entry else None, **row}
-        rows.append({"Ticker": label(t, f), **row})
+        rows.append({"Ticker": label(t, f), "Société": company_name(f), **row})
         det[t] = (f, d)
     df = pd.DataFrame(rows).sort_values("Écart JV (%)", ascending=False, na_position="last")
     if (df["Devise"] == "USD").all():
