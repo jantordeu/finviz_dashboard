@@ -1533,7 +1533,7 @@ def fair_value(f, p):
             res = None
         x_ = f["dcfx"]
         boom = (res and not x_.get("fc") and not f.get("cyclical") and x_.get("capex0", 0) > 0.25
-                and x_.get("capex0", 0) > 3 * max(x_.get("da_pct") or 0, 0.01))
+                and x_.get("capex0", 0) > 2.5 * max(x_.get("da_pct") or 0, 0.01))
         if boom:
             # vague d'investissements (ex. Oracle : capex > CA, 7× les amortissements) sans consensus : le DCF
             # prolonge la dépense sans voir le CA qu'elle doit produire -> non retenu ; JV = multiples
@@ -3397,7 +3397,7 @@ cycliques par nature (semi-conducteurs et matériel informatique, automobile, p�
 dette dépasse 30 % de la capitalisation, le coût des fonds propres est majoré (bêta réendetté, plafond 20 %) et la marge
 de crédit dépend de dette nette / EBITDA (1,5 à 6 points) — une dette lourde ne fait plus baisser le CMPC.
 
-**Vague d'investissements sans consensus** (capex > 25 % du CA et > 3× les amortissements, sans pages Zonebourse) :
+**Vague d'investissements sans consensus** (capex > 25 % du CA et > 2,5× les amortissements, sans pages Zonebourse) :
 le DCF prolongerait la dépense sans voir le CA qu'elle doit produire ; il n'est pas retenu et la JV repose sur les multiples.
 
 **Après le consensus** (années 4 à 10 du DCF) : la croissance du CA décroît linéairement vers la croissance perpétuelle
