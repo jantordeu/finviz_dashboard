@@ -1561,7 +1561,7 @@ def fair_value(f, p):
                             f"an 1 {res['g_rev'] * 100:.0f} %, 3 scénarios 25/50/25, valeur terminale moyenne croissance "
                             f"perpétuelle {res['tg'] * 100:.1f} % / multiple de sortie {res['exit_mult']:.1f}x EBITDA ; "
                             f"fourchette P10–P90 de 2 000 simulations")
-        if f.get("cash_unrep"):
+        if f.get("cash_unrep") and "reconstruits" in res.get("src", ""):
             out["_alerts"].append("⚠️ flux de trésorerie non représentatifs : DCF reconstruit depuis le résultat")
             out["notes"].append("⚠️ flux de trésorerie publiés non représentatifs (flux d'exploitation des 3 derniers "
                                 "exercices < 40 % du résultat + amortissements) : flux du DCF reconstruits depuis le "
@@ -1615,15 +1615,21 @@ def fair_value(f, p):
                                 + (f" ; WACC indicatif {wi * 100:.1f} %" if wi else ""))
         else:
             out["notes"].append("pas de DCF (flux libre négatif après rémunération en actions)")
-    # --- 2. PER cible x BNA N+1 ---
+    # --- 2. PER cible x BNA N+1 (redressement : BNA N+2 actualisé d'un an) ---
     eps = f["eps_next_y"]
+    e_lbl = f"BNA N+1 {eps:.2f}" if eps else ""
+    rec = recovery_eps(f, p)
+    if rec:
+        eps, e_lbl = rec[0], rec[1]
+        out["_alerts"].append("ℹ️ redressement : PER cible sur le BNA N+2 actualisé")
     if eps and eps > 0:
         pe = p["pe_cyc"] if f["cyclical"] else clamp(p["pe_base"] + 0.4 * (min(g5, 25) - 10), p["pe_min"], p["pe_max"])
         if f.get("pe_hist") and not f["cyclical"] and pe > 1.25 * f["pe_hist"]:
             pe = 1.25 * f["pe_hist"]
             out["notes"].append(f"PER cible plafonné à 1,25 × le PER historique ({f['pe_hist']:.1f}x)")
         out.update({"PER bas": eps * pe * 0.85, "PER": eps * pe, "PER haut": eps * pe * 1.15})
-        out["notes"].append(f"PER cible {pe:.1f}x sur BNA N+1 {eps:.2f}")
+        out["notes"].append(f"PER cible {pe:.1f}x sur {e_lbl}")
+    eps = f["eps_next_y"]                                # comparables et PER historique : BNA N+1
     # --- 3. comparables : sociétés comparables désignées par Finviz (médianes), sinon moyenne de l'industrie ---
     med = lambda xs: (sorted(xs)[len(xs) // 2] if len(xs) % 2 else
                       (sorted(xs)[len(xs) // 2 - 1] + sorted(xs)[len(xs) // 2]) / 2) if xs else None
@@ -1669,6 +1675,25 @@ def fair_value(f, p):
     if f["cyclical"] and "DCF" in (out.get("_excl") or []):
         out["_peak_only"] = True                     # PER et comparables appliqués au même BNA de pic : pas indépendants
     return out
+
+
+def recovery_eps(f, p):
+    """Redressement (pages Zonebourse, valeur non cyclique) : BNA N+2 ≥ 2 × BNA N+1 (ou BNA N+1 ≤ 0 et N+2 > 0) —
+    le BNA N+1 est celui du creux ; on retient le BNA N+2 du consensus actualisé d'un an au coût des fonds propres.
+    -> (BNA retenu, libellé) ou None."""
+    z = f.get("zb")
+    if not z or f.get("cyclical") or f.get("bank"):
+        return None
+    N = z.get("N")
+    b = z.get("bna") or {}
+    e1, e2 = b.get(N + 1) if N else None, b.get(N + 2) if N else None
+    if not e2 or e2 <= 0 or e1 is None or (e1 > 0 and e2 < 2 * e1):
+        return None
+    ke, _ = cost_of_equity(f, p)
+    ke = max(ke, 0.08)
+    v = e2 / (1 + ke)
+    return v, (f"BNA N+2 {e2:.2f} actualisé à {v:.2f} ({ke * 100:.1f} %) — redressement : BNA N+1 "
+               f"{e1:.2f} (Zonebourse), creux non représentatif")
 
 
 def synthese_dcf(out, w_dcf=0.5):
@@ -3391,6 +3416,10 @@ après un exercice bénéficiaire. Exception (pages Zonebourse) : **redressement
 BNA en hausse d'au moins 10 % par an en N+1 et N+2, une marge d'EBITDA en progression et un CA en hausse d'au moins 5 % par
 an — un pic de cycle se lit au contraire par un BNA qui plafonne ou recule. L'exception ne s'applique pas aux industries
 cycliques par nature (semi-conducteurs et matériel informatique, automobile, pétrole et gaz, matériaux, chimie, mines).
+
+**Redressement** (pages Zonebourse, valeur non cyclique) : si le BNA N+2 du consensus vaut au moins 2 fois le BNA N+1
+(ou si N+1 est une perte et N+2 un bénéfice), le PER cible s'applique au BNA N+2 actualisé d'un an au coût des fonds
+propres ; comparables et PER historique restent sur N+1.
 
 **Endettement et CMPC** : sans bêta de marché (pages Zonebourse), le taux unique vaut pour un endettement courant ; si la
 dette dépasse 30 % de la capitalisation, le coût des fonds propres est majoré (bêta réendetté, plafond 20 %) et la marge
