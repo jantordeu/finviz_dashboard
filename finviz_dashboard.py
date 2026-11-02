@@ -2619,7 +2619,7 @@ def render_insider_screener(max_days, use_cache, use_oi):
     if pick:
         view = view[view["sector"].isin(pick)]
 
-    t1, t2, t3, t4, t5 = st.tabs(["Tableau final", "A. Dataroma", "B. OpenInsider", "Transactions", "Diagnostic"])
+    t1, t4, t5 = st.tabs(["Tableau final", "Transactions", "Diagnostic"])
     with t1:
         if dr_df is not None and "ins_buy_n" in view:
             missing = view.loc[view["ins_buy_n"].isna() & ~view["ticker"].isin(uni["ticker"]), "ticker"]
@@ -2635,17 +2635,6 @@ def render_insider_screener(max_days, use_cache, use_oi):
         st.dataframe(an.display(view), width="stretch", hide_index=True, column_config=cfg)
         st.caption("🟢🟢 achats groupés et plus d'acheteurs que de vendeurs · 🟢 plus d'acheteurs · 🟠 autant ou plus "
                    "de vendeurs · ⚪ aucune transaction. Cas atypique : actionnaire >10 %, entité ou montant ≥ 50 M$.")
-    with t2:
-        if dr_df is None:
-            st.info("Analyse Dataroma désactivée dans les réglages.")
-        else:
-            cols = ["ticker", "name", "sector", "si_count", "ins_buy_n", "ins_buy_usd", "ins_sell_n", "ins_sell_usd",
-                    "dr_balance_usd", "url"]
-            st.dataframe(an.display(final[final["dr_ok"]][cols]), width="stretch", hide_index=True, column_config=cfg)
-    with t3:
-        cols = ["ticker", "name", "si_count", "oi_signal", "buyers", "sellers", "buy_tx", "sell_tx", "buy_usd",
-                "sell_usd", "balance_usd", "max_delta_own", "cluster", "atypical", "buyer_names", "oi_url"]
-        st.dataframe(an.display(final[final["oi_ok"]][cols]), width="stretch", hide_index=True, column_config=cfg)
     with t4:
         tk = st.selectbox("Valeur", ["(toutes)"] + (sorted(tx["ticker"].unique()) if not tx.empty else []),
                           key="ins_tx_tk")
