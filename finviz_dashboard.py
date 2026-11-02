@@ -1235,7 +1235,21 @@ def wacc_calc(f, x, p):
     ke = max(ke, p["tg"] + 0.03)
     e, d = f.get("mcap") or 0.0, max(x.get("debt") or 0.0, 0.0)
     cover = x["ebit"] / x["interest"] if x.get("ebit") and x.get("interest") else None
-    spread = 0.015 if cover is None or cover > 6 else 0.025 if cover > 3 else 0.04
+    if cover is not None:
+        spread = 0.015 if cover > 6 else 0.025 if cover > 3 else 0.04
+    else:                                         # pas de charge d'intérêts (pages Zonebourse) : dette nette / EBITDA
+        eb_ = x["rev0"] * x["m0"]
+        lev = (x.get("net_debt") or 0.0) / eb_ if eb_ > 0 else 9.0
+        spread = 0.015 if lev <= 1 else 0.025 if lev <= 2.5 else 0.04 if lev <= 4 else 0.06
+    # taux unique (pas de bêta de marché) : il vaut pour un endettement courant (dette / capitalisation ≈ 30 %) ;
+    # au-delà, le risque des actionnaires augmente (bêta réendetté, Hamada) — sinon une dette lourde et bon marché
+    # ferait baisser le CMPC (ex. Air France-KLM : dette = 3× la capitalisation)
+    if "taux unique" in how and e > 0 and d / e > 0.3:
+        de = min(d / e, 4.0)
+        bu = max(ke - p["rf"], 0.0) / p["erp"] / (1 + 0.75 * 0.3)
+        add = p["erp"] * bu * 0.75 * (de - 0.3)
+        ke = min(ke + add, 0.20)
+        how += f" + prime d'endettement {add * 100:.1f} pt (dette = {d / e:.1f}× la capitalisation)"
     kd = (p["rf"] + spread) * (1 - x["tax"])
     w = (e * ke + d * kd) / (e + d) if e + d > 0 else ke
     return {"ke": ke, "kd": kd, "spread": spread, "E": e, "D": d, "wacc": max(w, p["tg"] + 0.03), "how": how}
@@ -1494,7 +1508,7 @@ def fair_value(f, p):
     g5, capped = growth_expected(f)
     if capped:
         out["notes"].append(f"croissance du BNA ramenée à {g5:.0f} % (CA + 10 points ; consensus 5 ans "
-                            f"{f['eps_5y']:.0f} %)")
+                            + (f"{f['eps_5y']:.0f} %)" if f.get("eps_5y") is not None else "absent, 8 % par défaut)"))
     out["_alerts"] = []
     if f.get("spin_note"):
         out["notes"].append(f["spin_note"])
@@ -2200,7 +2214,8 @@ def reddit_scan(p, n_cand=40, n_top=10, use_cache=True, progress=None, log=print
             f = build_facts(raw)
             fv = fair_value(f, p)
             an = analyst_stats(f)
-        except Exception:
+        except Exception as e:
+            log(f"{t} : juste valeur impossible ({type(e).__name__} : {e})")
             f, fv, an = {"price": None, "target": None}, {}, {"Consensus": None, "Potentiel (%)": None}
         ana = f"{an['Consensus'] or '?'} · {f['target']:.0f}" if f.get("target") else (an.get("Consensus") or "n.d.")
         if an.get("Potentiel (%)") is not None:
@@ -2215,14 +2230,34 @@ def reddit_scan(p, n_cand=40, n_top=10, use_cache=True, progress=None, log=print
                      "Juste valeur": (f"{fv['JV centrale']:.0f} ({fv['JV basse']:.0f}–{fv['JV haute']:.0f})"
                                       if fv.get("JV centrale") else "n.d."),
                      "Écart JV (%)": fv.get("Écart (%)"),
+                     "Précision JV": precision_txt(fv) if fv.get("JV centrale") else "n.d.",
                      "Analystes · objectif": ana})
     df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values(["Score", "Reddit : rang"], ascending=[False, True]).head(n_top)
+    if not df.empty:                    # toutes les valeurs retenues, triées ; le top n_top est pris à l'affichage
+        df = df.sort_values(["Score", "Reddit : rang"], ascending=[False, True])
     return df, len(cand)
 
 
-def render_reddit_top(p, use_cache):
+def send_to_watchlist(sel, label, max_days, use_cache, use_oi):
+    """Envoie des tickers en analyse complète (fiche Finviz en ligne + états financiers…) dans « Valeurs à étudier »,
+    gardés à part des pages HTML déposées (jamais écrasées)."""
+    wl, errs = dict(st.session_state.get("wl_scr") or {}), list(st.session_state.get("wl_errs_scr") or [])
+    bar = st.progress(0.0)
+    for i, t in enumerate(sel):
+        bar.progress((i + 1) / len(sel), text=t)
+        try:
+            f = build_facts(fetch_ticker(t, max_days, use_cache, log=errs.append, openinsider=use_oi))
+            f["source"] = f"{label} + Finviz en ligne"
+            wl[t] = f
+        except Exception as e:
+            errs.append(f"{t} : {type(e).__name__} — {e}")
+    bar.empty()
+    st.session_state["wl_scr"], st.session_state["wl_errs_scr"] = wl, errs
+    st.success(f"{len(sel)} valeur(s) ajoutée(s) à l'onglet « 🛒 Valeurs à étudier ».")
+    st.rerun()
+
+
+def render_reddit_top(p, use_cache, max_days=200, use_oi=True):
     st.subheader("Reddit : 10 actions les plus citées à l'actualité positive")
     c1, c2 = st.columns([1, 3])
     n_cand = c1.slider("Actions examinées (rangs Reddit)", 20, 80, 40, 10, key="rd_n",
@@ -2244,8 +2279,15 @@ def render_reddit_top(p, use_cache):
         st.caption("Cliquez sur « Scanner Reddit » pour lancer la recherche.")
         return
     df, n, when, logs = res
+    only_prec = st.checkbox("Seulement les JV précises (🟢 / 🟠)", value=False, key="rd_prec",
+                            help="Méthodes concordantes à ± 35 % près : une forte marge avec des méthodes divergentes "
+                                 "est souvent un piège. Le classement reprend les suivantes pour garder 10 valeurs.")
+    if only_prec and not df.empty:
+        df = df[df["Précision JV"].astype(str).str.startswith(("🟢", "🟠"))]
+    df = df.head(10)
     if df.empty:
-        st.info(f"Aucune des {n} actions examinées n'a une actualité nettement positive ({when}).")
+        st.info(f"Aucune des {n} actions examinées n'a une actualité nettement positive"
+                + (" et une JV précise" if only_prec else "") + f" ({when}).")
     else:
         st.dataframe(df, hide_index=True, width="stretch", column_config={
             **FMT,
@@ -2253,13 +2295,19 @@ def render_reddit_top(p, use_cache):
             "Mentions 24 h": st.column_config.TextColumn(help="nombre de mentions sur 24 h (évolution par rapport à la veille)"),
             "Score": st.column_config.NumberColumn(format="%d", help="60 % ton 30 j + 40 % ton 7 j, +5 si les mentions ont bondi de 50 % ou plus"),
             "Juste valeur": st.column_config.TextColumn(help="calculée sur la fiche Finviz seule (sans états financiers) : indicative"),
+            "Précision JV": st.column_config.TextColumn(help="écart maximal des méthodes retenues à la JV : 🟢 ≤ 15 %, "
+                                                              "🟠 ≤ 35 %, 🔴 au-delà (même lecture que le Screener JV)"),
         })
     st.caption(f"Scan du {when} sur les {n} actions les plus citées (hors ETF). Reddit mesure l'attention, pas le ton : "
                "le ton vient des titres d'actualité Finviz (≥ 5 titres sur 30 j, score ≥ 15, 7 j non négatif). "
-               "Une action très discutée et bien notée peut déjà être chère : vérifiez la juste valeur. "
-               "Pour l'analyse complète, ajoutez le ticker à la liste du portefeuille ou déposez sa fiche Finviz.")
+               "Une action très discutée et bien notée peut déjà être chère : vérifiez la juste valeur.")
+    if not df.empty:
+        sel = st.multiselect("Envoyer en analyse complète (onglet « Valeurs à étudier »)", list(df["Ticker"]),
+                             default=[], key="rd_sel")
+        if st.button("➜ Analyse complète", key="rd_full", disabled=not sel):
+            send_to_watchlist(sel, "Sentiment screener", max_days, use_cache, use_oi)
     if logs:
-        with st.expander(f"{len(logs)} fiche(s) non lue(s)"):
+        with st.expander(f"{len(logs)} valeur(s) non lue(s) ou sans juste valeur"):
             st.write("\n".join(f"- {x}" for x in logs))
 
 
@@ -2400,8 +2448,8 @@ def render_screener(p, use_cache, max_days, use_oi):
     v = res[res["Écart JV (%)"].fillna(-999) >= marge]
     if no_cyc:
         v = v[~v["_cyc"]]
-    if only_prec and "_disp" in v:
-        v = v[v["_disp"].fillna(999) <= 35]
+    if only_prec:
+        v = v[v["Précision JV"].astype(str).str.startswith(("🟢", "🟠"))]
     v = v.sort_values("Écart JV (%)", ascending=False)
     cols = ["Ticker", "Société", "Industrie", "Cours", "Juste valeur (fourchette)", "Écart JV (%)", "Précision JV",
             "Lecture de l'écart", "Croissance implicite / attendue", "Analystes · objectif", "BNA N+1 (évol.)", "Résultats"]
@@ -2415,21 +2463,7 @@ def render_screener(p, use_cache, max_days, use_oi):
     sel = st.multiselect("Envoyer en analyse complète (onglet « Valeurs à étudier »)", list(v["_t"]),
                          default=list(v["_t"])[:5], key="scr_sel")
     if st.button("➜ Analyse complète", key="scr_full", disabled=not sel):
-        # valeurs du screener gardées à part : les pages HTML déjà analysées ne sont jamais écrasées
-        wl, errs = dict(st.session_state.get("wl_scr") or {}), list(st.session_state.get("wl_errs_scr") or [])
-        bar = st.progress(0.0)
-        for i, t in enumerate(sel):
-            bar.progress((i + 1) / len(sel), text=t)
-            try:
-                f = build_facts(fetch_ticker(t, max_days, use_cache, log=errs.append, openinsider=use_oi))
-                f["source"] = "Screener JV + Finviz en ligne"
-                wl[t] = f
-            except Exception as e:
-                errs.append(f"{t} : {type(e).__name__} — {e}")
-        bar.empty()
-        st.session_state["wl_scr"], st.session_state["wl_errs_scr"] = wl, errs
-        st.success(f"{len(sel)} valeur(s) ajoutée(s) à l'onglet « 🛒 Valeurs à étudier ».")
-        st.rerun()
+        send_to_watchlist(sel, "Screener JV", max_days, use_cache, use_oi)
 
 
 # ---------- Screener initiés : superinvestors (Dataroma) × achats des dirigeants (OpenInsider)
@@ -2624,20 +2658,7 @@ def render_insider_screener(max_days, use_cache, use_oi):
     sel = st.multiselect("Envoyer en analyse complète (onglet « Valeurs à étudier »)", list(view["ticker"]),
                          default=list(view["ticker"])[:5], key="ins_sel")
     if st.button("➜ Analyse complète", key="ins_full", disabled=not sel):
-        wl, errs = dict(st.session_state.get("wl_scr") or {}), list(st.session_state.get("wl_errs_scr") or [])
-        bar = st.progress(0.0)
-        for i, t in enumerate(sel):
-            bar.progress((i + 1) / len(sel), text=t)
-            try:
-                f = build_facts(fetch_ticker(t, max_days, use_cache, log=errs.append, openinsider=use_oi))
-                f["source"] = "Screener initiés + Finviz en ligne"
-                wl[t] = f
-            except Exception as e:
-                errs.append(f"{t} : {type(e).__name__} — {e}")
-        bar.empty()
-        st.session_state["wl_scr"], st.session_state["wl_errs_scr"] = wl, errs
-        st.success(f"{len(sel)} valeur(s) ajoutée(s) à l'onglet « 🛒 Valeurs à étudier ».")
-        st.rerun()
+        send_to_watchlist(sel, "Screener initiés", max_days, use_cache, use_oi)
 
     note = an.make_note(g, m, d, criterion, excl10, wdr, sc, min_value)
     stamp = f"{TODAY:%Y%m%d}"
@@ -3279,7 +3300,7 @@ def main():
             st.warning(e)
         if st.session_state.get("wl_scr"):
             c1, c2 = st.columns([3, 1])
-            c1.caption("Venues des screeners (JV, initiés) : " + ", ".join(st.session_state["wl_scr"]))
+            c1.caption("Venues des screeners (JV, sentiment, initiés) : " + ", ".join(st.session_state["wl_scr"]))
             if c2.button("🗑️ Retirer les valeurs du screener", key="scr_rm"):
                 for k in ("wl_scr", "wl_errs_scr"):
                     st.session_state.pop(k, None)
@@ -3304,7 +3325,7 @@ def main():
         render_sentiment(sent)
 
     with tab5:
-        render_reddit_top(p, use_cache)
+        render_reddit_top(p, use_cache, max_days, use_oi)
 
     with tab6:
         render_screener(p, use_cache, max_days, use_oi)
@@ -3371,6 +3392,10 @@ après un exercice bénéficiaire. Exception (pages Zonebourse) : **redressement
 BNA en hausse d'au moins 10 % par an en N+1 et N+2, une marge d'EBITDA en progression et un CA en hausse d'au moins 5 % par
 an — un pic de cycle se lit au contraire par un BNA qui plafonne ou recule. L'exception ne s'applique pas aux industries
 cycliques par nature (semi-conducteurs et matériel informatique, automobile, pétrole et gaz, matériaux, chimie, mines).
+
+**Endettement et CMPC** : sans bêta de marché (pages Zonebourse), le taux unique vaut pour un endettement courant ; si la
+dette dépasse 30 % de la capitalisation, le coût des fonds propres est majoré (bêta réendetté, plafond 20 %) et la marge
+de crédit dépend de dette nette / EBITDA (1,5 à 6 points) — une dette lourde ne fait plus baisser le CMPC.
 
 **Vague d'investissements sans consensus** (capex > 25 % du CA et > 3× les amortissements, sans pages Zonebourse) :
 le DCF prolongerait la dépense sans voir le CA qu'elle doit produire ; il n'est pas retenu et la JV repose sur les multiples.
