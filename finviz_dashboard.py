@@ -667,6 +667,12 @@ def parse_zonebourse(htmls, name=""):
     has_fcf = any(v is not None for v in fcf.values())
     # banque / assurance : ni EBITDA ni flux libre publiés (une industrielle sans EBITDA garde son flux libre)
     f["bank"] = not has_eb and not has_fcf
+    # banques et assureurs d'après le secteur Zonebourse : leurs flux et leur « dette » viennent du bilan
+    # (dépôts, placements, réserves techniques) -> pas de DCF d'entreprise, modèle financier (P/B justifié + PER)
+    sec0 = re.search(r"/secteurs/([a-z0-9\-]+/[a-z0-9\-]+)/", "".join(htmls))
+    sec0 = sec0.group(1) if sec0 else ""
+    f["insurer"] = "assurance" in sec0
+    f["bank"] = bool(f["bank"] or f["insurer"] or "services-bancaires" in sec0)
     if not has_eb and has_fcf:                        # EBITDA absent (ex. constructeur avec filiale de crédit, biotech) :
         ebit = ser("Résultat d'exploitation")          # résultat d'exploitation utilisé à la place
         if any(v is not None for v in ebit.values()):
@@ -757,6 +763,10 @@ def build_facts(raw):
     if f["mcap"] and f["price"] and f["shares"] and abs(f["mcap"] / f["price"] / f["shares"] - 1) > 0.2:
         f["shares"] = f["mcap"] / f["price"]
     f["rev"], f["ebitda"] = stmt(IA, "Total Revenue"), stmt(IA, "EBITDA")
+    # BNA publié des exercices clos (comptable), du plus ancien au plus récent
+    if IA and IA.get("Period") and IA.get("EPS (Diluted)"):
+        f["eps_hist"] = [(str(pp).replace("FY", ""), num(v)) for pp, v in zip(IA["Period"], IA["EPS (Diluted)"])
+                         if "FY" in str(pp) and num(v) is not None][::-1]
     try:
         f["dcfx"] = dcfx_from_finviz(IA, BA, CA, sn)
     except Exception:
@@ -801,6 +811,7 @@ def build_facts(raw):
     # banque / courtier / assureur : pas d'EBITDA ni de flux libre significatif -> modèle bancaire (actif net, PER)
     f["bank"] = f["sector"] == "Financial" and bool(
         re.search(r"Bank|Capital Markets|Insurance|Mortgage", f["industry"]) or f["ebitda"] is None)
+    f["insurer"] = f["bank"] and "Insurance" in f["industry"]
     jump = (f["eps_this_y_pct"] or 0) > 150
     defensive = f["sector"] in DEFENSIVE_SECTORS
     f["cyclical"] = bool(jump and (not defensive or (f["eps_next_y_pct"] is not None and f["eps_next_y_pct"] < 10))) \
@@ -831,6 +842,7 @@ def merge_facts(fv, zb):
     notes = []
     f["merged"] = True
     f["bank"] = bool(fv.get("bank") or zb.get("bank"))
+    f["insurer"] = bool(fv.get("insurer") or zb.get("insurer"))
     for k in ("eps_this_y", "eps_next_y"):
         a, b = fv.get(k), zb.get(k)
         if not (a and a > 0) and b:
@@ -1028,6 +1040,7 @@ def add_hist_pe(f, out):
     eps, pe = f.get("eps_next_y_zb") or f["eps_next_y"], f.get("pe_hist")   # même base que les PER Zonebourse
     if eps and eps > 0 and pe:
         out.update({"PER hist. bas": eps * pe * 0.85, "PER hist.": eps * pe, "PER hist. haut": eps * pe * 1.15})
+        out.setdefault("_mult", {})["PER hist."] = f"PER historique {pe:.1f}x × BNA {eps:.2f}"
         out["notes"].append(f"PER historique médian {pe:.1f}x" + (f" (P/B historique médian {f['pb_hist']:.2f})"
                                                                  if f.get("pb_hist") else ""))
 
@@ -1051,17 +1064,31 @@ def fair_value_bank(f, p):
         pe_b = p.get("pe_bank_us", 12.0)             # banques US : PER historique ~12x (Europe ~8-9x)
     else:
         pe_b = p["pe_bank"]
+    ins = bool(f.get("insurer"))
+    if ins:
+        # assureur : coût des fonds propres de la valeur (CAPM ou taux unique, ≥ 8 %) plutôt que celui des banques ;
+        # PER cible selon la croissance, plafonné à 1,25 × le PER historique, plutôt que le PER bancaire
+        k = max(cost_of_equity(f, p)[0], 0.08)
+        g5, _ = growth_expected(f)
+        pe_b = clamp(p["pe_base"] + 0.4 * (min(g5, 25) - 10), p["pe_min"], p["pe_max"])
+        if f.get("pe_hist") and pe_b > 1.25 * f["pe_hist"]:
+            pe_b = 1.25 * f["pe_hist"]
+        out["notes"].append("assureur : modèle financier (actif net × P/B justifié, PER) — pas de DCF d'entreprise, "
+                            "les flux et la dette d'un assureur dépendent de son bilan (placements, réserves)")
     if bv and roe:
         r = roe / 100
         v = lambda kk: bv * max(r - g, 0) / (kk - g)
         out.update({"P/B bas": v(k + 0.01), "P/B": v(k), "P/B haut": v(k - 0.01)})
+        out.setdefault("_mult", {})["P/B"] = f"P/B justifié {v(k) / bv:.2f} × actif net {bv:.1f}"
         out["notes"].append(f"Actif net {bv:.1f} × P/B justifié {v(k) / bv:.2f} (ROE {roe:.1f} %, coût des fonds propres "
                             f"{k * 100:.1f} %, g {g * 100:.1f} %)")
     eps = f["eps_next_y"]
     if eps and eps > 0:
         pe = pe_b
         out.update({"PER bas": eps * pe * 0.85, "PER": eps * pe, "PER haut": eps * pe * 1.15})
-        out["notes"].append(f"PER bancaire {pe:.1f}x sur BNA N+1 {eps:.2f}")
+        lbl_ = "PER cible" if ins else "PER bancaire"
+        out.setdefault("_mult", {})["PER"] = f"{lbl_} {pe:.1f}x × BNA N+1 {eps:.2f}"
+        out["notes"].append(f"{lbl_} {pe:.1f}x sur BNA N+1 {eps:.2f}")
     add_hist_pe(f, out)
     synthese(out, ("P/B", "PER", "PER hist."))
     if out.get("JV centrale") and f["price"]:
@@ -1628,6 +1655,7 @@ def fair_value(f, p):
             pe = 1.25 * f["pe_hist"]
             out["notes"].append(f"PER cible plafonné à 1,25 × le PER historique ({f['pe_hist']:.1f}x)")
         out.update({"PER bas": eps * pe * 0.85, "PER": eps * pe, "PER haut": eps * pe * 1.15})
+        out.setdefault("_mult", {})["PER"] = f"PER cible {pe:.1f}x × {e_lbl.split(' (')[0].split(' —')[0]}"
         out["notes"].append(f"PER cible {pe:.1f}x sur {e_lbl}")
     eps = f["eps_next_y"]                                # comparables et PER historique : BNA N+1
     # --- 3. comparables : sociétés comparables désignées par Finviz (médianes), sinon moyenne de l'industrie ---
@@ -1656,6 +1684,9 @@ def fair_value(f, p):
         if parts:
             c = sum(parts) / len(parts)
             out.update({"Comparables bas": c * 0.85, "Comparables": c, "Comparables haut": c * 1.15})
+            out.setdefault("_mult", {})["Comparables"] = (
+                f"PER prév. {clamp(im['fpe'], p['pe_min'], p['pe_max']):.1f}x" if im.get("fpe") else "") + (
+                f" · P/FCF {clamp(im['pfcf'], 8.0, 25.0):.1f}x" if im.get("pfcf") and len(parts) > 1 else "")
             out["notes"].append(f"comparables — {src} : PER prévisionnel {im.get('fpe') or 0:.1f}x, "
                                 f"P/FCF {im.get('pfcf') or 0:.1f}x (bornés)")
     # --- synthèse ---
@@ -1718,6 +1749,7 @@ def synthese_dcf(out, w_dcf=0.5):
     out["Dispersion (%)"] = max(abs(dcf / jv - 1), abs(mc / jv - 1)) * 100
     out["_keep"], out["_excl"] = ["DCF"] + keep, [m for _, m in mult if m not in keep]
     out["_mode"] = "dcf"
+    out["_w_dcf"] = w_dcf
     out["notes"].append(f"JV = {w_dcf * 100:.0f} % DCF ({dcf:.0f}) + {(1 - w_dcf) * 100:.0f} % multiples ({mc:.0f}, "
                         f"médiane de {', '.join(m for _, m in mult)})")
 
@@ -2551,6 +2583,7 @@ def render_insider_screener(max_days, use_cache, use_oi):
                                                     "sp500": "Tout le S&P 500 (500 valeurs, ≈ 5 s)"}[k])
             days = st.select_slider("Période (jours de déclaration)", [30, 60, 90, 120, 180], 90, key="ins_days")
             compare = st.radio("Sentiment comparé à (≈ +5 s)", list(an.COMPARE), format_func=lambda k: an.COMPARE[k],
+                               index=list(an.COMPARE).index("precedente") if "precedente" in an.COMPARE else 0,
                                key="ins_compare", help="L'an dernier : même saison, même calendrier de résultats. "
                                                        "Période précédente : tendance récente.")
         with c[2]:
@@ -2592,7 +2625,7 @@ def render_insider_screener(max_days, use_cache, use_oi):
     prev_tx = an.filter_tx(prev_raw, excl10, min_value) if prev_raw is not None else None
     s_now = oi.sentiment(tx)
     s_prev = oi.sentiment(prev_tx) if prev_tx is not None else None
-    cmp_mode = st.session_state.get("ins_cmp", "an")
+    cmp_mode = st.session_state.get("ins_cmp", "precedente")
     sent = an.sentiment_table(s_now, s_prev, d, cmp_mode)
     p_prev = an.compare_range(d, cmp_mode)
 
@@ -2737,7 +2770,7 @@ def analyze(f, p, ov=None):
            "Dette nette/EBITDA": lev,                                # actuel (dette nette du jour / EBITDA 12 mois)
            "Résultats": f["earnings"],
            "Pages Zonebourse": ("📄 " + (f.get("zb_date") or "")) if f.get("zb") else ""}
-    return row, {"fv": fv, "an": an, "si": si, "pc": pc, "ins": ins, "sc": sc}
+    return row, {"fv": fv, "an": an, "si": si, "pc": pc, "ins": ins, "sc": sc, "lev": lev}
 
 
 DEFAULT_P = {"wacc": 0.09, "tg": 0.025, "gcap": 0.15, "pe_base": 18.0, "pe_min": 10.0, "pe_max": 28.0,
@@ -2900,34 +2933,252 @@ def render_dcfx(f, res):
         st.caption(f"Cours : {f['price']:.2f}. Moyenne des deux valeurs terminales.")
 
 
-def render_detail(f, d):
+METHODS = [("DCF", "DCF"), ("PER", "PER"), ("Comparables", "Comparables"), ("PER hist.", "PER historique"),
+           ("P/B", "Actif net (P/B)")]
+
+
+def render_fv_tables(fv, cur):
+    """Juste valeur en deux tableaux : 1) valeur par action de chaque méthode (avec le multiple ou le taux utilisé)
+    et synthèse ; 2) indicateurs (taux, croissances, précision)."""
+    keep = set(fv.get("_keep") or [])
+    mult = fv.get("_mult") or {}
+    rows = []
+    for k, lbl in METHODS:
+        if fv.get(k) is None:
+            continue
+        hyp = mult.get(k, "")
+        if k == "DCF":
+            hyp = (f"CMPC {fv['CMPC (%)']:.1f} %" if fv.get("CMPC (%)") else
+                   f"coût des fonds propres {fv['Coût fonds propres (%)']:.1f} %" if fv.get("Coût fonds propres (%)") else "")
+        rows.append({"Méthode": lbl, "Hypothèse": hyp, f"Basse ({cur})": fv.get(k + " bas"),
+                     f"Centrale ({cur})": fv[k], f"Haute ({cur})": fv.get(k + " haut"),
+                     "Retenue": "✓" if not keep or k in keep else "écartée"})
+    if fv.get("JV centrale"):
+        rows.append({"Méthode": "➜ Juste valeur", "Hypothèse": "", f"Basse ({cur})": fv.get("JV basse"),
+                     f"Centrale ({cur})": fv["JV centrale"], f"Haute ({cur})": fv.get("JV haute"), "Retenue": ""})
+    if rows:
+        st.dataframe(pd.DataFrame(rows).round(1), hide_index=True, width="stretch")
+        st.caption(f"Valeurs par action en {cur.strip()} (pas des ratios) : multiple ou taux utilisé dans « Hypothèse »."
+                   + (f" Médiane des multiples : {fv['Multiples (médiane)']:.1f} ; juste valeur = "
+                      f"{fv['_w_dcf'] * 100:.0f} % DCF + {(1 - fv['_w_dcf']) * 100:.0f} % multiples (réglable)."
+                      if fv.get("Multiples (médiane)") and fv.get("_w_dcf") is not None else
+                      " Juste valeur = médiane des méthodes (moyenne s'il n'y en a que deux)." if fv.get("JV centrale") else ""))
+    skip = {m for k, _ in METHODS for m in (k, k + " bas", k + " haut")} | {
+        "JV centrale", "JV basse", "JV haute", "Multiples (médiane)", "notes"}
+    ind = {k: v for k, v in fv.items() if k not in skip and not k.startswith("_") and isinstance(v, (int, float))}
+    if ind:
+        st.dataframe(pd.DataFrame([ind]).round(1), hide_index=True)
+
+
+def _md(x):
+    """Texte affiché en Markdown : « $ » échappé (sinon Streamlit l'interprète comme une formule)."""
+    return str(x).replace("$", "\\$")
+
+
+def short_source(f):
+    """Source lisible : noms de fichiers Zonebourse remplacés par « Zonebourse (pages du …) »."""
+    src = str(f.get("source") or "Finviz en ligne")
+    src = re.sub(r"Zonebourse\s*:.*$", "Zonebourse", src)
+    if f.get("zb_date") and "Zonebourse" in src:
+        src = src.replace("Zonebourse", f"Zonebourse (pages du {f['zb_date']})", 1)
+    return src
+
+
+def _eps_series(f):
+    """BNA : historique publié + consensus -> [(exercice, BNA, « publié » / « consensus »)]."""
+    z = f.get("zb")
+    out = []
+    if z and z.get("bna"):
+        N, L = z.get("N"), z.get("L")
+        for y in sorted(z["bna"]):
+            v = z["bna"][y]
+            if v is None or (L and y < L - 4):
+                continue
+            out.append((str(y), v, "publié" if L and y <= L else "consensus"))
+        return out
+    for lbl, v in (f.get("eps_hist") or [])[-5:]:
+        out.append((lbl, v, "publié"))
+    if f.get("eps_this_y") is not None:
+        out.append(("N (en cours)", f["eps_this_y"], "consensus"))
+    if f.get("eps_next_y") is not None:
+        out.append(("N+1", f["eps_next_y"], "consensus"))
+    return out
+
+
+def _cagr(a, b, n):
+    return ((b / a) ** (1 / n) - 1) * 100 if a and b and a > 0 and b > 0 and n > 0 else None
+
+
+def en_bref(f, d, cur):
+    """3 à 4 phrases : juste valeur, fourchette, potentiel, écart avec les analystes, principal point d'attention."""
+    fv, an = d["fv"], d["an"]
+    jv, pr = fv.get("JV centrale"), f.get("price")
+    if not jv or not pr:
+        return "Juste valeur non calculable avec les données disponibles."
+    s = [f"Juste valeur **{jv:.0f} {cur}** (fourchette {fv['JV basse']:.0f}–{fv['JV haute']:.0f}), soit "
+         f"**{(jv / pr - 1) * 100:+.0f} %** par rapport au cours de {pr:.2f} {cur}."]
+    keep = [lbl for k, lbl in METHODS if k in (fv.get("_keep") or [])]
+    if keep:
+        s.append(f"Méthodes retenues : {', '.join(keep)} ; précision {precision_txt(fv)}.")
+    if f.get("target"):
+        e = (jv / f["target"] - 1) * 100
+        s.append(f"Objectif moyen des analystes : {f['target']:.0f} {cur} ({an.get('Consensus') or 'n.d.'}) — la juste "
+                 f"valeur est {'au-dessus' if e > 0 else 'en dessous'} de {abs(e):.0f} %"
+                 + (" : écart expliqué en section 7." if abs(e) > 10 else "."))
+    al = fv.get("_alerts") or []
+    if al:
+        s.append("À noter : " + " ; ".join(a.lstrip("⚠️ℹ️ ").strip() for a in al) + ".")
+    elif f.get("cyclical"):
+        s.append("Valeur classée cyclique : calcul prudent (bénéfices possiblement proches d'un pic).")
+    return " ".join(s)
+
+
+def risk_points(f, d):
+    """Points de vigilance et points favorables, déduits des données."""
+    fv, ins, si = d["fv"], d["ins"], d["si"]
+    bad, good = [], []
+    if f.get("cyclical"):
+        bad.append("valeur cyclique : multiples appliqués à des bénéfices qui peuvent être proches d'un pic")
+    lev = d.get("lev")
+    if lev is not None and lev > 3 and not f.get("bank"):
+        bad.append(f"endettement élevé : dette nette = {lev:.1f}× l'EBITDA")
+    tv = fv.get("Valeur terminale (% VE)") or fv.get("Valeur terminale (% du DCF)")
+    if tv and tv > 75:
+        bad.append(f"valeur très dépendante du long terme : valeur terminale = {tv:.0f} % de la valeur du DCF")
+    gi, ga = fv.get("g implicite (%)"), fv.get("g attendue (%)")
+    if gi is not None and ga is not None and gi - ga >= 8:
+        bad.append(f"le cours suppose une croissance de {gi:.0f} %/an, contre {ga:.0f} % retenus")
+    if fv.get("Dispersion (%)") and fv["Dispersion (%)"] > 35:
+        bad.append(f"méthodes divergentes (±{fv['Dispersion (%)']:.0f} %) : juste valeur incertaine")
+    if f.get("short") and f["short"] > 10:
+        bad.append(f"vente à découvert élevée ({f['short']:.1f} % du flottant)")
+    if f.get("target") and f.get("eps_next_y") and f["eps_next_y"] > 0 and f["target"] / f["eps_next_y"] > 35:
+        bad.append(f"l'objectif des analystes suppose un PER de {f['target'] / f['eps_next_y']:.0f}x le BNA N+1")
+    for a_ in fv.get("_alerts") or []:
+        (bad if a_.startswith("⚠️") else good if "redressement" in a_ else bad).append(a_.lstrip("⚠️ℹ️ ").strip())
+    if ins and str(ins.get("Signal", "")).startswith("🟢"):
+        good.append("achats des dirigeants : " + ins["Résumé"])
+    elif ins and str(ins.get("Signal", "")).startswith("🟠"):
+        bad.append("ventes des dirigeants : " + ins["Résumé"])
+    if si and si.get("Lignes") and str(si.get("Signal", "")).startswith("🟢"):
+        good.append("super investors : " + si["Résumé"])
+    if fv.get("Écart (%)") is not None and fv["Écart (%)"] > 15 and precision_txt(fv).startswith("🟢"):
+        good.append(f"juste valeur supérieure au cours de {fv['Écart (%)']:.0f} % avec des méthodes concordantes")
+    if fv.get("Probabilité JV DCF > cours (%)") is not None and fv["Probabilité JV DCF > cours (%)"] >= 75:
+        good.append(f"{fv['Probabilité JV DCF > cours (%)']:.0f} % des simulations du DCF dépassent le cours")
+    return bad[:5], good[:4]
+
+
+def football_field(fv, f, cur):
+    """Graphique « terrain de football » : une barre basse–haute par méthode, la juste valeur mise en avant,
+    le cours et l'objectif des analystes en lignes de référence."""
+    import altair as alt
+    rows = [{"Méthode": lbl, "Basse": fv.get(k + " bas"), "Haute": fv.get(k + " haut"), "Centrale": fv[k]}
+            for k, lbl in METHODS if fv.get(k) is not None and fv.get(k + " bas") is not None]
+    if fv.get("JV centrale"):
+        rows.append({"Méthode": "➜ Juste valeur", "Basse": fv["JV basse"], "Haute": fv["JV haute"],
+                     "Centrale": fv["JV centrale"]})
+    if len(rows) < 2:
+        return
+    df = pd.DataFrame(rows)
+    order = list(df["Méthode"])
+    base = alt.Chart(df).encode(y=alt.Y("Méthode:N", sort=order, title=None,
+                                        axis=alt.Axis(labelOverlap=False, labelLimit=200, labelFontSize=12)))
+    bars = base.mark_bar(size=16, cornerRadius=3).encode(
+        x=alt.X("Basse:Q", title=f"Valeur par action ({cur.strip()})"), x2="Haute:Q",
+        color=alt.condition(alt.datum["Méthode"] == "➜ Juste valeur", alt.value("#2e7d32"), alt.value("#90a4ae")),
+        tooltip=["Méthode", alt.Tooltip("Basse:Q", format=".0f"), alt.Tooltip("Centrale:Q", format=".0f"),
+                 alt.Tooltip("Haute:Q", format=".0f")])
+    ticks = base.mark_tick(color="black", thickness=2, size=18).encode(x="Centrale:Q")
+    refs = [{"Repère": f"Cours {f['price']:.0f}", "x": f["price"]}] if f.get("price") else []
+    if f.get("target"):
+        refs.append({"Repère": f"Objectif analystes {f['target']:.0f}", "x": f["target"]})
+    layers = [bars, ticks]
+    if refs:
+        rdf = pd.DataFrame(refs)
+        layers.append(alt.Chart(rdf).mark_rule(strokeDash=[5, 4], size=2).encode(
+            x="x:Q", color=alt.Color("Repère:N", scale=alt.Scale(range=["#d32f2f", "#1565c0"]),
+                                     legend=alt.Legend(orient="bottom", title=None))))
+    st.altair_chart(alt.layer(*layers).properties(height=48 * len(rows) + 30), width="stretch", theme=None)
+
+
+def render_detail(f, d, t=None):
+    fv = d["fv"]
     cur = {"USD": "$", "EUR": "€"}.get(f.get("currency"), f.get("currency", "") + " ")
-    st.caption(f"Source : {f.get('source', 'Finviz en ligne')}")
-    c = st.columns(4)
+    name = company_name(f, 60)
+    # ---------- 1. Fiche d'identité
+    tk = t or f.get("ticker") or ""
+    st.markdown(f"### {name} ({tk})" if name and tk and name != tk else f"### {name or tk}")
+    st.markdown("##### 1. Fiche d'identité")
+    c = st.columns(5)
     c[0].metric("Cours", f"{f['price']:.2f} {cur}" if f["price"] else "n.d.")
-    jv = d["fv"].get("JV centrale")
-    c[1].metric("Juste valeur", f"{jv:.0f} {cur}" if jv else "n.d.",
-                f"{d['fv']['Écart (%)']:+.0f} %" if d["fv"].get("Écart (%)") is not None else None)
-    c[2].metric("Objectif analystes", f"{f['target']:.0f} {cur}" if f["target"] else "n.d.",
-                f"{d['an']['Potentiel (%)']:+.0f} %" if d["an"]["Potentiel (%)"] is not None else None)
-    c[3].metric("P/C encours", d["pc"].get("P/C encours", "n.d."), d["pc"].get("Lecture P/C"), delta_color="off")
-    st.caption(" · ".join(d["fv"]["notes"]))
-    for a_ in d["fv"].get("_alerts") or []:
-        st.warning(a_)
-    why = _divergence_causes(f, d["fv"])
-    if why:
-        st.warning("Écart entre méthodes — " + why)
-    if f.get("merge_notes"):
-        st.info("Finviz + Zonebourse — " + " · ".join(f["merge_notes"]))
+    c[1].metric("Capitalisation", f"{f['mcap'] / 1e3:,.1f} Md {cur}".replace(",", " ") if f.get("mcap") else "n.d.")
+    lev = d.get("lev")
+    c[2].metric("Dette nette / EBITDA", "trésorerie nette" if lev is not None and lev < 0 else
+                f"{lev:.1f}x" if lev is not None else "n.d.")
+    c[3].metric("Bêta", f"{f['beta']:.2f}" if f.get("beta") else "n.d.")
+    c[4].metric("Dividende / action", f"{f['div_ps']:.2f} {cur}" if f.get("div_ps") else "aucun")
+    info = [x for x in (f.get("sector"), f.get("industry") or (f.get("zb_sector") or "").replace("-", " "),
+                        f"devise {f.get('currency', 'USD')}",
+                        f"prochains résultats : {f['earnings']}" if f.get("earnings") else None,
+                        "⟳ cyclique" if f.get("cyclical") else None, "🏦 modèle financier" if f.get("bank") else None) if x]
+    st.caption(" · ".join(info) + f" — source : {short_source(f)}")
     if f.get("fx_note"):
-        st.info("💱 " + f["fx_note"])
-    st.markdown("**Juste valeur**")
-    st.dataframe(pd.DataFrame([{k: v for k, v in d["fv"].items() if k != "notes" and not k.startswith("_")}]).round(1),
-                 hide_index=True)
-    if d["fv"].get("_dcfx"):
-        render_dcfx(f, d["fv"]["_dcfx"])
-    if d["fv"].get("_dcf"):
-        fcf, g0, ke, sh = d["fv"]["_dcf"]
+        st.caption("💱 " + f["fx_note"])
+    # ---------- 2. En bref
+    st.markdown("##### 2. En bref")
+    c = st.columns(4)
+    jv = fv.get("JV centrale")
+    c[0].metric("Juste valeur", f"{jv:.0f} {cur}" if jv else "n.d.",
+                f"{fv['Écart (%)']:+.0f} %" if fv.get("Écart (%)") is not None else None)
+    c[1].metric("Objectif analystes", f"{f['target']:.0f} {cur}" if f["target"] else "n.d.",
+                f"{d['an']['Potentiel (%)']:+.0f} %" if d["an"]["Potentiel (%)"] is not None else None)
+    c[2].metric("Précision", precision_txt(fv).split(" (")[0] if jv else "n.d.")
+    c[3].metric("Croissance implicite / attendue", reverse_txt(fv))
+    st.info(_md(en_bref(f, d, cur)))
+    for a_ in fv.get("_alerts") or []:
+        st.warning(a_)
+    # ---------- 3. Bénéfice par action
+    st.markdown("##### 3. Bénéfice par action (BNA)")
+    ser = _eps_series(f)
+    if ser:
+        edf = pd.DataFrame(ser, columns=["Exercice", "BNA", "Type"])
+        import altair as alt
+        st.altair_chart(alt.Chart(edf).mark_bar().encode(
+            x=alt.X("Exercice:N", sort=list(edf["Exercice"]), title=None),
+            y=alt.Y("BNA:Q", title=f"BNA ({cur.strip()})"),
+            color=alt.Color("Type:N", scale=alt.Scale(domain=["publié", "consensus"], range=["#607d8b", "#43a047"]),
+                            legend=alt.Legend(orient="bottom", title=None)),
+            tooltip=["Exercice", alt.Tooltip("BNA:Q", format=".2f"), "Type"]).properties(height=220),
+            width="stretch")
+        pub = [v for _, v, t in ser if t == "publié"]
+        est = [v for _, v, t in ser if t == "consensus"]
+        txt = []
+        g_h = _cagr(pub[0], pub[-1], len(pub) - 1) if len(pub) >= 2 else None
+        if g_h is not None:
+            txt.append(f"croissance annuelle publiée {g_h:+.0f} % ({ser[0][0]} → {[s_ for s_ in ser if s_[2] == 'publié'][-1][0]})")
+        if pub and est:
+            g_e = _cagr(pub[-1], est[-1], len(est))
+            if g_e is not None:
+                txt.append(f"attendue par le consensus {g_e:+.0f} %/an")
+        if f.get("eps_5y") is not None:
+            txt.append(f"consensus à 5 ans {f['eps_5y']:.0f} %/an")
+        st.caption((("BNA " + " ; ".join(txt) + ". ") if txt else "") +
+                   "Historique : BNA comptable publié. Prévisions : consensus des analystes, en général sur le BNA "
+                   "non-GAAP (« ajusté » : hors rémunérations en actions, amortissements d'acquisitions, éléments "
+                   "exceptionnels) — c'est lui qu'utilisent le PER cible et les comparables ; le PER historique reste "
+                   "sur le BNA comptable, le DCF part des flux de trésorerie et déduit les rémunérations en actions.")
+    else:
+        st.caption("Non disponible pour cette source.")
+    # ---------- 4. DCF
+    st.markdown("##### 4. DCF")
+    if fv.get("_dcfx"):
+        render_dcfx(f, fv["_dcfx"])
+    elif fv.get("_dcf"):
+        fcf, g0, ke, sh = fv["_dcf"]
+        st.caption(f"DCF simplifié (fiche seule) : flux libre {fcf / 1e3:.1f} Md, croissance {g0 * 100:.0f} % décroissant "
+                   f"vers {DEFAULT_P['tg'] * 100:.1f} %, coût des fonds propres {ke * 100:.1f} % → {fv['DCF']:.0f} {cur} "
+                   f"(fourchette {fv['DCF bas']:.0f}–{fv['DCF haut']:.0f}). Analyse complète en ligne : DCF d'entreprise.")
         with st.expander("Sensibilité du DCF (coût des fonds propres × croissance terminale)"):
             kes = [ke + x for x in (-0.02, -0.01, 0.0, 0.01, 0.02)]
             tgs = [0.015, 0.02, 0.025, 0.03, 0.035]
@@ -2935,13 +3186,91 @@ def render_detail(f, d):
                                                           for k in kes] for t_ in tgs},
                                 index=[f"{k * 100:.1f} %" for k in kes])
             st.dataframe(grid.round(0))
-            st.caption(f"Valeur par action selon le taux d'actualisation (lignes) et la croissance à long terme (colonnes) ; "
-                       f"croissance initiale {g0 * 100:.0f} %. Cours : {f['price']:.2f}.")
+            st.caption(f"Valeur par action selon le taux d'actualisation (lignes) et la croissance à long terme "
+                       f"(colonnes) ; croissance initiale {g0 * 100:.0f} %. Cours : {f['price']:.2f}.")
+    else:
+        why_ = [n for n in fv["notes"] if "DCF" in n or "flux" in n or "assureur" in n]
+        st.caption("Pas de DCF retenu" + (" : " + " · ".join(why_) if why_ else "."))
+    # ---------- 5. PER et multiples
+    st.markdown("##### 5. PER et multiples")
+    mult = fv.get("_mult") or {}
+    rows = [{"Méthode": lbl, "Hypothèse": mult.get(k, ""), f"Valeur ({cur.strip()})": fv[k],
+             "Retenue": "✓" if not fv.get("_keep") or k in fv["_keep"] else "écartée"}
+            for k, lbl in METHODS if k != "DCF" and fv.get(k) is not None]
+    if rows:
+        st.dataframe(pd.DataFrame(rows).round(1), hide_index=True, width="stretch")
+    m = []
+    if f.get("fwd_pe"):
+        m.append(f"PER actuel sur N+1 {f['fwd_pe']:.1f}x")
+    if f.get("pe"):
+        m.append(f"sur 12 mois {f['pe']:.1f}x")
+    if f.get("fwd_pe") and f.get("eps_5y") and f["eps_5y"] > 0:
+        m.append(f"PEG {f['fwd_pe'] / f['eps_5y']:.2f}")
+    if f.get("pe_hist"):
+        m.append(f"PER historique médian {f['pe_hist']:.1f}x")
+    if m:
+        st.caption(" · ".join(m) + ".")
     if f.get("peers"):
         with st.expander(f"Sociétés comparables ({len(f['peers'])})"):
             st.dataframe(pd.DataFrame(f["peers"]).rename(columns={
                 "ticker": "Ticker", "fpe": "PER prév.", "pfcf": "P/FCF", "pe": "PER", "g": "Croiss. BNA 5 ans (%)",
                 "mcap": "Capitalisation"}), hide_index=True)
+    # ---------- 6. Synthèse
+    st.markdown("##### 6. Synthèse")
+    football_field(fv, f, cur)
+    render_fv_tables(fv, cur)
+    # ---------- 7. Juste valeur et objectif des analystes
+    st.markdown("##### 7. Juste valeur calculée et objectif des analystes")
+    if jv and f.get("target"):
+        e = (jv / f["target"] - 1) * 100
+        cmp_ = [{"Repère": "Juste valeur calculée", "Valeur": round(jv, 1), "vs cours (%)": fv.get("Écart (%)")},
+                {"Repère": f"Objectif moyen des analystes ({f.get('n_analysts') or '?'} analystes)",
+                 "Valeur": round(f["target"], 1), "vs cours (%)": d["an"].get("Potentiel (%)")}]
+        st.dataframe(pd.DataFrame(cmp_).round(1), hide_index=True)
+        txt = [f"Écart juste valeur / objectif : {e:+.0f} %."]
+        if f.get("eps_next_y") and f["eps_next_y"] > 0:
+            txt.append(f"L'objectif correspond à un PER de {f['target'] / f['eps_next_y']:.1f}x le BNA N+1 "
+                       f"(marché : {f['fwd_pe']:.1f}x)." if f.get("fwd_pe") else
+                       f"L'objectif correspond à un PER de {f['target'] / f['eps_next_y']:.1f}x le BNA N+1.")
+        st.caption(" ".join(txt))
+        if f.get("merge_notes"):
+            st.caption("Finviz + Zonebourse — " + " · ".join(f["merge_notes"]))
+        why = _divergence_causes(f, fv)
+        if abs(e) > 10:
+            causes = []
+            if why:
+                causes.append("écart entre méthodes : " + why)
+            if fv.get("CMPC (%)"):
+                causes.append(f"taux d'actualisation retenu : CMPC {fv['CMPC (%)']:.1f} % (souvent 8 à 9 % chez les "
+                              f"analystes pour une grande capitalisation)")
+            g5, cap_ = growth_expected(f)
+            if cap_:
+                causes.append(f"croissance du BNA plafonnée à {g5:.0f} % (consensus {f.get('eps_5y') or 0:.0f} %) ; "
+                              "les analystes retiennent souvent la croissance du consensus et le BNA N+2")
+            if lev is not None and lev > 3:
+                causes.append(f"endettement : dette nette {lev:.1f}× l'EBITDA déduite de la valeur")
+            if f.get("cyclical"):
+                causes.append("classement cyclique : PER cible 8x, croissance ≤ 5 % (correction possible dans "
+                              "« Forcer le classement cyclique »)")
+            if causes:
+                st.markdown(_md("Raisons probables de l'écart :\n" + "\n".join(f"- {x}" for x in causes)))
+        elif why:
+            st.caption("Écart entre méthodes — " + why)
+        st.caption("L'objectif des analystes est un point de comparaison (souvent à 12 mois, sur le BNA N+2), pas la "
+                   "bonne réponse.")
+    else:
+        st.caption("Objectif des analystes non disponible.")
+    # ---------- 8. Risques et points de vigilance
+    st.markdown("##### 8. Risques et points de vigilance")
+    bad, good = risk_points(f, d)
+    if bad:
+        st.markdown(_md("\n".join(f"- ⚠️ {x}" for x in bad)))
+    if good:
+        st.markdown(_md("\n".join(f"- ✅ {x}" for x in good)))
+    if not bad and not good:
+        st.caption("Aucun point particulier détecté dans les données.")
+    # ---------- 9. Signaux de marché (initiés, super investors, analystes, options)
+    st.markdown("##### 9. Signaux de marché")
     a, b = st.columns(2)
     with a:
         st.markdown(f"**Initiés ({f.get('insider_source', 'fiche Finviz')}) — achats et ventes en bourse**")
@@ -2981,9 +3310,15 @@ def render_detail(f, d):
         st.dataframe(pd.DataFrame(d["an"]["Actions récentes"]), hide_index=True)
     op = pd.DataFrame(f["options"])
     if not op.empty:
-        st.markdown("**Options par échéance**")
+        st.markdown(f"**Options par échéance** — P/C encours {d['pc'].get('P/C encours', 'n.d.')}"
+                    + (f" ({d['pc']['Lecture P/C']})" if d["pc"].get("Lecture P/C") else ""))
         op["P/C"] = (op["OI puts"].astype(float) / op["OI calls"].astype(float).replace(0, float("nan"))).round(2)
         st.dataframe(op, hide_index=True)
+    # ---------- 10. Notes de calcul et sources
+    st.markdown("##### 10. Notes de calcul et sources")
+    with st.expander("Détail des hypothèses et notes du calcul"):
+        st.markdown(_md("\n".join(f"- {n}" for n in fv["notes"]) or "—"))
+    st.caption("Sources : " + short_source(f) + ". Estimation argumentée, pas un conseil en investissement.")
 
 
 def scenario_values(f, d):
@@ -3053,13 +3388,25 @@ def detail_and_scenarios(df, det, keys, key):
     f, d = det[t]
     s1, s2 = st.tabs(["🔍 Détail", "📈 Scénarios"])
     with s1:
-        render_detail(f, d)
+        render_detail(f, d, t)
     with s2:
         render_scenarios(f, d)
 
 
 def main():
     st.set_page_config(page_title="Finviz Dashboard", page_icon="📊", layout="wide")
+    # barres de défilement toujours visibles dans les tableaux (macOS les masque par défaut)
+    st.markdown("""<style>
+    [data-testid="stDataFrame"] *::-webkit-scrollbar { -webkit-appearance: none; width: 12px; height: 12px; }
+    [data-testid="stDataFrame"] *::-webkit-scrollbar-track { background: rgba(128,128,128,0.12); border-radius: 6px; }
+    [data-testid="stDataFrame"] *::-webkit-scrollbar-thumb { background: rgba(110,110,110,0.65); border-radius: 6px;
+        border: 2px solid transparent; background-clip: padding-box; }
+    [data-testid="stDataFrame"] *::-webkit-scrollbar-thumb:hover { background: rgba(80,80,80,0.85);
+        background-clip: padding-box; }
+    @supports (-moz-appearance: none) {
+        [data-testid="stDataFrame"] * { scrollbar-width: auto; scrollbar-color: rgba(110,110,110,0.65) rgba(128,128,128,0.12); }
+    }
+    </style>""", unsafe_allow_html=True)
     st.title("📊 Finviz Dashboard")
     st.caption("Juste valeur · initiés & super investors · analystes · Put/Call · scénarios BNA / EBITDA / capex / dette")
 
@@ -3420,6 +3767,12 @@ cycliques par nature (semi-conducteurs et matériel informatique, automobile, p�
 **Redressement** (pages Zonebourse, valeur non cyclique) : si le BNA N+2 du consensus vaut au moins 2 fois le BNA N+1
 (ou si N+1 est une perte et N+2 un bénéfice), le PER cible s'applique au BNA N+2 actualisé d'un an au coût des fonds
 propres ; comparables et PER historique restent sur N+1.
+
+**Banques et assureurs** (industrie Finviz « Bank / Capital Markets / Insurance », ou secteur Zonebourse « services bancaires »
+/ « assurance ») : pas de DCF d'entreprise — leurs flux et leur dette viennent du bilan. Actif net × P/B justifié
+((ROE − g) / (coût des fonds propres − g)), PER et PER historique. Banques : coût des fonds propres 11 % (CAPM aux US), PER
+bancaire ; assureurs : coût des fonds propres de la valeur (≥ 8 %), PER cible selon la croissance plafonné à 1,25 × le
+PER historique.
 
 **Endettement et CMPC** : sans bêta de marché (pages Zonebourse), le taux unique vaut pour un endettement courant ; si la
 dette dépasse 30 % de la capitalisation, le coût des fonds propres est majoré (bêta réendetté, plafond 20 %) et la marge
