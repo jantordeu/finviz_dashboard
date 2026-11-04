@@ -2977,7 +2977,9 @@ def _md(x):
 
 def short_source(f):
     """Source lisible : noms de fichiers Zonebourse remplacés par « Zonebourse (pages du …) »."""
-    src = str(f.get("source") or "Finviz en ligne")
+    src = str(f.get("source") or ("Zonebourse" if f.get("zb") and not f.get("dcfx", {}) is None else "Finviz en ligne"))
+    if not f.get("source") and f.get("zb"):
+        src = "Zonebourse"
     src = re.sub(r"Zonebourse\s*:.*$", "Zonebourse", src)
     if f.get("zb_date") and "Zonebourse" in src:
         src = src.replace("Zonebourse", f"Zonebourse (pages du {f['zb_date']})", 1)
@@ -3102,6 +3104,356 @@ def football_field(fv, f, cur):
     st.altair_chart(alt.layer(*layers).properties(height=48 * len(rows) + 30), width="stretch", theme=None)
 
 
+# ---------- Export de la fiche détaillée (PDF / Word)
+_EMO = {"🟢🟢": "(très favorable)", "🟢": "(vert)", "🟠": "(orange)", "🔴": "(rouge)", "⚪": "", "⚠️": "Attention :",
+        "ℹ️": "Info :", "✅": "", "⟳": "(cyclique)", "🏦": "(modèle financier)", "➜": "->", "→": "->", "✓": "oui",
+        "≥": ">=", "≤": "<=", "▲": "+", "▼": "-", "💱": "", "📄": "", " ": " ", "\xa0": " "}
+
+
+def _clean(x):
+    """Texte sans émoji ni caractère hors des polices standard des PDF (les pastilles deviennent des mots)."""
+    s = "" if x is None else str(x)
+    for k, v in _EMO.items():
+        s = s.replace(k, v)
+    s = s.replace("**", "")
+    s = s.encode("cp1252", "ignore").decode("cp1252")
+    return re.sub(r"[ \t]{2,}", " ", s).strip()
+
+
+def _fmt(v, nd=1):
+    if v is None or (isinstance(v, float) and v != v):
+        return ""
+    if isinstance(v, (int, float)):
+        return f"{v:,.{nd}f}".replace(",", " ")
+    return _clean(v)
+
+
+def report_model(f, d, t):
+    """Contenu de la fiche (mêmes sections que l'onglet Détail) : liste de blocs
+    ("h", texte) · ("p", texte) · ("ul", [textes]) · ("table", en-têtes, lignes) · ("img", png)."""
+    fv, an = d["fv"], d["an"]
+    cur = {"USD": "$", "EUR": "€"}.get(f.get("currency"), f.get("currency", "") + " ").strip()
+    B = []
+    name = company_name(f, 80) or t
+    B.append(("title", f"{name} ({t})" if name != t else t))
+    B.append(("p", f"Analyse du {TODAY:%d/%m/%Y} — {short_source(f)}"))
+    # 1
+    B.append(("h", "1. Fiche d'identité"))
+    lev = d.get("lev")
+    rows = [["Cours", f"{f['price']:.2f} {cur}" if f.get("price") else "n.d."],
+            ["Capitalisation", f"{f['mcap'] / 1e3:,.1f} Md {cur}".replace(",", " ") if f.get("mcap") else "n.d."],
+            ["Dette nette / EBITDA", "sans objet (banque / assurance)" if f.get("bank") else
+             "trésorerie nette" if lev is not None and lev < 0 else f"{lev:.1f}x" if lev is not None else "n.d."],
+            ["Bêta", f"{f['beta']:.2f}" if f.get("beta") else "n.d."],
+            ["Dividende / action", f"{f['div_ps']:.2f} {cur}" if f.get("div_ps") else "aucun"],
+            ["Secteur / industrie", " · ".join(x for x in (f.get("sector"), f.get("industry")
+                                                          or (f.get("zb_sector") or "").replace("-", " ")) if x) or "n.d."],
+            ["Prochains résultats", f.get("earnings") or "n.d."],
+            ["Classement", ", ".join(x for x in ("cyclique" if f.get("cyclical") else "",
+                                                  "modèle financier (banque / assurance)" if f.get("bank") else "") if x)
+             or "standard"]]
+    B.append(("table", ["Élément", "Valeur"], rows))
+    # 2
+    B.append(("h", "2. En bref"))
+    B.append(("p", en_bref(f, d, cur)))
+    if fv.get("_alerts"):
+        B.append(("ul", list(fv["_alerts"])))
+    # 3
+    B.append(("h", "3. Bénéfice par action (BNA)"))
+    ser = _eps_series(f)
+    if ser:
+        png = _png_eps(ser, cur)
+        if png:
+            B.append(("img", png))
+        B.append(("table", ["Exercice", f"BNA ({cur})", "Type"], [[a, _fmt(b, 2), c] for a, b, c in ser]))
+        B.append(("p", "Historique : BNA comptable publié. Prévisions : consensus des analystes, en général sur le BNA "
+                       "non-GAAP (ajusté), utilisé par le PER cible et les comparables."))
+    else:
+        B.append(("p", "Non disponible pour cette source."))
+    # 4
+    B.append(("h", "4. DCF"))
+    res = fv.get("_dcfx")
+    if res:
+        x = res["x"]
+        B.append(("table", ["DCF (scénarios pondérés)", "Fourchette P10 – P90", "Probabilité > cours", "CMPC"],
+                  [[f"{res['central']:.0f} {cur}", f"{res['p10']:.0f} – {res['p90']:.0f}",
+                    f"{res['prob_up']:.0f} %" if res.get("prob_up") is not None else "n.d.",
+                    f"{res['wacc']['wacc'] * 100:.1f} %"]]))
+        B.append(("table", ["Scénario", "Poids", "Croissance CA an 1 (%)", "Écart de marge (pts)", f"Valeur / action ({cur})",
+                            "Valeur terminale (% VE)"],
+                  [[s["Scénario"], _fmt(s["Poids"], 2), _fmt(s["Croissance CA an 1 (%)"]), _fmt(s["Écart de marge (pts)"]),
+                    _fmt(s["Valeur / action"]), _fmt(s["Valeur terminale (% VE)"], 0)] for s in res["scen"]]))
+        B.append(("p", f"Hypothèses ({res['src']}) : CA de départ {x['rev0'] / 1e3:.1f} Md, croissance an 1 "
+                       f"{res['g_rev'] * 100:.1f} % décroissant jusqu'à {res['tg'] * 100:.1f} % en année 10 ; marge EBITDA "
+                       f"{x['m0'] * 100:.1f} % ; impôt {x['tax'] * 100:.0f} % ; valeur terminale : moyenne croissance "
+                       f"perpétuelle et multiple de sortie {res['exit_mult']:.1f}x EBITDA ; dette nette "
+                       f"{x['net_debt'] / 1e3:.1f} Md déduite."))
+    elif fv.get("_dcf"):
+        fcf, g0, ke, sh = fv["_dcf"]
+        B.append(("p", f"DCF simplifié (fiche seule) : flux libre {fcf / 1e3:.1f} Md, croissance {g0 * 100:.0f} %, coût des "
+                       f"fonds propres {ke * 100:.1f} % -> {fv['DCF']:.0f} {cur} (fourchette {fv['DCF bas']:.0f}–"
+                       f"{fv['DCF haut']:.0f})."))
+    else:
+        why_ = [n for n in fv["notes"] if "DCF" in n or "flux" in n or "assureur" in n]
+        B.append(("p", "Pas de DCF retenu" + (" : " + " · ".join(why_) if why_ else ".")))
+    # 5
+    B.append(("h", "5. PER et multiples"))
+    mult = fv.get("_mult") or {}
+    rows = [[lbl, mult.get(k, ""), _fmt(fv[k]), "oui" if not fv.get("_keep") or k in fv["_keep"] else "écartée"]
+            for k, lbl in METHODS if k != "DCF" and fv.get(k) is not None]
+    if rows:
+        B.append(("table", ["Méthode", "Hypothèse", f"Valeur ({cur})", "Retenue"], rows))
+    m = [s for s in (f"PER actuel sur N+1 {f['fwd_pe']:.1f}x" if f.get("fwd_pe") else "",
+                     f"PER historique médian {f['pe_hist']:.1f}x" if f.get("pe_hist") else "") if s]
+    if m:
+        B.append(("p", " · ".join(m) + "."))
+    # 6
+    B.append(("h", "6. Synthèse"))
+    png = _png_football(fv, f, cur)
+    if png:
+        B.append(("img", png))
+    keep = set(fv.get("_keep") or [])
+    rows = [[lbl, (f"CMPC {fv['CMPC (%)']:.1f} %" if k == "DCF" and fv.get("CMPC (%)") else mult.get(k, "")),
+             _fmt(fv.get(k + " bas")), _fmt(fv[k]), _fmt(fv.get(k + " haut")), "oui" if not keep or k in keep else "écartée"]
+            for k, lbl in METHODS if fv.get(k) is not None]
+    if fv.get("JV centrale"):
+        rows.append(["-> Juste valeur", "", _fmt(fv["JV basse"]), _fmt(fv["JV centrale"]), _fmt(fv["JV haute"]), ""])
+    if rows:
+        B.append(("table", ["Méthode", "Hypothèse", f"Basse ({cur})", f"Centrale ({cur})", f"Haute ({cur})", "Retenue"], rows))
+        B.append(("p", f"Valeurs par action en {cur}. Précision : {precision_txt(fv)}. Croissance implicite / attendue : "
+                       f"{reverse_txt(fv)}."))
+    # 7
+    B.append(("h", "7. Juste valeur calculée et objectif des analystes"))
+    jv = fv.get("JV centrale")
+    if jv and f.get("target"):
+        e = (jv / f["target"] - 1) * 100
+        B.append(("table", ["Repère", f"Valeur ({cur})", "vs cours (%)"],
+                  [["Juste valeur calculée", _fmt(jv), _fmt(fv.get("Écart (%)"), 0)],
+                   [f"Objectif moyen des analystes ({f.get('n_analysts') or '?'} analystes)", _fmt(f["target"]),
+                    _fmt(an.get("Potentiel (%)"), 0)]]))
+        txt = f"Écart juste valeur / objectif : {e:+.0f} %."
+        if f.get("eps_next_y") and f["eps_next_y"] > 0:
+            txt += f" L'objectif correspond à un PER de {f['target'] / f['eps_next_y']:.1f}x le BNA N+1."
+        B.append(("p", txt))
+        why = _divergence_causes(f, fv)
+        if why:
+            B.append(("p", "Écart entre méthodes : " + why))
+    else:
+        B.append(("p", "Objectif des analystes non disponible."))
+    # 8
+    B.append(("h", "8. Risques et points de vigilance"))
+    bad, good = risk_points(f, d)
+    if bad or good:
+        B.append(("ul", [f"Vigilance : {x}" for x in bad] + [f"Favorable : {x}" for x in good]))
+    else:
+        B.append(("p", "Aucun point particulier détecté dans les données."))
+    # 9
+    B.append(("h", "9. Signaux de marché"))
+    ins = d.get("ins")
+    if ins:
+        B.append(("p", f"Initiés ({f.get('insider_source', 'fiche Finviz')}) : {ins['Résumé']}"))
+        keys = ("Achats 365j", "Ventes 365j", "Acheteurs", "Achats groupés (max en 30 j)", "Achats PDG / DAF (M$)",
+                "Hausse médiane de détention (%)", "Ventes avec levée d'options (M$)")
+        B.append(("table", ["Initiés, 12 mois", "Valeur"], [[k, _fmt(ins.get(k))] for k in keys]))
+        if ins.get("Achats notables"):
+            B.append(("ul", ["Achat : " + x for x in ins["Achats notables"]]))
+    else:
+        B.append(("p", "Initiés : non disponible pour cette source."))
+    si = d.get("si") or {}
+    B.append(("p", "Super investors (Dataroma) : " + (si.get("Résumé") if si.get("Lignes") else "aucune donnée.")))
+    nb = f" · {f['n_analysts']} analystes" if f.get("n_analysts") else ""
+    B.append(("p", f"Analystes : consensus {an.get('Consensus') or 'n.d.'}{nb}"
+                   + (f", {an['Relèvements 180j']} relèvement(s) / {an['Abaissements 180j']} abaissement(s) sur 180 j"
+                      if f.get("ratings") else "")))
+    if an.get("Actions récentes"):
+        ar = pd.DataFrame(an["Actions récentes"]).head(8)
+        B.append(("table", [str(c) for c in ar.columns], [[_fmt(v) for v in r] for r in ar.itertuples(index=False)]))
+    op = pd.DataFrame(f.get("options") or [])
+    if not op.empty:
+        op["P/C"] = (op["OI puts"].astype(float) / op["OI calls"].astype(float).replace(0, float("nan"))).round(2)
+        B.append(("p", f"Options par échéance — P/C encours {d['pc'].get('P/C encours', 'n.d.')}"
+                       + (f" ({d['pc']['Lecture P/C']})" if d["pc"].get("Lecture P/C") else "")))
+        B.append(("table", [str(c) for c in op.columns], [[_fmt(v, 2) for v in r] for r in op.itertuples(index=False)]))
+    # 10
+    B.append(("h", "10. Notes de calcul et sources"))
+    B.append(("ul", list(fv["notes"])))
+    B.append(("p", f"Sources : {short_source(f)}. Estimation argumentée, pas un conseil en investissement."))
+    return B
+
+
+def _png_eps(ser, cur):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None
+    fig, ax = plt.subplots(figsize=(7.2, 2.6), dpi=150)
+    col = ["#607d8b" if t == "publié" else "#43a047" for _, _, t in ser]
+    ax.bar([a for a, _, _ in ser], [b for _, b, _ in ser], color=col)
+    ax.axhline(0, color="#999", lw=0.8)
+    ax.set_ylabel(f"BNA ({cur})", fontsize=8)
+    ax.tick_params(labelsize=7)
+    for s_ in ("top", "right"):
+        ax.spines[s_].set_visible(False)
+    from matplotlib.patches import Patch
+    ax.legend(handles=[Patch(color="#607d8b", label="publié"), Patch(color="#43a047", label="consensus")],
+              fontsize=7, frameon=False, loc="upper left")
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def _png_football(fv, f, cur):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None
+    rows = [(lbl, fv.get(k + " bas"), fv.get(k + " haut"), fv[k]) for k, lbl in METHODS
+            if fv.get(k) is not None and fv.get(k + " bas") is not None]
+    if fv.get("JV centrale"):
+        rows.append(("Juste valeur", fv["JV basse"], fv["JV haute"], fv["JV centrale"]))
+    if len(rows) < 2:
+        return None
+    fig, ax = plt.subplots(figsize=(7.2, 0.55 * len(rows) + 1.0), dpi=150)
+    for i, (lbl, lo, hi, c) in enumerate(reversed(rows)):
+        ax.barh(i, hi - lo, left=lo, height=0.5, color="#2e7d32" if lbl == "Juste valeur" else "#90a4ae")
+        ax.plot([c, c], [i - 0.3, i + 0.3], color="black", lw=2)
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([r[0] for r in reversed(rows)], fontsize=8)
+    if f.get("price"):
+        ax.axvline(f["price"], color="#d32f2f", ls="--", lw=1.5, label=f"Cours {f['price']:.0f}")
+    if f.get("target"):
+        ax.axvline(f["target"], color="#1565c0", ls="--", lw=1.5, label=f"Objectif analystes {f['target']:.0f}")
+    ax.set_xlabel(f"Valeur par action ({cur})", fontsize=8)
+    ax.tick_params(axis="x", labelsize=7)
+    ax.legend(fontsize=7, frameon=False, loc="lower right")
+    for s_ in ("top", "right"):
+        ax.spines[s_].set_visible(False)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def report_docx(blocks):
+    from docx import Document
+    from docx.shared import Pt, Cm, RGBColor
+    doc = Document()
+    sec = doc.sections[0]
+    sec.left_margin = sec.right_margin = Cm(1.8)
+    sec.top_margin = sec.bottom_margin = Cm(1.6)
+    st_ = doc.styles["Normal"]
+    st_.font.name = "Calibri"
+    st_.font.size = Pt(10)
+    for b in blocks:
+        k = b[0]
+        if k == "title":
+            doc.add_heading(_clean(b[1]), level=0)
+        elif k == "h":
+            doc.add_heading(_clean(b[1]), level=1)
+        elif k == "p":
+            doc.add_paragraph(_clean(b[1]))
+        elif k == "ul":
+            for it in b[1]:
+                doc.add_paragraph(_clean(it), style="List Bullet")
+        elif k == "img":
+            doc.add_picture(io.BytesIO(b[1]), width=Cm(17))
+        elif k == "table":
+            head, rows = b[1], b[2]
+            tb = doc.add_table(rows=1, cols=len(head))
+            tb.style = "Light Grid Accent 1"
+            for i, h in enumerate(head):
+                cell = tb.rows[0].cells[i]
+                cell.text = _clean(h)
+                for r_ in cell.paragraphs[0].runs:
+                    r_.font.bold = True
+                    r_.font.size = Pt(8.5)
+            for row in rows:
+                cells = tb.add_row().cells
+                for i, v in enumerate(row[:len(head)]):
+                    cells[i].text = _clean(v)
+                    for r_ in cells[i].paragraphs[0].runs:
+                        r_.font.size = Pt(8.5)
+            doc.add_paragraph()
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def report_pdf(blocks):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, ListFlowable, ListItem
+    from xml.sax.saxutils import escape
+    ss = getSampleStyleSheet()
+    body = ParagraphStyle("b", parent=ss["Normal"], fontName="Helvetica", fontSize=9, leading=12, spaceAfter=4)
+    cellst = ParagraphStyle("c", parent=body, fontSize=7.5, leading=9, spaceAfter=0)
+    h1 = ParagraphStyle("h1", parent=ss["Heading2"], fontName="Helvetica-Bold", fontSize=12, spaceBefore=10, spaceAfter=4,
+                        textColor=colors.HexColor("#1f3b57"))
+    tit = ParagraphStyle("t", parent=ss["Title"], fontName="Helvetica-Bold", fontSize=17)
+    P = lambda s_, st=body: Paragraph(escape(_clean(s_)), st)
+    W = A4[0] - 3.4 * cm
+    story = []
+    for b in blocks:
+        k = b[0]
+        if k == "title":
+            story.append(P(b[1], tit))
+        elif k == "h":
+            story.append(P(b[1], h1))
+        elif k == "p":
+            story.append(P(b[1]))
+        elif k == "ul":
+            story.append(ListFlowable([ListItem(P(x), leftIndent=10) for x in b[1]], bulletType="bullet",
+                                      start="•", leftIndent=12))
+        elif k == "img":
+            img = Image(io.BytesIO(b[1]))
+            r = W / img.drawWidth
+            img.drawWidth, img.drawHeight = W, img.drawHeight * r
+            story.append(img)
+        elif k == "table":
+            head, rows = b[1], b[2]
+            data = [[P(h, ParagraphStyle("hc", parent=cellst, fontName="Helvetica-Bold")) for h in head]]
+            data += [[P(v, cellst) for v in row[:len(head)]] for row in rows]
+            tb = Table(data, colWidths=[W / len(head)] * len(head), repeatRows=1)
+            tb.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8eef4")),
+                                    ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#b0bec5")),
+                                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7f9fb")])]))
+            story += [tb, Spacer(1, 6)]
+    buf = io.BytesIO()
+    SimpleDocTemplate(buf, pagesize=A4, leftMargin=1.7 * cm, rightMargin=1.7 * cm, topMargin=1.5 * cm,
+                      bottomMargin=1.5 * cm, title="Fiche d'analyse").build(story)
+    return buf.getvalue()
+
+
+def render_export(f, d, t):
+    """Boutons d'export de la fiche (PDF et Word), préparés à la demande (graphiques compris)."""
+    key = f"exp_{t}_{round(d['fv'].get('JV centrale') or 0)}_{f.get('price')}"
+    c1, c2, c3 = st.columns([1.3, 1, 1])
+    if c1.button("📄 Préparer la fiche PDF / Word", key=f"prep_{t}"):
+        try:
+            blocks = report_model(f, d, t)
+            st.session_state[key] = (report_pdf(blocks), report_docx(blocks))
+        except ImportError as e:
+            st.error(f"Export impossible : bibliothèque manquante ({e.name}) — pip install -r requirements.txt")
+        except Exception as e:
+            st.error(f"Export impossible ({type(e).__name__} : {e})")
+    if key in st.session_state:
+        pdf, docx_ = st.session_state[key]
+        fn = f"Fiche_{re.sub(r'[^A-Za-z0-9]+', '_', t)}_{TODAY:%Y%m%d}"
+        c2.download_button("⬇️ PDF", pdf, f"{fn}.pdf", "application/pdf", key=f"dlp_{t}")
+        c3.download_button("⬇️ Word", docx_, f"{fn}.docx",
+                           "application/vnd.openxmlformats-officedocument.wordprocessingml.document", key=f"dlw_{t}")
+
+
 def render_detail(f, d, t=None):
     fv = d["fv"]
     cur = {"USD": "$", "EUR": "€"}.get(f.get("currency"), f.get("currency", "") + " ")
@@ -3109,13 +3461,14 @@ def render_detail(f, d, t=None):
     # ---------- 1. Fiche d'identité
     tk = t or f.get("ticker") or ""
     st.markdown(f"### {name} ({tk})" if name and tk and name != tk else f"### {name or tk}")
+    render_export(f, d, tk)
     st.markdown("##### 1. Fiche d'identité")
     c = st.columns(5)
     c[0].metric("Cours", f"{f['price']:.2f} {cur}" if f["price"] else "n.d.")
     c[1].metric("Capitalisation", f"{f['mcap'] / 1e3:,.1f} Md {cur}".replace(",", " ") if f.get("mcap") else "n.d.")
     lev = d.get("lev")
-    c[2].metric("Dette nette / EBITDA", "trésorerie nette" if lev is not None and lev < 0 else
-                f"{lev:.1f}x" if lev is not None else "n.d.")
+    c[2].metric("Dette nette / EBITDA", "sans objet (banque / assurance)" if f.get("bank") else
+                "trésorerie nette" if lev is not None and lev < 0 else f"{lev:.1f}x" if lev is not None else "n.d.")
     c[3].metric("Bêta", f"{f['beta']:.2f}" if f.get("beta") else "n.d.")
     c[4].metric("Dividende / action", f"{f['div_ps']:.2f} {cur}" if f.get("div_ps") else "aucun")
     info = [x for x in (f.get("sector"), f.get("industry") or (f.get("zb_sector") or "").replace("-", " "),

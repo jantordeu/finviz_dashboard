@@ -17,3 +17,8 @@ python-calamine>=0.2
 
 # Sentiment des actualités (onglet « Sentiment »)
 vaderSentiment>=3.3
+
+# Export de la fiche détaillée (PDF et Word)
+python-docx>=1.1
+reportlab>=4.0
+matplotlib>=3.8
