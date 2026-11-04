@@ -397,9 +397,14 @@ def parse_zonebourse_cached(htmls, name=""):
     return parse_zonebourse(list(htmls), name)
 
 
-@st.cache_data(show_spinner=False, max_entries=300)
+@st.cache_data(show_spinner=False, max_entries=1000)
+def finviz_page_cached(name, html):
+    """Lecture d'UNE page Finviz gardée en mémoire : ajouter une page ne relit pas les autres."""
+    return finviz_page(name, html)
+
+
 def raws_from_finviz_pages_cached(pages):
-    return raws_from_finviz_pages(list(pages))
+    return raws_from_finviz_pages(list(pages), page_fn=finviz_page_cached)
 
 
 def complete_online(raw, t, max_days=200, log=print, s=None, openinsider=True):
@@ -475,19 +480,30 @@ def page_kind(name, html):
     return None
 
 
-def raws_from_finviz_pages(pages):
-    """pages : liste de (nom, html) Finviz -> {ticker: raw}. Fiche « quote » et pages « Options »."""
+def finviz_page(name, html):
+    """Une page Finviz -> ("opt", ticker, options) · ("quote", ticker, fiche) · None."""
+    m = re.search(r"<title>\s*([A-Z][A-Z0-9.\-]{0,9})\s+-\s", html)
+    t = m.group(1) if m else os.path.basename(name).split("_")[0].split(" ")[0].upper()
+    d = parse_options_page(html)
+    if d and d.get("options"):
+        return ("opt", t, d)
+    q = parse_quote(html)
+    return ("quote", t, q) if q["snap"].get("Price") else None
+
+
+def raws_from_finviz_pages(pages, page_fn=None):
+    """pages : liste de (nom, html) Finviz -> {ticker: raw}. Fiche « quote » et pages « Options ».
+    page_fn : lecture d'une page (version mise en cache : chaque page n'est lue qu'une fois)."""
     raws, opts = {}, {}
     for name, html in pages:
-        m = re.search(r"<title>\s*([A-Z][A-Z0-9.\-]{0,9})\s+-\s", html)
-        t = m.group(1) if m else os.path.basename(name).split("_")[0].split(" ")[0].upper()
-        d = parse_options_page(html)
-        if d and d.get("options"):
-            opts.setdefault(t, []).append(d)
+        part = (page_fn or finviz_page)(name, html)
+        if not part:
             continue
-        q = parse_quote(html)
-        if q["snap"].get("Price"):
-            raws[t] = {"ticker": t, "source": "page Finviz", **q, "options": [], "dataroma": None}
+        kind, t, d = part
+        if kind == "opt":
+            opts.setdefault(t, []).append(copy.deepcopy(d))
+            continue
+        raws[t] = {"ticker": t, "source": "page Finviz", **copy.deepcopy(d), "options": [], "dataroma": None}
     for t, ds in opts.items():
         if t in raws:
             price = num(raws[t]["snap"].get("Price"))
@@ -2758,10 +2774,10 @@ def analyze(f, p, ov=None):
     row = {"Cours": f["price"], "Devise": f.get("currency", "USD"),
            "Juste valeur (fourchette)": jv,
            "Écart JV (%)": fv.get("Écart (%)"),                      # (JV centrale / cours - 1) : >0 = sous-évaluée
-           "Précision JV": precision_txt(fv),
-           "Lecture de l'écart": divergence_txt(f, fv),
-           "Croissance implicite / attendue": reverse_txt(fv),
+           "Précision JV": precision_txt(fv) + (" ⚠️" if any(a_.startswith("⚠️") for a_ in fv.get("_alerts") or [])
+                                                 else ""),
            "Analystes · objectif": ana,
+           "Croissance implicite / attendue": reverse_txt(fv),
            "Initiés (12 m)": ins_txt,
            "Super investors": si["Résumé"] if f["dataroma"].get("n") is not None and si["Résumé"] else "n.d.",
            "Put/Call (total / ±10 %)": pcs,
@@ -2981,7 +2997,7 @@ def short_source(f):
     if not f.get("source") and f.get("zb"):
         src = "Zonebourse"
     src = re.sub(r"Zonebourse\s*:.*$", "Zonebourse", src)
-    if f.get("zb_date") and "Zonebourse" in src:
+    if f.get("zb_date") and "Zonebourse" in src and f["zb_date"] not in src:
         src = src.replace("Zonebourse", f"Zonebourse (pages du {f['zb_date']})", 1)
     return src
 
@@ -3434,11 +3450,11 @@ def report_pdf(blocks):
     return buf.getvalue()
 
 
-def render_export(f, d, t):
+def render_export(f, d, t, ns=""):
     """Boutons d'export de la fiche (PDF et Word), préparés à la demande (graphiques compris)."""
-    key = f"exp_{t}_{round(d['fv'].get('JV centrale') or 0)}_{f.get('price')}"
+    key = f"exp_{ns}_{t}_{round(d['fv'].get('JV centrale') or 0)}_{f.get('price')}"
     c1, c2, c3 = st.columns([1.3, 1, 1])
-    if c1.button("📄 Préparer la fiche PDF / Word", key=f"prep_{t}"):
+    if c1.button("📄 Préparer la fiche PDF / Word", key=f"prep_{ns}_{t}"):
         try:
             blocks = report_model(f, d, t)
             st.session_state[key] = (report_pdf(blocks), report_docx(blocks))
@@ -3449,19 +3465,38 @@ def render_export(f, d, t):
     if key in st.session_state:
         pdf, docx_ = st.session_state[key]
         fn = f"Fiche_{re.sub(r'[^A-Za-z0-9]+', '_', t)}_{TODAY:%Y%m%d}"
-        c2.download_button("⬇️ PDF", pdf, f"{fn}.pdf", "application/pdf", key=f"dlp_{t}")
+        c2.download_button("⬇️ PDF", pdf, f"{fn}.pdf", "application/pdf", key=f"dlp_{ns}_{t}")
         c3.download_button("⬇️ Word", docx_, f"{fn}.docx",
-                           "application/vnd.openxmlformats-officedocument.wordprocessingml.document", key=f"dlw_{t}")
+                           "application/vnd.openxmlformats-officedocument.wordprocessingml.document", key=f"dlw_{ns}_{t}")
 
 
-def render_detail(f, d, t=None):
+def wacc_effect(f, fv, ref=0.085):
+    """CMPC nettement au-dessus (> 9,5 %) de ce qu'utilisent souvent les analystes (8 à 9 %) : effet chiffré sur le DCF
+    (scénario central recalculé à 8,5 %). Rien si le CMPC est dans cette zone : il n'explique alors pas l'écart."""
+    res = fv.get("_dcfx")
+    if not res or not f.get("shares") or res["wacc"]["wacc"] <= 0.095:
+        return None
+    x = res["x"]
+    v = lambda w: (lambda r: (r["eq_perp"] + r["eq_exit"]) / 2 / f["shares"])(
+        dcfx_project(x, res["g_rev"], 0.0, w, res["tg"], res["exit_mult"], bool(f.get("cyclical"))))
+    try:
+        a, b = v(res["wacc"]["wacc"]), v(ref)
+    except Exception:
+        return None
+    w_dcf = fv.get("_w_dcf", 0.5)
+    return (f"taux d'actualisation : CMPC {res['wacc']['wacc'] * 100:.1f} %, au-dessus des 8 à 9 % souvent retenus "
+            f"par les analystes ; à {ref * 100:.1f} %, le DCF (scénario central) passerait de {a:.0f} à {b:.0f}, soit "
+            f"{(b - a) * w_dcf:+.0f} sur la juste valeur")
+
+
+def render_detail(f, d, t=None, ns=""):
     fv = d["fv"]
     cur = {"USD": "$", "EUR": "€"}.get(f.get("currency"), f.get("currency", "") + " ")
     name = company_name(f, 60)
     # ---------- 1. Fiche d'identité
     tk = t or f.get("ticker") or ""
     st.markdown(f"### {name} ({tk})" if name and tk and name != tk else f"### {name or tk}")
-    render_export(f, d, tk)
+    render_export(f, d, tk, ns)
     st.markdown("##### 1. Fiche d'identité")
     c = st.columns(5)
     c[0].metric("Cours", f"{f['price']:.2f} {cur}" if f["price"] else "n.d.")
@@ -3489,8 +3524,13 @@ def render_detail(f, d, t=None):
     c[2].metric("Précision", precision_txt(fv).split(" (")[0] if jv else "n.d.")
     c[3].metric("Croissance implicite / attendue", reverse_txt(fv))
     st.info(_md(en_bref(f, d, cur)))
-    for a_ in fv.get("_alerts") or []:
-        st.warning(a_)
+    why_ = _divergence_causes(f, fv)
+    if fv.get("_alerts") or why_:
+        st.markdown("**Lecture de l'écart de la JV** — ajustements du calcul et raisons de l'écart entre méthodes")
+        for a_ in fv.get("_alerts") or []:
+            st.warning(a_)
+        if why_:
+            st.warning(_md("Écart entre méthodes — " + why_))
     # ---------- 3. Bénéfice par action
     st.markdown("##### 3. Bénéfice par action (BNA)")
     ser = _eps_series(f)
@@ -3593,9 +3633,9 @@ def render_detail(f, d, t=None):
             causes = []
             if why:
                 causes.append("écart entre méthodes : " + why)
-            if fv.get("CMPC (%)"):
-                causes.append(f"taux d'actualisation retenu : CMPC {fv['CMPC (%)']:.1f} % (souvent 8 à 9 % chez les "
-                              f"analystes pour une grande capitalisation)")
+            wv = wacc_effect(f, fv)
+            if wv:
+                causes.append(wv)
             g5, cap_ = growth_expected(f)
             if cap_:
                 causes.append(f"croissance du BNA plafonnée à {g5:.0f} % (consensus {f.get('eps_5y') or 0:.0f} %) ; "
@@ -3607,10 +3647,8 @@ def render_detail(f, d, t=None):
                               "« Forcer le classement cyclique »)")
             if causes:
                 st.markdown(_md("Raisons probables de l'écart :\n" + "\n".join(f"- {x}" for x in causes)))
-        elif why:
-            st.caption("Écart entre méthodes — " + why)
-        st.caption("L'objectif des analystes est un point de comparaison (souvent à 12 mois, sur le BNA N+2), pas la "
-                   "bonne réponse.")
+        st.caption("L'objectif des analystes est une comparaison utile, il vise souvent un cours dans 12 mois, "
+                   "sur le BNA N+2.")
     else:
         st.caption("Objectif des analystes non disponible.")
     # ---------- 8. Risques et points de vigilance
@@ -3741,7 +3779,7 @@ def detail_and_scenarios(df, det, keys, key):
     f, d = det[t]
     s1, s2 = st.tabs(["🔍 Détail", "📈 Scénarios"])
     with s1:
-        render_detail(f, d, t)
+        render_detail(f, d, t, key)
     with s2:
         render_scenarios(f, d)
 
@@ -4071,7 +4109,8 @@ exercice publié, croissance du DCF plafonnée par celle du CA, flux libre norma
   ≤ 10x si cyclique) et flux libre × P/FCF moyen de l'industrie (borné 8–25x : les moyennes sont tirées par les géants) ; multiples de la page « Groups » de Finviz, mis en cache 24 h ; ± 15 %.
 - *Comparables* : en priorité les sociétés comparables désignées par Finviz (lien « Peers » de la fiche, médianes de leurs
   PER prévisionnels et P/FCF) ; à défaut, moyenne de l'industrie.
-- *Lecture de l'écart* (précision 🟠 / 🔴) : les deux causes les plus fortes de l'écart DCF / multiples, détectées
+- *Lecture de l'écart de la JV* (onglet Détail, section 2 ; ⚠️ dans la colonne « Précision JV » signale un ajustement
+  important du calcul) : les deux causes les plus fortes de l'écart DCF / multiples, détectées
   dans les données — haut de cycle, investissements lourds (capex / amortissements), faible conversion du bénéfice en
   trésorerie, CMPC élevé, croissance anticipée par le cours, dette nette, ou à l'inverse trésorerie nette importante,
   flux supérieurs aux bénéfices, forte croissance du consensus.
