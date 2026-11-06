@@ -9,6 +9,9 @@ concises et pratiques. Déploiement prévu : GitHub (dépôt privé) + Streamlit
 - Finviz (cloudscraper) : fiche « quote », états financiers `/api/statement` (IA, BA, CA), options, actualités,
   sociétés comparables (lien « Peers » → screener v=121), multiples d'industrie (page Groups, cache 24 h), screener.
 - OpenInsider (initiés 12 mois), Dataroma (super investors), ApeWisdom (rangs Reddit).
+- Yahoo Finance (API de recherche publique, sans clé, cache 1 h) : actualités de la section 11 pour les valeurs sans
+  fiche Finviz (Europe) — ISIN lu sur la page Zonebourse → symbole Yahoo (RI.PA…) → recherche par nom court, titres
+  gardés seulement si Yahoo les rattache au symbole ; titres en anglais ; à défaut de titre sur 7 j, liste 30 j.
 - Zonebourse : uniquement des pages HTML enregistrées et déposées par l'utilisateur (onglets Finances + Valorisation) ;
   jamais de récupération automatique.
 - Cache disque 2 h (`./cache_finviz`).

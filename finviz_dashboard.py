@@ -20,7 +20,7 @@
 #     pages Zonebourse déposées pour la même valeur (📄)
 #   - Valeurs à étudier : pages Finviz / Zonebourse déposées (doublons ignorés) + valeurs envoyées par
 #     le Screener JV ; prix d'entrée si la valeur est en portefeuille
-#   - Sentiment : ton des actualités (VADER + lexique financier), rang Reddit
+#   - Fear & Greed : indice CNN du sentiment de marché (jauge, historique 1 an avec le S&P 500, composantes)
 #   - Sentiment screener : actions les plus citées sur Reddit à l'actualité positive
 #   - Screener JV : lecture d'un screener Finviz, exclusion d'industries, juste valeur rapide,
 #     envoi en analyse complète
@@ -225,7 +225,7 @@ def parse_quote(html):
 
 
 def parse_news(soup, ref=None):
-    """Titres d'actualité de la fiche Finviz -> [[date ISO, titre, source], …] (les lignes sans date
+    """Titres d'actualité de la fiche Finviz -> [[date ISO, titre, source, lien], …] (les lignes sans date
     reprennent la date de la ligne précédente ; « Today » = aujourd'hui)."""
     tb = soup.select_one("#news-table") or soup.select_one("table.news-table")
     out, day = [], None
@@ -248,7 +248,10 @@ def parse_news(soup, ref=None):
         src = tr.find("span")
         src = src.get_text(" ", strip=True).strip("()") if src else ""
         t = datetime.combine(day, datetime.strptime(m.group(2), "%I:%M%p").time())
-        out.append([t.isoformat(timespec="minutes"), a.get_text(" ", strip=True), src])
+        href = a.get("href") or ""
+        if href.startswith("/"):
+            href = "https://finviz.com" + href
+        out.append([t.isoformat(timespec="minutes"), a.get_text(" ", strip=True), src, href])
     return out
 
 
@@ -397,8 +400,11 @@ def parse_zonebourse_cached(htmls, name=""):
     return parse_zonebourse(list(htmls), name)
 
 
+PAGE_PARSE_VERSION = 2          # à augmenter quand la lecture des pages change (invalide la mémoire)
+
+
 @st.cache_data(show_spinner=False, max_entries=1000)
-def finviz_page_cached(name, html):
+def finviz_page_cached(name, html, version=PAGE_PARSE_VERSION):
     """Lecture d'UNE page Finviz gardée en mémoire : ajouter une page ne relit pas les autres."""
     return finviz_page(name, html)
 
@@ -453,12 +459,20 @@ def complete_online(raw, t, max_days=200, log=print, s=None, openinsider=True):
     return raw
 
 
+def _news_old(raw):
+    """Fiche mise en cache par une version antérieure : titres d'actualité sans lien -> à relire."""
+    n = raw.get("news") or []
+    return bool(n) and all(len(x) < 4 for x in n)
+
+
 def fetch_ticker(t, max_days=200, use_cache=True, log=print, openinsider=True):
     os.makedirs(CACHE_DIR, exist_ok=True)
     path = os.path.join(CACHE_DIR, f"{t}{'_oi' if openinsider else ''}.json")
     if use_cache and os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_HOURS * 3600:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            cached = json.load(f)
+        if not _news_old(cached):
+            return cached
     s = _session()
     raw = {"ticker": t, "fetched": datetime.now().isoformat(timespec="minutes")}
     raw.update(parse_quote(_get(s, f"https://finviz.com/quote.ashx?t={t}&p=d")))
@@ -537,6 +551,23 @@ def zb_company(html):
     """Nom de la société d'après le titre de la page Zonebourse (sert à regrouper Finances + Valorisation)."""
     m = re.search(r"<title>(.*?)</title>", html, re.S)
     return re.split(r"\s*:", m.group(1).strip())[0].strip() if m else ""
+
+
+def _isin_ok(code):
+    """Clé de contrôle d'un code ISIN (algorithme de Luhn sur les lettres converties en chiffres)."""
+    digits = "".join(str(int(c, 36)) for c in code)
+    tot = 0
+    for i, ch in enumerate(reversed(digits)):
+        n = int(ch) * (2 if i % 2 else 1)
+        tot += n - 9 if n > 9 else n
+    return tot % 10 == 0
+
+
+def zb_isin(html):
+    """Code ISIN de la société (le plus fréquent des codes valides de la page Zonebourse), ou "" ."""
+    from collections import Counter
+    c = Counter(m for m in re.findall(r"\b([A-Z]{2}[A-Z0-9]{9}[0-9])\b", html) if _isin_ok(m))
+    return c.most_common(1)[0][0] if c else ""
 
 
 def page_identity(name, html):
@@ -700,7 +731,15 @@ def parse_zonebourse(htmls, name=""):
     # cyclique : BNA de l'année en hausse > 150 %, ou perte réapparue après un exercice bénéficiaire (ex. automobile) ;
     # une sortie de pertes continue (biotech qui devient rentable) n'est pas cyclique
     hist_eps = [bna[y] for y in act[-6:] if bna.get(y) is not None]
-    relapse = any(a_ > 0 and b_ < 0 for i_, a_ in enumerate(hist_eps) for b_ in hist_eps[i_ + 1:])
+    yrs = [y for y in act[-6:] if bna.get(y) is not None]
+    # retour à la perte « cyclique » seulement si l'activité recule aussi (EBITDA en baisse d'au moins 20 % par rapport
+    # au dernier exercice bénéficiaire) ; une perte purement comptable (amortissements d'acquisition, charges de
+    # fusion, dépréciations) avec un EBITDA stable ou en hausse n'est pas un signe de cycle (ex. Coherent 2023-2025)
+    def _relapse(i_, j_):
+        e_a, e_b = g(eb, yrs[i_]), g(eb, yrs[j_])
+        return e_a is None or e_b is None or e_a <= 0 or e_b < 0.8 * e_a
+    relapse = any(bna[yrs[i_]] > 0 and bna[yrs[j_]] < 0 and _relapse(i_, j_)
+                  for i_ in range(len(yrs)) for j_ in range(i_ + 1, len(yrs)))
     # scission / cession (ex. Aptiv 2026) : CA prévu N < 80 % du dernier exercice publié alors que la marge d'EBITDA
     # tient et que le CA repart en N+1 -> le dernier exercice n'est pas comparable : base = consensus N (pro forma)
     mL = g(eb, L) / g(ca, L) if g(eb, L) is not None and g(ca, L) else None
@@ -721,6 +760,7 @@ def parse_zonebourse(htmls, name=""):
     mg = [g(eb, y) / g(ca, y) if g(eb, y) is not None and g(ca, y) else None for y in (N, N + 1, N + 2)]
     sec_m = re.search(r"/secteurs/([a-z0-9\-]+/[a-z0-9\-]+)/", "".join(htmls))
     f["zb_sector"] = sec_m.group(1) if sec_m else ""
+    f["isin"] = zb_isin("".join(htmls))
     f["turnaround"] = bool(
         f["cyclical"] and not CYCLICAL_ZB.search(f["zb_sector"]) and e0 and e1 and e2 and e0 > 0 and e1 >= 1.10 * e0 and e2 >= 1.10 * e1
         and None not in mg and mg[0] < mg[1] < mg[2]
@@ -936,6 +976,7 @@ def merge_facts(fv, zb):
         notes.append(f"objectif moyen : Finviz {fv['target']:.0f} · Zonebourse {zb['target']:.0f} "
                      f"({zb.get('n_analysts') or '?'} analystes, « {zb.get('consensus_label') or '?'} »)")
     f["merge_notes"] = notes
+    f["isin"] = fv.get("isin") or zb.get("isin") or ""
     f["source"] = (fv.get("source") or "Finviz") + " + " + (zb.get("source") or "Zonebourse")
     return f
 
@@ -1054,6 +1095,19 @@ def synthese(out, methods):
 def add_hist_pe(f, out):
     """3e méthode si l'onglet Valorisation Zonebourse est chargé : BNA N+1 × PER médian de la société."""
     eps, pe = f.get("eps_next_y_zb") or f["eps_next_y"], f.get("pe_hist")   # même base que les PER Zonebourse
+    # PER historique mesuré sur des bénéfices bien plus petits (BNA N+1 ≥ 2,5 × le BNA du dernier exercice) et deux
+    # fois plus élevé que le PER cible : il reflète une croissance passée exceptionnelle, pas un multiple applicable
+    # aux bénéfices futurs (ex. Nvidia : 51,6x historique sur un BNA multiplié par 3) -> non retenu
+    eL = f.get("eps_ttm")
+    pe_c = out["PER"] / f["eps_next_y"] if out.get("PER") and f.get("eps_next_y") else None
+    if (not f.get("cyclical") and eps and pe and pe_c and eL and eL > 0 and eps >= 2.5 * eL
+            and pe > 2 * pe_c):
+        out["notes"].append(f"PER historique {pe:.1f}x non retenu : mesuré sur des bénéfices {eps / eL:.1f} fois plus "
+                            f"petits que le BNA N+1 (croissance passée exceptionnelle) et plus de 2 × le PER cible "
+                            f"({pe_c:.1f}x)")
+        out.setdefault("_alerts", []).append(f"ℹ️ PER historique ({pe:.0f}x) non retenu : bénéfices passés bien plus "
+                                             f"petits")
+        return
     if eps and eps > 0 and pe:
         out.update({"PER hist. bas": eps * pe * 0.85, "PER hist.": eps * pe, "PER hist. haut": eps * pe * 1.15})
         out.setdefault("_mult", {})["PER hist."] = f"PER historique {pe:.1f}x × BNA {eps:.2f}"
@@ -2098,6 +2152,8 @@ ALIASES = {"GOOGL": ["Google", "Alphabet"], "GOOG": ["Google", "Alphabet"], "MET
 
 def relevant(news, ticker, company):
     """Garde les titres qui citent la société (Finviz mêle des titres sur les concurrents) ; tous si trop peu."""
+    if not ticker and not company:
+        return news
     keys = [ticker] + ALIASES.get(ticker, [])
     if company:
         w = re.sub(r"\b(Inc|Corp|Corporation|Co|Ltd|plc|NV|N\.V\.|SE|SA|AG|Holdings|Group|Technologies|The)\b\.?", "",
@@ -2117,7 +2173,8 @@ def news_sentiment(news, ref=None, ticker="", company=""):
     ref = ref or TODAY
     news = relevant(news, ticker, company)
     rows = []
-    for iso, title, src in news:
+    for n_ in news:
+        iso, title, src = n_[:3]
         d = datetime.fromisoformat(iso)
         rows.append({"Date": d, "Titre": title, "Source": src,
                      "Score": round(a.polarity_scores(title)["compound"] * 100)})
@@ -2203,6 +2260,168 @@ def sentiment_table(facts):
     return pd.DataFrame(rows), det, msg
 
 
+# ---------- Indice CNN Fear & Greed (onglet « Fear & Greed »)
+CNN_FG_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+FG_LABELS = {"extreme fear": "Peur extrême", "fear": "Peur", "neutral": "Neutre", "greed": "Avidité",
+             "extreme greed": "Avidité extrême"}
+FG_COMPONENTS = [
+    ("stock_price_strength", "Stock Price Strength", "#8e44ad", "Écart plus hauts / plus bas sur 52 semaines",
+     "Compare le nombre d'actions du NYSE à un plus haut sur 52 semaines à celles à un plus bas."),
+    ("stock_price_breadth", "Stock Price Breadth", "#16a085", "McClellan Volume Summation Index",
+     "Compare le volume des actions en hausse à celui des actions en baisse (largeur du marché)."),
+    ("put_call_options", "Put/Call (moyenne 5 jours)", "#d35400", "Ratio put/call",
+     "Volume d'options de vente / options d'achat : un ratio élevé traduit la nervosité des investisseurs."),
+]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_fear_greed():
+    """Indice CNN Fear & Greed : niveau actuel, historique 1 an (avec le S&P 500), composantes."""
+    import requests
+    r = requests.get(CNN_FG_URL, timeout=15, headers={
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/124.0.0.0 Safari/537.36"})
+    r.raise_for_status()
+    js = r.json()
+    cur = js["fear_and_greed"]
+    to_df = lambda rows, col: (pd.DataFrame(rows).assign(
+        date=lambda d_: pd.to_datetime(d_["x"], unit="ms", utc=True).dt.normalize()).rename(columns={"y": col}))
+    fg = to_df(js["fear_and_greed_historical"]["data"], "score")[["date", "score", "rating"]]
+    sp = to_df(js["market_momentum_sp500"]["data"], "sp500")[["date", "sp500"]]
+    df = fg.merge(sp, on="date", how="inner").sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    comps = {}
+    for k, *_ in FG_COMPONENTS:
+        c = js.get(k) or {}
+        if c.get("data"):
+            comps[k] = {"score": c.get("score"), "rating": c.get("rating"),
+                        "df": to_df(c["data"], "value")[["date", "value"]].sort_values("date")}
+    return cur, df, comps
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fear_greed_commentary(api_key, score, rating, prev_close, prev_w, prev_m, prev_y, trend, sp):
+    """Commentaire de 3-4 phrases (API Claude, facultatif) ; gardé en mémoire tant que les données ne changent pas."""
+    try:
+        import anthropic
+    except ImportError:
+        return "Le paquet « anthropic » n'est pas installé (pip install anthropic)."
+    chg = (sp[-1] / sp[0] - 1) * 100 if sp and sp[0] else 0
+    prompt = (f"Tu es un analyste de marché concis. Données actuelles du CNN Fear & Greed Index et du S&P 500 :\n"
+              f"- score actuel : {score:.1f}/100 ({rating}) ; clôture précédente {prev_close:.1f} ; il y a 1 semaine "
+              f"{prev_w:.1f} ; il y a 1 mois {prev_m:.1f} ; il y a 1 an {prev_y:.1f}\n"
+              f"- 21 dernières valeurs (jours ouvrés) : {list(trend)}\n"
+              f"- S&P 500 il y a ~1 mois : {sp[0]:.0f} ; aujourd'hui : {sp[-1]:.0f} ({chg:+.1f} %)\n"
+              "En 3-4 phrases courtes et factuelles en français, décris la tendance récente du sentiment de marché en "
+              "la mettant en relation avec l'évolution du S&P 500 sur la période, sans conseil d'investissement.")
+    msg = anthropic.Anthropic(api_key=api_key).messages.create(
+        model="claude-sonnet-4-5", max_tokens=300, messages=[{"role": "user", "content": prompt}])
+    return msg.content[0].text
+
+
+def render_fear_greed():
+    st.subheader("Indice CNN Fear & Greed — sentiment du marché américain")
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        st.error("Bibliothèque « plotly » manquante : pip install -r requirements.txt")
+        return
+    c0, c1 = st.columns([1, 3])
+    if c0.button("🔄 Rafraîchir", key="fg_refresh"):
+        fetch_fear_greed.clear()
+        st.session_state.pop("_fail_fg", None)
+        st.session_state.pop("_fail_fg_msg", None)
+    if time.time() - st.session_state.get("_fail_fg", 0) < 600:          # échec récent : pas de nouvel essai
+        st.error(f"Indice CNN indisponible ({st.session_state.get('_fail_fg_msg', '')}) — nouvel essai dans quelques "
+                 "minutes ou avec « 🔄 Rafraîchir ».")
+        return
+    try:
+        with st.spinner("Indice CNN Fear & Greed…"):
+            cur, df, comps = fetch_fear_greed()
+    except Exception as e:
+        st.session_state["_fail_fg"] = time.time()
+        st.session_state["_fail_fg_msg"] = f"{type(e).__name__}"
+        st.error(f"Indice CNN indisponible ({type(e).__name__} : {e}).")
+        return
+    try:
+        ts = datetime.fromisoformat(str(cur["timestamp"]).replace("Z", "+00:00"))
+        c1.caption(f"Données CNN Business du {ts:%d/%m/%Y à %H:%M} UTC · mises en cache 10 minutes.")
+    except Exception:
+        pass
+    score, rating = float(cur["score"]), str(cur["rating"])
+    g, m = st.columns([1.2, 1])
+    with g:
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number", value=score, number={"suffix": " / 100", "font": {"size": 40}},
+            title={"text": FG_LABELS.get(rating, rating).upper(), "font": {"size": 22}},
+            gauge={"axis": {"range": [0, 100], "tickwidth": 1}, "bar": {"color": "#262626", "thickness": 0.25},
+                   "steps": [{"range": [0, 25], "color": "#c0392b"}, {"range": [25, 45], "color": "#e67e22"},
+                             {"range": [45, 55], "color": "#b1b1b1"}, {"range": [55, 75], "color": "#27ae60"},
+                             {"range": [75, 100], "color": "#145a32"}]}))
+        fig.update_layout(height=320, margin=dict(l=30, r=30, t=60, b=10))
+        st.plotly_chart(fig, width="stretch", key="fg_gauge")
+    with m:
+        st.markdown("**Historique récent**")
+        a, b = st.columns(2)
+        a.metric("Clôture précédente", f"{cur['previous_close']:.1f}")
+        b.metric("Il y a 1 semaine", f"{cur['previous_1_week']:.1f}", f"{score - cur['previous_1_week']:+.1f}")
+        a, b = st.columns(2)
+        a.metric("Il y a 1 mois", f"{cur['previous_1_month']:.1f}", f"{score - cur['previous_1_month']:+.1f}")
+        b.metric("Il y a 1 an", f"{cur['previous_1_year']:.1f}", f"{score - cur['previous_1_year']:+.1f}")
+        st.caption("0–25 peur extrême · 25–45 peur · 45–55 neutre · 55–75 avidité · 75–100 avidité extrême. "
+                   "Indicateur à contre-courant : une peur extrême accompagne souvent les points bas du marché, une "
+                   "avidité extrême les excès — c'est un indicateur d'ambiance, pas un signal d'achat ou de vente.")
+    with st.expander("🤖 Commentaire automatique (API Claude, facultatif)"):
+        # le champ « mot de passe » n'est créé qu'à la demande : sa seule présence dans la page fait proposer au
+        # navigateur ses mots de passe enregistrés (« Manage Passwords ») sur les autres champs, comme le menu « Valeur »
+        key = None
+        if st.checkbox("Activer le commentaire automatique", key="fg_ai_on"):
+            key = st.text_input("Clé API Anthropic", type="password", key="fg_api_key", autocomplete="off",
+                                help="Utilisée seulement pour ce commentaire, jamais enregistrée dans le script.")
+        if key and len(df) >= 21:
+            try:
+                with st.spinner("Rédaction du commentaire…"):
+                    st.info(fear_greed_commentary(
+                        key, score, rating, cur["previous_close"], cur["previous_1_week"], cur["previous_1_month"],
+                        cur["previous_1_year"], tuple(round(v, 1) for v in df.tail(21)["score"]),
+                        tuple(round(v, 1) for v in df.tail(21)["sp500"])))
+            except Exception as e:
+                st.warning(f"Commentaire impossible : {e}")
+    st.markdown("**S&P 500 et Fear & Greed (12 derniers mois)**")
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Scatter(x=df["date"], y=df["sp500"], mode="lines", line=dict(color="#1f2937", width=2),
+                             name="S&P 500"), secondary_y=False)
+    fig.add_trace(go.Scatter(x=df["date"], y=df["score"], mode="lines", name="Fear & Greed", opacity=0.85,
+                             line=dict(color="#006598", width=1.5, dash="dot")), secondary_y=True)
+    fig.update_yaxes(title_text="S&P 500 (points)", secondary_y=False)
+    fig.update_yaxes(title_text="Fear & Greed (0–100)", range=[0, 100], showgrid=False, secondary_y=True)
+    fig.update_layout(height=440, margin=dict(l=10, r=10, t=10, b=10), hovermode="x unified",
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    st.plotly_chart(fig, width="stretch", key="fg_hist")
+    st.caption("Ligne pleine : S&P 500 (échelle de gauche) · pointillés : Fear & Greed (échelle de droite).")
+    if comps:
+        st.markdown("**Composantes de l'indice**")
+        for k, lbl, color, ytitle, desc in FG_COMPONENTS:
+            c = comps.get(k)
+            if not c:
+                continue
+            a, b = st.columns([1, 3])
+            a.metric(lbl, f"{c['score']:.1f} / 100" if c.get("score") is not None else "n.d.", help=desc)
+            a.caption(FG_LABELS.get(c.get("rating"), c.get("rating") or "") + " — " + desc)
+            f2 = go.Figure(go.Scatter(x=c["df"]["date"], y=c["df"]["value"], mode="lines",
+                                      line=dict(color=color, width=2)))
+            f2.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10), yaxis=dict(title=ytitle),
+                             showlegend=False)
+            b.plotly_chart(f2, width="stretch", key=f"fg_{k}")
+        st.caption("Chaque composante a sa propre échelle (celle de CNN avant normalisation sur 0–100). L'indice en "
+                   "compte sept : momentum du S&P 500, force et largeur des cours, put/call, volatilité (VIX), "
+                   "demande de valeurs refuges et d'obligations à haut rendement.")
+    with st.expander("Données brutes"):
+        st.dataframe(df, width="stretch", hide_index=True)
+        st.download_button("⬇️ CSV", df.to_csv(index=False).encode("utf-8"),
+                           f"fear_greed_{TODAY:%Y%m%d}.csv", "text/csv", key="fg_csv")
+
+
 def render_sentiment(facts):
     if not facts:
         st.info("Récupérez d'abord les données du portefeuille, ou analysez des pages Finviz dans « Valeurs à étudier ».")
@@ -2239,7 +2458,9 @@ def fetch_quote(t, use_cache=True):
     path = os.path.join(CACHE_DIR, f"{t}_quote.json")
     if use_cache and os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_HOURS * 3600:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            cached = json.load(f)
+            if not _news_old(cached):
+                return cached
     raw = {"ticker": t, "fetched": datetime.now().isoformat(timespec="minutes")}
     s = _session()
     raw.update(parse_quote(_get(s, f"https://finviz.com/quote.ashx?t={t}&p=d", pause=(0.6, 1.2))))
@@ -3121,16 +3342,21 @@ def football_field(fv, f, cur):
 
 
 # ---------- Export de la fiche détaillée (PDF / Word)
-_EMO = {"🟢🟢": "(très favorable)", "🟢": "(vert)", "🟠": "(orange)", "🔴": "(rouge)", "⚪": "", "⚠️": "Attention :",
+_DOTS = {"🟢": ("\x01", "2e7d32"), "🟠": ("\x02", "ef6c00"), "🔴": ("\x03", "c62828"), "⚪": ("\x04", "9e9e9e")}
+_DOT_COL = {v[0]: v[1] for v in _DOTS.values()}
+_EMO = {"🟢🟢": "\x01\x01", "⚠️": "Attention :",
         "ℹ️": "Info :", "✅": "", "⟳": "(cyclique)", "🏦": "(modèle financier)", "➜": "->", "→": "->", "✓": "oui",
-        "≥": ">=", "≤": "<=", "▲": "+", "▼": "-", "💱": "", "📄": "", " ": " ", "\xa0": " "}
+        "≥": ">=", "≤": "<=", "▲": "+", "▼": "-", "💱": "", "📄": "", " ": " ", "\xa0": " ", "−": "-", "😨": ""}
 
 
 def _clean(x):
-    """Texte sans émoji ni caractère hors des polices standard des PDF (les pastilles deviennent des mots)."""
+    """Texte sans émoji ni caractère hors des polices standard des PDF ; les pastilles de couleur deviennent des
+    marqueurs (\x01…\x04) que les rendus PDF et Word dessinent en ronds colorés."""
     s = "" if x is None else str(x)
     for k, v in _EMO.items():
         s = s.replace(k, v)
+    for k, (m_, _) in _DOTS.items():
+        s = s.replace(k, m_)
     s = s.replace("**", "")
     s = s.encode("cp1252", "ignore").decode("cp1252")
     return re.sub(r"[ \t]{2,}", " ", s).strip()
@@ -3291,6 +3517,20 @@ def report_model(f, d, t):
                        + (f" ({d['pc']['Lecture P/C']})" if d["pc"].get("Lecture P/C") else "")))
         B.append(("table", [str(c) for c in op.columns], [[_fmt(v, 2) for v in r] for r in op.itertuples(index=False)]))
     # 10
+    B.append(("h", "11. Actualités (7 derniers jours)"))
+    try:
+        det_, ns_ = news_recent(dict(f, ticker=f.get("ticker") or t))
+    except Exception:
+        det_, ns_ = None, None
+    if det_ is not None and len(det_):
+        B.append(("p", f"{ns_['n7']} titres sur 7 jours ({ns_['pos7']} positifs, {ns_['neg7']} négatifs) ; ton moyen "
+                       f"7 j {ns_['s7']} / 30 j {ns_['s30']} (de −100 à +100). Source : {ns_['src']}."))
+        sh = det_.sort_values("Date", ascending=False).head(15)
+        B.append(("table", ["Date", "Ton", "Événement", "Titre", "Source"],
+                  [[r_.Date.strftime("%d/%m"), f"{r_.Ton} ({r_.Score:+d})", r_.Événement, r_.Titre, r_.Source]
+                   for r_ in sh.itertuples()]))
+    else:
+        B.append(("p", "Actualités non disponibles pour cette source."))
     B.append(("h", "10. Notes de calcul et sources"))
     B.append(("ul", list(fv["notes"])))
     B.append(("p", f"Sources : {short_source(f)}. Estimation argumentée, pas un conseil en investissement."))
@@ -3357,6 +3597,21 @@ def _png_football(fv, f, cur):
     return buf.getvalue()
 
 
+def _docx_runs(par, text, size=None, bold=False):
+    """Ajoute le texte à un paragraphe Word, les marqueurs de pastille devenant des ronds colorés."""
+    from docx.shared import Pt, RGBColor
+    for part in re.split(r"([\x01-\x04])", _clean(text)):
+        if not part:
+            continue
+        r_ = par.add_run("●" if part in _DOT_COL else part)
+        if part in _DOT_COL:
+            r_.font.color.rgb = RGBColor.from_string(_DOT_COL[part].upper())
+        if size:
+            r_.font.size = Pt(size)
+        r_.font.bold = bold
+    return par
+
+
 def report_docx(blocks):
     from docx import Document
     from docx.shared import Pt, Cm, RGBColor
@@ -3370,14 +3625,14 @@ def report_docx(blocks):
     for b in blocks:
         k = b[0]
         if k == "title":
-            doc.add_heading(_clean(b[1]), level=0)
+            doc.add_heading(re.sub(r"[\x01-\x04]", "", _clean(b[1])), level=0)
         elif k == "h":
-            doc.add_heading(_clean(b[1]), level=1)
+            doc.add_heading(re.sub(r"[\x01-\x04]", "", _clean(b[1])), level=1)
         elif k == "p":
-            doc.add_paragraph(_clean(b[1]))
+            _docx_runs(doc.add_paragraph(), b[1])
         elif k == "ul":
             for it in b[1]:
-                doc.add_paragraph(_clean(it), style="List Bullet")
+                _docx_runs(doc.add_paragraph(style="List Bullet"), it)
         elif k == "img":
             doc.add_picture(io.BytesIO(b[1]), width=Cm(17))
         elif k == "table":
@@ -3385,17 +3640,11 @@ def report_docx(blocks):
             tb = doc.add_table(rows=1, cols=len(head))
             tb.style = "Light Grid Accent 1"
             for i, h in enumerate(head):
-                cell = tb.rows[0].cells[i]
-                cell.text = _clean(h)
-                for r_ in cell.paragraphs[0].runs:
-                    r_.font.bold = True
-                    r_.font.size = Pt(8.5)
+                _docx_runs(tb.rows[0].cells[i].paragraphs[0], h, 8.5, True)
             for row in rows:
                 cells = tb.add_row().cells
                 for i, v in enumerate(row[:len(head)]):
-                    cells[i].text = _clean(v)
-                    for r_ in cells[i].paragraphs[0].runs:
-                        r_.font.size = Pt(8.5)
+                    _docx_runs(cells[i].paragraphs[0], v, 8.5)
             doc.add_paragraph()
     buf = io.BytesIO()
     doc.save(buf)
@@ -3415,7 +3664,26 @@ def report_pdf(blocks):
     h1 = ParagraphStyle("h1", parent=ss["Heading2"], fontName="Helvetica-Bold", fontSize=12, spaceBefore=10, spaceAfter=4,
                         textColor=colors.HexColor("#1f3b57"))
     tit = ParagraphStyle("t", parent=ss["Title"], fontName="Helvetica-Bold", fontSize=17)
-    P = lambda s_, st=body: Paragraph(escape(_clean(s_)), st)
+    # rond coloré : police DejaVu Sans fournie avec matplotlib (« ● »), sinon puce standard « • »
+    dot_font, dot_char = "Helvetica", "•"
+    try:
+        import matplotlib
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        ttf = os.path.join(matplotlib.get_data_path(), "fonts", "ttf", "DejaVuSans.ttf")
+        if os.path.exists(ttf):
+            if "DejaVuDot" not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(TTFont("DejaVuDot", ttf))
+            dot_font, dot_char = "DejaVuDot", "●"
+    except Exception:
+        pass
+
+    def _pdf_txt(s_):
+        t_ = escape(_clean(s_))
+        for m_, col in _DOT_COL.items():
+            t_ = t_.replace(m_, f'<font name="{dot_font}" color="#{col}">{dot_char}</font>')
+        return t_
+    P = lambda s_, st=body: Paragraph(_pdf_txt(s_), st)
     W = A4[0] - 3.4 * cm
     story = []
     for b in blocks:
@@ -3487,6 +3755,186 @@ def wacc_effect(f, fv, ref=0.085):
     return (f"taux d'actualisation : CMPC {res['wacc']['wacc'] * 100:.1f} %, au-dessus des 8 à 9 % souvent retenus "
             f"par les analystes ; à {ref * 100:.1f} %, le DCF (scénario central) passerait de {a:.0f} à {b:.0f}, soit "
             f"{(b - a) * w_dcf:+.0f} sur la juste valeur")
+
+
+# ---------- Section 11 du détail : actualités récentes et sentiment
+NEWS_EVENTS = [   # (catégorie, motif dans le titre anglais) : événements qui font souvent bouger le cours
+    ("Résultats", r"\b(earnings|results|quarter|Q[1-4]\b|beats?|miss(es|ed)?|EPS|revenue (tops|falls|rises))"),
+    ("Prévisions", r"\b(guidance|outlook|forecast|raises? (its )?(full-year|outlook|guidance)|cuts? (its )?(outlook|guidance))"),
+    ("Analystes", r"\b(upgrade[sd]?|downgrade[sd]?|price target|initiat(es|ed) coverage|overweight|underweight|"
+                  r"outperform|underperform|buy rating|sell rating)"),
+    ("Opération", r"\b(acquir(e|es|ed|ition)|merger|to buy|takeover|buyout|spin[- ]?off|divest|stake)"),
+    ("Contrat", r"\b(contract|order|deal|partnership|agreement|award(ed)?|wins?)\b"),
+    ("Justice / régulateur", r"\b(lawsuit|sue[sd]?|probe|investigation|SEC|DOJ|FTC|antitrust|recall|fine[sd]?|"
+                             r"settle(ment|s|d)?|subpoena)\b"),
+    ("Produit / autorisation", r"\b(FDA|approv(al|es|ed)|launch(es|ed)?|trial)\b"),
+    ("Capital", r"\b(dividend|buyback|repurchase|offering|share sale|debt|bond|notes)\b"),
+    ("Direction", r"\b(CEO|CFO|chief executive|resign(s|ed)?|appoint(s|ed)?|steps down|succession)\b"),
+]
+
+
+def news_event(title):
+    """Catégorie de l'événement (premier motif reconnu) ou "" ."""
+    for cat, pat in NEWS_EVENTS:
+        if re.search(pat, title, re.I):
+            return cat
+    return ""
+
+
+YAHOO_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_yahoo_news(isin, name=""):
+    """Titres Yahoo Finance d'une valeur sans fiche Finviz (Europe…) : ISIN -> symbole Yahoo (RI.PA…), puis
+    recherche par nom ; seuls les titres que Yahoo rattache à ce symbole sont gardés.
+    -> (symbole, [[iso, titre, source, lien], …]) du plus récent au plus ancien."""
+    import requests
+
+    def search(q, news=0, quotes=0):
+        err = None
+        for host in ("query1", "query2"):
+            try:
+                r = requests.get(f"https://{host}.finance.yahoo.com/v1/finance/search", timeout=15,
+                                 params={"q": q, "newsCount": news, "quotesCount": quotes},
+                                 headers={"User-Agent": YAHOO_UA})
+                r.raise_for_status()
+                return r.json()
+            except Exception as e:
+                err = e
+        raise err
+
+    qs = search(isin, quotes=3).get("quotes") or []
+    q = next((x for x in qs if x.get("quoteType") == "EQUITY"), qs[0] if qs else None)
+    if not q:
+        return None, []
+    sym, out, seen = q["symbol"], [], set()
+    # le nom court (« PERNOD RICARD ») donne les meilleurs résultats ; le nom long (« … SA », « … Société
+    # anonyme ») n'en donne parfois aucun
+    for term in dict.fromkeys(t for t in (q.get("shortname"), name, q.get("longname")) if t):
+        for n in search(term, news=30).get("news") or []:
+            if sym not in (n.get("relatedTickers") or []) or n.get("title") in seen or not n.get("providerPublishTime"):
+                continue
+            seen.add(n["title"])
+            out.append([datetime.fromtimestamp(n["providerPublishTime"]).isoformat(timespec="minutes"), n["title"],
+                        n.get("publisher") or "Yahoo Finance", n.get("link") or ""])
+        if out:
+            break
+    return sym, sorted(out, reverse=True)
+
+
+def news_for(f):
+    """Titres de la fiche Finviz ; à défaut (valeur européenne lue sur Zonebourse), titres Yahoo Finance via l'ISIN.
+    -> (titres, libellé de la source, filtrer sur le nom de la société ?)"""
+    if f.get("news"):
+        return f["news"], "Finviz", True
+    isin = f.get("isin") or ""
+    if isin:
+        y = _guarded(f"yahoo_{isin}", lambda: fetch_yahoo_news(isin, f.get("name") or f.get("company") or ""))
+        if y and y[1]:
+            return y[1], f"Yahoo Finance ({y[0]})", False       # déjà rattachés au symbole par Yahoo
+    return [], "", False
+
+
+def news_recent(f, days=7):
+    """Titres des `days` derniers jours, avec le ton et la catégorie d'événement ; résumé 7 j / 30 j."""
+    news, src, filt = news_for(f)
+    if not news:
+        return None, None
+    tk = f.get("ticker") or ""
+    ns = (news_sentiment(news, ticker=tk, company=f.get("company", "")) if filt
+          else news_sentiment(news, ticker="", company=""))
+    if not ns:
+        return None, None
+    ns["src"] = src
+    det = ns["détail"].copy()
+    det = det[(TODAY - det["Date"]).dt.days <= days]
+    links = {n[1]: n[3] for n in news if len(n) > 3 and n[3]}
+    det["Événement"] = det["Titre"].map(news_event)
+    det["Ton"] = det["Score"].map(lambda v: "🟢 positif" if v >= 15 else "🔴 négatif" if v <= -15 else "⚪ neutre")
+    from urllib.parse import quote_plus
+    det["Lien"] = det["Titre"].map(lambda t_: links.get(t_) or
+                                   "https://www.google.com/search?tbm=nws&q=" + quote_plus(t_))
+    return det, ns
+
+
+def _guarded(name, fn, ttl=600):
+    """Appel réseau protégé : après un échec, pas de nouvel essai pendant `ttl` secondes (l'onglet reste rapide)."""
+    k = f"_fail_{name}"
+    if time.time() - st.session_state.get(k, 0) < ttl:
+        return None
+    try:
+        return fn()
+    except Exception:
+        st.session_state[k] = time.time()
+        return None
+
+
+def render_news(f, ns_key=""):
+    det, ns = news_recent(f)
+    if det is None:
+        st.caption("Actualités non disponibles : pas de fiche Finviz, et aucun titre Yahoo Finance trouvé"
+                   + (" (code ISIN absent de la page Zonebourse)." if not f.get("isin") else "."))
+    else:
+        c = st.columns(4)
+        c[0].metric("Titres sur 7 jours", ns["n7"], f"{ns['pos7']} positifs · {ns['neg7']} négatifs", delta_color="off")
+        c[1].metric("Ton sur 7 jours", score_txt(ns["s7"], ns["n7"]) or "n.d.")
+        c[2].metric("Ton sur 30 jours", score_txt(ns["s30"], ns["n30"]) or "n.d.")
+        ev = det[det["Événement"] != ""]
+        c[3].metric("Événements repérés (7 j)", len(ev))
+        if len(det):
+            show = det.sort_values("Date", ascending=False)[["Date", "Ton", "Score", "Événement", "Titre", "Source", "Lien"]]
+            show["Date"] = show["Date"].dt.strftime("%d/%m %H:%M")
+            st.dataframe(show, hide_index=True, width="stretch", key=f"news_{ns_key}", column_config={
+                "Ton": st.column_config.TextColumn(help="positif : score ≥ +15 · négatif : score ≤ −15 · neutre "
+                                                        "entre les deux (titre factuel, sans mot nettement positif "
+                                                        "ou négatif)"),
+                "Score": st.column_config.NumberColumn(format="%d", help="ton du titre, de −100 à +100 (VADER + "
+                                                                           "vocabulaire financier)"),
+                "Événement": st.column_config.TextColumn(help="type d'information qui fait souvent bouger le cours "
+                                                              "(repéré par mots-clés)"),
+                "Titre": st.column_config.TextColumn(width="large"),
+                "Lien": st.column_config.LinkColumn(display_text="ouvrir", help="article d'origine (ou recherche "
+                                                                                  "Google Actualités du titre)")})
+        if not len(det):
+            det30, _ = news_recent(f, 30)
+            if det30 is not None and len(det30):
+                st.caption("Aucun titre sur les 7 derniers jours — titres des 30 derniers jours :")
+                show = det30.sort_values("Date", ascending=False)[["Date", "Ton", "Score", "Événement", "Titre",
+                                                                  "Source", "Lien"]]
+                show["Date"] = show["Date"].dt.strftime("%d/%m %H:%M")
+                st.dataframe(show, hide_index=True, width="stretch", key=f"news30_{ns_key}", column_config={
+                    "Titre": st.column_config.TextColumn(width="large"),
+                    "Lien": st.column_config.LinkColumn(display_text="article")})
+            else:
+                st.caption("Aucun titre sur les 30 derniers jours.")
+        if ns["src"] == "Finviz":
+            st.caption("Titres de la fiche Finviz qui citent la société (Reuters, Bloomberg, Barron's, communiqués…). "
+                       "Le ton est calculé titre par titre, sans comprendre le contexte : lisez les événements repérés "
+                       "avant d'en tirer une conclusion.")
+        else:
+            st.caption(f"Titres {ns['src']}, en anglais, que Yahoo rattache à la société (code ISIN "
+                       f"{f.get('isin')}) — mis en cache 1 heure. Couverture plus mince que Finviz pour les valeurs "
+                       "européennes (souvent quelques titres par semaine). Le ton est calculé titre par titre, sans "
+                       "comprendre le contexte.")
+    ape = _guarded("ape", fetch_apewisdom)
+    tk = (f.get("ticker") or "").upper()
+    x = (ape or {}).get(tk)
+    if x:
+        m, m0 = int(x.get("mentions") or 0), int(x.get("mentions_24h_ago") or 0)
+        mom = f" ({(m / m0 - 1) * 100:+.0f} % sur 24 h)" if m0 >= 10 else ""
+        st.markdown(f"**Reddit** — rang **{x.get('rank')}** des actions les plus citées, {m} mentions sur 24 h{mom}. "
+                    "L'attention ne dit pas le sens : à croiser avec le ton des actualités.")
+    elif ape is not None:
+        st.caption("Reddit : action peu ou pas citée sur 24 h (hors des ~600 premières d'ApeWisdom).")
+    else:
+        st.caption("Reddit (ApeWisdom) momentanément indisponible.")
+    fg = _guarded("fg", fetch_fear_greed)
+    if fg:
+        cur = fg[0]
+        st.caption(f"Contexte de marché : indice Fear & Greed {float(cur['score']):.0f}/100 "
+                   f"({FG_LABELS.get(cur['rating'], cur['rating'])}) — détail dans l'onglet 😨 Fear & Greed.")
 
 
 def render_detail(f, d, t=None, ns=""):
@@ -3710,6 +4158,9 @@ def render_detail(f, d, t=None, ns=""):
     with st.expander("Détail des hypothèses et notes du calcul"):
         st.markdown(_md("\n".join(f"- {n}" for n in fv["notes"]) or "—"))
     st.caption("Sources : " + short_source(f) + ". Estimation argumentée, pas un conseil en investissement.")
+    # ---------- 11. Actualités et sentiment
+    st.markdown("##### 11. Actualités et sentiment (7 derniers jours)")
+    render_news(dict(f, ticker=f.get("ticker") or tk), ns)
 
 
 def scenario_values(f, d):
@@ -3949,6 +4400,7 @@ def main():
                 f = (copy.deepcopy(parse_zonebourse_cached(hs_, grp[0][0])) if use_cache
                      else parse_zonebourse(list(hs_), grp[0][0]))     # cache décoché : relecture complète
                 f["source"] = "Zonebourse : " + ", ".join(n for n, _ in grp)
+                f.setdefault("isin", zb_isin("".join(hs_)))
                 facts[f["ticker"]] = f
                 zb_store[f["ticker"]] = f             # gardées pour enrichir le portefeuille
                 if f["missing_finances"]:
@@ -4000,7 +4452,7 @@ def main():
     st.session_state["wl_errs"] = list(st.session_state.get("wl_errs_pages") or []) + \
         list(st.session_state.get("wl_errs_scr") or [])
 
-    tab1, tab2, tab4, tab5, tab6, tab7, tab3 = st.tabs(["📋 Portefeuille", "🛒 Valeurs à étudier", "📰 Sentiment",
+    tab1, tab2, tab4, tab5, tab6, tab7, tab3 = st.tabs(["📋 Portefeuille", "🛒 Valeurs à étudier", "😨 Fear & Greed",
                                                         "🔥 Sentiment screener", "🔎 Screener JV", "👥 Screener initiés",
                                                         "ℹ️ Méthode"])
 
@@ -4082,9 +4534,7 @@ def main():
             detail_and_scenarios(df2, det2, keys2, "wl")
 
     with tab4:
-        sent = {t: build_facts(r) for t, r in raws.items()}
-        sent.update({t: f for t, f in st.session_state.get("wl", {}).items() if t not in sent})
-        render_sentiment(sent)
+        render_fear_greed()
 
     with tab5:
         render_reddit_top(p, use_cache, max_days, use_oi)
@@ -4146,8 +4596,13 @@ Par défaut il est propre à chaque valeur (CAPM) : taux sans risque 4,3 % + bê
 Sans bêta (pages Zonebourse), taux unique de 9 %, + 3 points pour une valeur cyclique (réglable). Le WACC est affiché à titre indicatif (dette nette, coût de la dette = taux sans
 risque + 1,5 point, impôt 25 %) mais n'entre pas dans le calcul.
 
-**Sentiment** : titres d'actualité de la fiche Finviz (environ 100 derniers) notés par VADER, un analyseur de ton
-complété d'un vocabulaire financier (upgrade, beat, downgrade, miss…) ; mentions Reddit via ApeWisdom (gratuit, sans clé).
+**😨 Fear & Greed** : indice CNN du sentiment du marché américain (0 = peur extrême, 100 = avidité extrême), calculé par
+CNN à partir de sept indicateurs (momentum du S&P 500, force et largeur des cours, put/call, VIX, valeurs refuges,
+obligations à haut rendement) ; jauge, historique 1 an avec le S&P 500, trois composantes ; données mises en cache 10 min.
+Commentaire automatique facultatif avec une clé API Anthropic (saisie dans l'onglet, jamais enregistrée).
+
+**Sentiment screener** : titres d'actualité de la fiche Finviz notés par VADER, un analyseur de ton complété d'un
+vocabulaire financier (upgrade, beat, downgrade, miss…) ; mentions Reddit via ApeWisdom (gratuit, sans clé).
 C'est un indicateur d'ambiance, pas un signal d'achat : à croiser avec la juste valeur.
 
 **Cyclique** : croissance du BNA de l'année > 150 % (bénéfices probablement proches d'un pic), ou retour à la perte
