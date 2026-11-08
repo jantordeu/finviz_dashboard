@@ -23,6 +23,7 @@ BASE_URL = "https://www.dataroma.com/m/"
 
 # Pages de la grille S&P 500 (paramètre ?s=)
 GRIDS = {
+    "o": "Ownership",            # nb de superinvestors qui détiennent la valeur (page par défaut, sans ?s=)
     "q": "Last qtr buys",
     "h": "Last 6 months buys",
     "sq": "Last qtr sells",
@@ -94,7 +95,7 @@ def parse_grid(html: str) -> list[dict]:
         if div is None:
             continue
         text = div.get_text(" ", strip=True)
-        m = re.search(r"(?:Buys/Adds|Sells/Reductions|Sells|Buys)[^:]*:\s*(\d+)", text)
+        m = re.search(r"(?:Buys/Adds|Sells/Reductions|Sells|Buys|Ownership)[^:]*:\s*(\d+)", text)
         sector = re.search(r"\(([^)]+)\)", text)
         rows.append({
             "ticker": a.get_text(strip=True),

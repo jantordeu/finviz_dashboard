@@ -72,13 +72,59 @@ LINKS = {LABELS["url"], LABELS["oi_url"]}
 
 def sp500(grid: str = "q") -> pd.DataFrame:
     """Les 500 valeurs de la grille Dataroma, avec leur nb de superinvestors."""
-    html = dr.fetch(dr.make_session(), dr.BASE_URL + "grid.php", {"s": grid})
+    html = dr.fetch(dr.make_session(), dr.BASE_URL + "grid.php", None if grid == "o" else {"s": grid})
     return pd.DataFrame(dr.parse_grid(html))
 
 
 def universe(grid: str = "q", min_si: int = 1, base: pd.DataFrame | None = None) -> pd.DataFrame:
     df = sp500(grid) if base is None else base
     return df[df["si_count"] >= min_si].reset_index(drop=True)
+
+
+def investors_universe(min_si: int = 1, progress=None) -> pd.DataFrame:
+    """Univers du screener investors : valeurs du S&P 500 détenues par au moins `min_si` superinvestors (grille
+    Dataroma « Ownership »), avec l'activité des fonds : renforcements / allègements du dernier trimestre et des
+    6 derniers mois (grilles « Last qtr / 6 months buys / sells »)."""
+    base = sp500("o").rename(columns={"si_count": "owners"})
+    for i, (g, col) in enumerate((("q", "add_q"), ("sq", "red_q"), ("h", "add_6m"), ("sh", "red_6m")), 1):
+        if progress:
+            progress(i, 4, dr.GRIDS[g])
+        part = sp500(g)[["ticker", "si_count"]].rename(columns={"si_count": col})
+        base = base.merge(part.drop_duplicates("ticker"), on="ticker", how="left")
+    for col in ("add_q", "red_q", "add_6m", "red_6m"):
+        base[col] = base[col].fillna(0).astype(int)
+    return base[base["owners"] >= min_si].reset_index(drop=True)
+
+
+def split_oe(tx: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(transactions hors levées d'options, ventes liées à une levée d'options « S - Sale+OE »)."""
+    if tx is None or tx.empty or "trade_type" not in tx:
+        return tx, tx.iloc[0:0] if tx is not None else tx
+    oe = tx["trade_type"].fillna("").str.contains("OE") & (tx["type"] == "S")
+    return tx[~oe], tx[oe]
+
+
+def exit_rows(oe_tx: pd.DataFrame) -> pd.DataFrame:
+    """Ventes après levée d'options au format de signaux.top_exit_warning (part de la détention vendue =
+    titres vendus / (titres détenus après + titres vendus))."""
+    if oe_tx is None or oe_tx.empty:
+        return pd.DataFrame(columns=["key", "date", "name", "role", "side", "oe", "pct_sold"])
+    qty = oe_tx["qty"].fillna(0).abs()
+    held = oe_tx["owned"].fillna(0).abs() + qty
+    return pd.DataFrame({"key": oe_tx["ticker"], "date": pd.to_datetime(oe_tx["trade_date"], errors="coerce"),
+                         "name": oe_tx["insider"], "role": oe_tx["title"], "side": "V", "oe": True,
+                         "pct_sold": (qty / held.where(held > 0)) * 100})
+
+
+def signal_tx(tx: pd.DataFrame) -> pd.DataFrame:
+    """Transactions OpenInsider au format du module signaux (achats P, ventes S)."""
+    if tx is None or tx.empty:
+        return pd.DataFrame(columns=["key", "date", "person", "side", "value", "mandate", "name"])
+    t = tx[tx["type"].isin(["P", "S"])]
+    return pd.DataFrame({"key": t["ticker"], "date": pd.to_datetime(t["trade_date"], errors="coerce"),
+                         "person": t["insider"].str.lower(), "side": t["type"].map({"P": "A", "S": "V"}),
+                         "value": t["value"], "mandate": False,
+                         "name": t["insider"] + t["title"].fillna("").map(lambda x: f" ({x})" if x else "")})
 
 
 def run_dataroma(uni: pd.DataFrame, delay: float = 0.5, progress=None) -> pd.DataFrame:
@@ -102,12 +148,13 @@ def run_dataroma(uni: pd.DataFrame, delay: float = 0.5, progress=None) -> pd.Dat
 
 
 def fetch_openinsider(uni: pd.DataFrame, days: int = 90, delay: float = 0.5, progress=None,
-                      years_back: int = 0, periods_back: int = 0):
+                      years_back: int = 0, periods_back: int = 0, include_oe: bool = False):
     """Téléchargement OpenInsider (levées d'options exclues) → (transactions, journal).
     years_back=1   : même période, un an plus tôt ;
     periods_back=1 : les `days` jours qui précèdent la période actuelle."""
     return oi.fetch_transactions(uni["ticker"].tolist(), days, delay, progress=progress,
-                                 period=oi.date_range(days, years_back, periods_back=periods_back))
+                                 period=oi.date_range(days, years_back, periods_back=periods_back),
+                                 include_oe=include_oe)
 
 
 SENT_ROWS = [("ratio_ins", "Acheteurs / vendeurs distincts (ratio)"),

@@ -24,9 +24,11 @@
 #   - Sentiment screener : actions les plus citées sur Reddit à l'actualité positive
 #   - Screener JV : lecture d'un screener Finviz, exclusion d'industries, juste valeur rapide,
 #     envoi en analyse complète
-#   - Screener initiés : superinvestors (Dataroma) × achats des dirigeants (OpenInsider), sentiment des
-#     initiés comparé, exports ; modules analyse.py, openinsider.py, dataroma_scraper.py, exports.py
-#     dans le même dossier
+#   - Screener investors (NYSE / Nasdaq) : S&P 500 détenu par les superinvestors (Dataroma), signal des
+#     dirigeants (OpenInsider, 12 mois) et des fonds ; modules analyse.py, openinsider.py,
+#     dataroma_scraper.py, exports.py, signaux.py dans le même dossier
+#   - Screener AMF (Euronext Paris) : déclarations des dirigeants (base BDIF de l'AMF) ; amf.py, signaux.py,
+#     sbf120.csv
 #   - Méthode : explication des calculs
 #
 #  Juste valeur :
@@ -383,7 +385,7 @@ def complete_online_cached(raw, t, max_days=200, use_cache=True, log=print, open
     """Compléments en ligne d'une fiche Finviz déposée, mis en cache 2 h par valeur : redéposer ou ajouter des
     pages ne relance pas les téléchargements déjà faits (le cours et la fiche restent ceux de la page)."""
     os.makedirs(CACHE_DIR, exist_ok=True)
-    path = os.path.join(CACHE_DIR, f"{t}_complements{'_oi' if openinsider else ''}_{max_days}.json")
+    path = os.path.join(CACHE_DIR, f"{t}_complements{'_oi' if openinsider else ''}_{max_days}_v{INS_MERGE_VERSION}.json")
     if use_cache and os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_HOURS * 3600:
         with open(path, encoding="utf-8") as fh:
             raw.update(json.load(fh))
@@ -413,6 +415,31 @@ def raws_from_finviz_pages_cached(pages):
     return raws_from_finviz_pages(list(pages), page_fn=finviz_page_cached)
 
 
+INS_MERGE_VERSION = 2       # change le nom des caches : les anciennes fusions OpenInsider + Finviz sont relues
+
+
+def _name_key(n):
+    return frozenset(w for w in re.findall(r"[a-z]+", (n or "").lower()) if len(w) > 1)
+
+
+def _oi_covers(oi_rows, r):
+    """Une transaction de la fiche Finviz est-elle déjà dans OpenInsider ? Même dirigeant (mêmes mots du nom, ordre
+    et casse ignorés), même sens, à 3 jours près : OpenInsider regroupe en une ligne les ventes étalées sur plusieurs
+    jours (ex. 25,8 + 25,6 M$ sur Finviz = 51,4 M$ sur OpenInsider), avec l'indication « levée d'options »."""
+    def dt(x):
+        try:
+            return datetime.strptime(x.replace("'", "20"), "%b %d %Y")
+        except ValueError:
+            return None
+    k, d = _name_key(r[0]), dt(r[2])
+    for o in oi_rows:
+        if o[3] == r[3] and _name_key(o[0]) == k:
+            do = dt(o[2])
+            if d is None or do is None or abs((do - d).days) <= 3:
+                return True
+    return False
+
+
 def complete_online(raw, t, max_days=200, log=print, s=None, openinsider=True):
     """Ajoute en ligne ce qui manque : états financiers, initiés (OpenInsider), options, super investors."""
     s = s or _session()
@@ -421,9 +448,8 @@ def complete_online(raw, t, max_days=200, log=print, s=None, openinsider=True):
         try:
             rows = fetch_openinsider(t, s)
             if rows:                                     # sinon (société non suivie) : on garde la fiche Finviz
-                seen = {(r[2], r[3], r[5]) for r in rows}
                 extra = [r for r in raw.get("insiders", []) if len(r) >= 7 and r[3] in ("Buy", "Sale")
-                         and (r[2], r[3], r[5]) not in seen]   # transactions de la fiche Finviz absentes d'OpenInsider
+                         and not _oi_covers(rows, r)]   # transactions de la fiche Finviz absentes d'OpenInsider
                 raw["insiders"] = rows + extra
                 raw["insider_source"] = f"OpenInsider + fiche Finviz, 12 mois ({len(rows) + len(extra)} transactions)"
         except Exception as e:
@@ -467,7 +493,7 @@ def _news_old(raw):
 
 def fetch_ticker(t, max_days=200, use_cache=True, log=print, openinsider=True):
     os.makedirs(CACHE_DIR, exist_ok=True)
-    path = os.path.join(CACHE_DIR, f"{t}{'_oi' if openinsider else ''}.json")
+    path = os.path.join(CACHE_DIR, f"{t}{'_oi' if openinsider else ''}_v{INS_MERGE_VERSION}.json")
     if use_cache and os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_HOURS * 3600:
         with open(path, encoding="utf-8") as f:
             cached = json.load(f)
@@ -990,6 +1016,13 @@ def insider_stats(rows, ref=None):
     part de la détention achetée, ventes accompagnées d'une levée d'options ; signal de synthèse."""
     ref = ref or TODAY
     seen, tx = set(), []
+    exer = []                                    # levées d'options (fiche Finviz) : la vente associée est repérée
+    for r in rows:
+        if len(r) >= 4 and r[3] == "Option Exercise":
+            try:
+                exer.append((r[0].strip().lower(), datetime.strptime(r[2].replace("'", "20"), "%b %d %Y")))
+            except ValueError:
+                pass
     for r in rows:
         if len(r) < 7:
             continue
@@ -1008,8 +1041,12 @@ def insider_stats(rows, ref=None):
         pct = None
         if typ == "Buy" and total and total > shares:
             pct = shares / (total - shares) * 100          # hausse de la détention du dirigeant
-        tx.append({"date": d, "age": (ref - d).days, "name": name.strip(), "rel": rel, "typ": typ,
-                   "val": (num(val) or 0) / 1e6, "pct": pct, "oe": "levée d'options" in rel,
+        pct_sold = shares / (total + shares) * 100 if typ == "Sale" and total is not None and total + shares > 0 \
+            else None                                # part de la détention vendue (détention après + titres vendus)
+        tx.append({"date": d, "age": (ref - d).days, "name": name.strip(), "rel": rel, "typ": typ, "pct_sold": pct_sold,
+                   "val": (num(val) or 0) / 1e6, "pct": pct,
+                   "oe": "levée d'options" in rel or (typ == "Sale" and any(
+                       n == name.strip().lower() and abs((d - e).days) <= 3 for n, e in exer)),
                    "top": bool(TOP_ROLES.search(rel)), "big": "10%" in rel})
     y = [t for t in tx if t["age"] <= 365]
     buys, sales = [t for t in y if t["typ"] == "Buy"], [t for t in y if t["typ"] == "Sale"]
@@ -1051,6 +1088,7 @@ def insider_stats(rows, ref=None):
         parts.append(f"ventes {out['Ventes 365j']:.1f} M$" + (f" (dont {oe:.1f} avec levée d'options)" if oe >= 0.05 else ""))
     out["Signal"] = sig
     out["Résumé"] = f"{sig.split()[0]} " + (" · ".join(parts) if parts else "aucun achat ni vente en bourse")
+    out["_tx"] = [{k: t[k] for k in ("date", "name", "rel", "typ", "val", "oe", "pct_sold")} for t in y]
     out["Achats notables"] = [f"{t['name']} ({t['rel']}) {t['date']:%d/%m/%y} : {t['val']:.1f} M$"
                               + (f", +{t['pct']:.0f} % de sa détention" if t["pct"] is not None else "")
                               for t in sorted(buys, key=lambda t: -t["val"])[:5]]
@@ -2000,6 +2038,7 @@ def superinvestor_stats(d, price=None):
     short = lambda n: n.split()[-1] if len(n.split()) == 2 else n
     txt = ", ".join(f"{short(r['Gérant'])} {r.get('% portefeuille') or 0:.1f} %"
                     + (" (nouveau)" if r in new else f" (+{pct_of(r):.0f} %)") for r in key)
+    res["Clés"] = txt
     res["Signal"] = sig
     res["Résumé"] = (f"{sig} {res['Super investors']} fonds · {len(new)} nouv. {len(add)} renf. {len(red) + len(out_)} allèg."
                      + (f" · {txt}" if txt else "")) if rows else ""
@@ -2760,8 +2799,7 @@ def render_screener(p, use_cache, max_days, use_oi):
         send_to_watchlist(sel, "Screener JV", max_days, use_cache, use_oi)
 
 
-# ---------- Screener initiés : superinvestors (Dataroma) × achats des dirigeants (OpenInsider)
-# Modules fournis à part, dans le même dossier : analyse.py, openinsider.py, dataroma_scraper.py, exports.py
+# ---------- Screeners des initiés : investors (NYSE / Nasdaq : Dataroma × OpenInsider) et AMF (Euronext)
 def _ins_modules():
     try:
         import analyse as an_
@@ -2772,189 +2810,381 @@ def _ins_modules():
         return None, None, str(e)
 
 
+SIG_FILTERS = ["🚨 / ✅ alerte 7 j", "🟢", "🟠", "🔴", "⚪", "achats groupés", "ventes groupées",
+               "achats répétés (≥ 2 mois)"]
+
+
+def _sig_filter(df, picks, col="signal", dot_col="dot"):
+    """Pastilles choisies : OU entre les couleurs, ET pour les autres critères."""
+    dots = [p for p in picks if p in ("🟢", "🟠", "🔴", "⚪")]
+    m = pd.Series(True, index=df.index)
+    if dots:
+        m &= df[dot_col].isin(dots)
+    if "achats groupés" in picks:
+        m &= df[col].str.contains("achats groupés", na=False)
+    if "ventes groupées" in picks:
+        m &= df[col].str.contains("ventes groupées", na=False)
+    if "🚨 / ✅ alerte 7 j" in picks:
+        m &= df["alerte"].fillna("") != ""
+    if "achats répétés (≥ 2 mois)" in picks:
+        m &= (df["months6"].fillna(0) >= 2) | (df["buyers6"].fillna(0) >= 2)
+    return df[m]
+
+
+def _sig_fill(df):
+    """Valeurs sans aucune transaction : ⚪ et cases vides lisibles."""
+    df["dot"] = df["dot"].fillna("⚪")
+    df["signal"] = df["signal"].fillna("⚪ aucune opération")
+    df["rank"] = df["rank"].fillna(3)
+    for c in ("achats_txt", "ventes_txt", "derniere_txt"):
+        df[c] = df[c].fillna("—")
+    for c in ("net12", "buy6", "sell3", "months6", "buyers6", "n_tx"):
+        df[c] = df[c].fillna(0)
+    df["monthly"] = df["monthly"].apply(lambda v: v if isinstance(v, list) else [0.0] * 12)
+    df["frise"] = df["frise"].fillna("⬜" * 12)
+    df["alerte"] = df["alerte"].fillna("")
+    return df
+
+
+def _sig_columns(cur):
+    return {
+        "Alerte 7 j": st.column_config.TextColumn(help="transaction d'un dirigeant dans les 7 derniers jours (date de "
+                                                      "l'opération) : 🚨 vente · ✅ achat"),
+        "Achats 6 mois": st.column_config.TextColumn(help="montant · dirigeants distincts · mois avec achat"),
+        "Ventes 3 mois": st.column_config.TextColumn(help="montant · dirigeants distincts ; (mandat) = ventes faites "
+                                                          "surtout par un gérant sous mandat"),
+        "Net 12 mois": st.column_config.NumberColumn(format=f"%,.0f {cur}", help="achats − ventes sur 12 mois"),
+        "12 derniers mois": st.column_config.TextColumn(help="un carré par mois, du plus ancien au plus récent : "
+                                                            "🟩 achats nets · 🟥 ventes nettes · ⬜ aucune opération"),
+    }
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def _ins_load(grid, min_si, with_dr, scope, days, compare):
+def _inv_load(min_si):
     an_, oi_, _ = _ins_modules()
-    bar = st.progress(0.0, text="Grille Dataroma…")
-    base = an_.sp500(grid)
-    uni = an_.universe(grid, min_si, base)
-    oi_uni = base if scope == "sp500" else uni
-    dr_df = None
-    if with_dr:
-        dr_df = an_.run_dataroma(uni, progress=lambda i, n, t: bar.progress(i / n * 0.9, text=f"Dataroma {i}/{n} – {t}"))
-    raw_tx, log = an_.fetch_openinsider(oi_uni, days, progress=lambda i, n, t: bar.progress(
-        0.9 + i / n * 0.05, text=f"OpenInsider {i}/{n}"))
-    prev_tx = None
-    if compare != "aucune":
-        prev_tx, log_prev = an_.fetch_openinsider(
-            oi_uni, days, years_back=int(compare == "an"), periods_back=int(compare == "precedente"),
-            progress=lambda i, n, t: bar.progress(0.95 + i / n * 0.05, text=f"OpenInsider comparaison {i}/{n}"))
-        log = log + [dict(e, periode=an_.COMPARE[compare]) for e in log_prev]
+    bar = st.progress(0.0, text="Grilles Dataroma…")
+    uni = an_.investors_universe(min_si, progress=lambda i, n, t: bar.progress(0.04 * i, text=f"Dataroma : {t}"))
+    raw_tx, log = an_.fetch_openinsider(uni, 365, include_oe=True, progress=lambda i, n, t: bar.progress(
+        0.2 + 0.8 * i / n, text=f"OpenInsider (12 mois) {i}/{n}"))
     bar.empty()
-    return uni, oi_uni, dr_df, raw_tx, log, prev_tx
+    return uni, raw_tx, log
 
 
-def render_insider_screener(max_days, use_cache, use_oi):
-    """Onglet « Screener initiés » : valeurs du S&P 500 suivies par les superinvestors (Dataroma) et/ou achetées
-    par leurs dirigeants (OpenInsider, levées d'options exclues) ; sentiment des initiés comparé ; exports."""
+def render_investors_screener(max_days, use_cache, use_oi):
+    """Onglet « Screener investors » : valeurs du S&P 500 détenues par les superinvestors (grille Dataroma
+    « Ownership ») ; signal des dirigeants (OpenInsider, 12 mois) et signal des fonds (activité Dataroma)."""
+    import signaux as sg
     an, oi, grids = _ins_modules()
     if an is None:
-        st.error(f"Modules du screener initiés introuvables ({grids}) : placez analyse.py, openinsider.py, "
-                 "dataroma_scraper.py et exports.py dans le même dossier que finviz_dashboard.py.")
+        st.error(f"Modules du screener introuvables ({grids}) : placez analyse.py, openinsider.py, "
+                 "dataroma_scraper.py, exports.py et signaux.py dans le dossier du dashboard.")
         return
-    st.caption("Univers : valeurs du S&P 500 suivies par les superinvestors (dataroma.com), ou tout le S&P 500 pour "
-               "OpenInsider. Deux analyses séparées : résumé initiés 6 mois de Dataroma, et transactions OpenInsider "
-               "(levées d'options exclues).")
-    with st.expander("⚙️ Réglages", expanded="ins_data" not in st.session_state):
+    st.caption("Univers : valeurs du S&P 500 détenues par les superinvestors (grille Dataroma « Ownership »). "
+               "Deux signaux côte à côte : les dirigeants (OpenInsider, 12 mois, levées d'options exclues) et les "
+               "fonds (renforcements / allègements, Dataroma).")
+    with st.expander("⚙️ Réglages", expanded="inv_data" not in st.session_state):
         c = st.columns(3)
-        with c[0]:
-            st.markdown("**Univers**")
-            grid = st.selectbox("Page Dataroma", list(grids), format_func=lambda k: grids[k], key="ins_grid")
-            min_si = st.number_input("Nb minimum de superinvestors", 1, 50, 1, key="ins_min_si")
-            with_dr = st.checkbox("A. Lire le résumé initiés de chaque fiche Dataroma (≈ 1 min 30)", value=True,
-                                  key="ins_with_dr", help="Porte uniquement sur les valeurs suivies par les superinvestors.")
-        with c[1]:
-            st.markdown("**B. OpenInsider**")
-            scope = st.radio("Valeurs analysées", ["si", "sp500"], index=1, key="ins_scope",
-                             format_func=lambda k: {"si": "Suivies par les superinvestors",
-                                                    "sp500": "Tout le S&P 500 (500 valeurs, ≈ 5 s)"}[k])
-            days = st.select_slider("Période (jours de déclaration)", [30, 60, 90, 120, 180], 90, key="ins_days")
-            compare = st.radio("Sentiment comparé à (≈ +5 s)", list(an.COMPARE), format_func=lambda k: an.COMPARE[k],
-                               index=list(an.COMPARE).index("precedente") if "precedente" in an.COMPARE else 0,
-                               key="ins_compare", help="L'an dernier : même saison, même calendrier de résultats. "
-                                                       "Période précédente : tendance récente.")
-        with c[2]:
-            st.markdown("**Filtres (instantanés)**")
-            criterion = st.radio("Critère", list(oi.CRITERIA), format_func=lambda k: oi.CRITERIA[k], key="ins_crit")
-            min_value = st.select_slider(
-                "Montant minimum par achat ($)", [0, 25_000, 50_000, 90_000, 100_000, 250_000, 500_000, 1_000_000],
-                an.DEFAULT_MIN_BUY, key="ins_min_value",
-                format_func=lambda v: "aucun" if v == 0 else f"{v:,.0f} $".replace(",", " "),
-                help="Ignore les achats plus petits ; les ventes sont toutes comptées. 90 000 $ ≈ achat médian ; "
-                     "500 000 $ = forte conviction (peut casser les achats groupés).")
-            excl10 = st.checkbox("Exclure les actionnaires >10 %", value=False, key="ins_excl10",
-                                 help="Ex. Berkshire Hathaway, déclaré initié chez Lennar.")
-            min_delta = st.slider("ΔOwn minimum d'un acheteur (%)", 0, 100, 0, 5, key="ins_delta",
-                                  help="50 % = un dirigeant a augmenté sa position de moitié.")
-            cluster_only = st.checkbox("Seulement les achats groupés (≥ 2 acheteurs en 30 j)", key="ins_cluster")
-        go = st.button("Lancer l'analyse", type="primary", key="ins_go")
+        min_si = c[0].number_input("Nb minimum de superinvestors détenteurs", 1, 50, 1, key="inv_min_si",
+                                   help="1 ≈ 430 valeurs, 3 ≈ 250, 5 ≈ 150 (novembre 2026).")
+        min_sig = c[1].select_slider("Montant significatif", [25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000],
+                                     100_000, key="inv_min_sig",
+                                     format_func=lambda v: f"{v:,.0f} $".replace(",", " "),
+                                     help="Sous ce montant, achats (6 mois) ou ventes (3 mois) ne comptent pas "
+                                          "dans le signal.")
+        min_value = c[1].select_slider("Montant minimum par achat", [0, 25_000, 50_000, 90_000, 250_000],
+                                       an.DEFAULT_MIN_BUY, key="inv_min_value",
+                                       format_func=lambda v: "aucun" if v == 0 else f"{v:,.0f} $".replace(",", " "),
+                                       help="Ignore les petits achats symboliques ; les ventes sont toutes comptées.")
+        excl10 = c[2].checkbox("Exclure les actionnaires >10 %", value=False, key="inv_excl10",
+                               help="Ex. Berkshire Hathaway, déclaré initié chez Lennar.")
+        go = c[2].button("Lancer l'analyse", type="primary", key="inv_go")
     if go:
         try:
             if not use_cache:
-                _ins_load.clear()
-            st.session_state["ins_data"] = _ins_load(grid, int(min_si), with_dr, scope, int(days), compare)
-            st.session_state["ins_cmp"] = compare
-            st.session_state.pop("ins_dr_extra", None)
-            st.session_state["ins_p"] = (grid, int(min_si), with_dr, int(days), scope)
+                _inv_load.clear()
+            st.session_state["inv_data"] = _inv_load(int(min_si))
         except Exception as e:  # noqa: BLE001
             st.error(f"Erreur : {e}")
-    if "ins_data" not in st.session_state:
-        st.info("Réglez les paramètres puis cliquez sur **Lancer l'analyse**.")
+    if "inv_data" not in st.session_state:
+        st.info("Réglez les paramètres puis cliquez sur **Lancer l'analyse** (≈ 15 s).")
         return
-
-    uni, oi_uni, dr_df, raw_tx, log, prev_raw = st.session_state["ins_data"]
-    g, m, wdr, d, sc = st.session_state["ins_p"]
-    tx = an.filter_tx(raw_tx, excl10, min_value)
-    oi_df = oi.summarize(tx, oi_uni["ticker"].tolist())
-    extra = st.session_state.get("ins_dr_extra")
-    dr_all = dr_df if extra is None or dr_df is None else pd.concat([dr_df, extra], ignore_index=True)
-    final = an.combine(oi_uni, dr_all, oi_df, criterion, min_delta, cluster_only, dr_universe=set(uni["ticker"]))
-    prev_tx = an.filter_tx(prev_raw, excl10, min_value) if prev_raw is not None else None
-    s_now = oi.sentiment(tx)
-    s_prev = oi.sentiment(prev_tx) if prev_tx is not None else None
-    cmp_mode = st.session_state.get("ins_cmp", "precedente")
-    sent = an.sentiment_table(s_now, s_prev, d, cmp_mode)
-    p_prev = an.compare_range(d, cmp_mode)
-
+    uni, raw_tx, log = st.session_state["inv_data"]
+    tx_all = an.filter_tx(raw_tx, excl10, min_value)
+    tx, tx_oe = an.split_oe(tx_all)              # ventes liées à une levée d'options : hors signal
+    sig = sg.summarize(an.signal_tx(tx), today=TODAY.date(), min_sig=min_sig, cur="$")
+    final = _sig_fill(uni.merge(sig, left_on="ticker", right_on="key", how="left"))
+    ex = an.exit_rows(tx_oe)
+    warn = {k: sg.top_exit_warning(g, today=TODAY.date()) for k, g in ex.groupby("key")} if not ex.empty else {}
+    final["sortie"] = final["ticker"].map(warn).fillna("")
+    final["fonds"] = [sg.fund_signal(*r) for r in final[["add_q", "red_q", "add_6m", "red_6m"]].itertuples(index=False)]
+    final["fonds_dot"] = final["fonds"].str[:1]
+    qs = [sg.fund_quarters(*r) for r in final[["add_q", "red_q", "add_6m", "red_6m"]].itertuples(index=False)]
+    final["fonds_q"] = [f"▲ {a}  ▼ {r}" for a, r, _, _ in qs]
+    final["fonds_p"] = [f"▲ {a}  ▼ {r}" for _, _, a, r in qs]
+    final["concord"] = (final["dot"] == "🟢") & (final["fonds_dot"] == "🟢")
+    final = final.sort_values(["rank", "concord", "net12"], ascending=[True, False, False]).reset_index(drop=True)
     if raw_tx.empty:
         st.warning("OpenInsider n'a renvoyé aucune transaction : voir l'onglet **Diagnostic**.")
-    c = st.columns(5)
-    c[0].metric("Univers OpenInsider" if sc == "sp500" else "Univers", len(oi_uni))
-    c[1].metric("Retenues Dataroma", int(final["dr_ok"].sum()))
-    c[2].metric("Retenues OpenInsider", int(final["oi_ok"].sum()))
-    c[3].metric("Les deux", int((final["dr_ok"] & final["oi_ok"]).sum()))
-    c[4].metric("Achats groupés", int((final["cluster"] >= 2).sum()))
 
-    money = {an.LABELS[k]: st.column_config.NumberColumn(format="$%d")
-             for k in ("ins_buy_usd", "ins_sell_usd", "dr_balance_usd", "buy_usd", "sell_usd", "balance_usd")}
-    cfg = money | {an.LABELS["url"]: st.column_config.LinkColumn(display_text="fiche"),
-                   an.LABELS["oi_url"]: st.column_config.LinkColumn(display_text="fiche"),
-                   an.LABELS["oi_signal"]: st.column_config.TextColumn(width="large"),
-                   an.LABELS["max_delta_own"]: st.column_config.NumberColumn(format="%.0f %%")}
+    c = st.columns(6)
+    c[5].metric("Alertes 7 j", f"🚨 {final['alerte'].str.contains('🚨').sum()} · ✅ {final['alerte'].str.contains('✅').sum()}")
+    c[0].metric("Univers", len(final))
+    c[1].metric("🟢 dirigeants", int((final["dot"] == "🟢").sum()))
+    c[2].metric("🔴 dirigeants", int((final["dot"] == "🔴").sum()))
+    c[3].metric("Achats groupés", int(final["signal"].str.contains("achats groupés").sum()))
+    c[4].metric("🟢 dirigeants + 🟢 fonds", int(final["concord"].sum()))
 
-    with st.container(border=True):
-        st.markdown(f"**Sentiment des initiés** · {'tout le S&P 500' if sc == 'sp500' else 'univers superinvestors'}"
-                    f" · {d} derniers jours" + (f" · comparé au {p_prev[0]:%d/%m/%Y} → {p_prev[1]:%d/%m/%Y}"
-                                                f" ({an.COMPARE[cmp_mode].lower()})" if s_prev and p_prev else ""))
+    # sentiment de l'univers : 90 derniers jours comparés aux 90 précédents (dates de déclaration)
+    if not tx.empty:
+        fd = pd.to_datetime(tx["filing_date"], errors="coerce")
+        now_ = oi.sentiment(tx[fd > TODAY - pd.Timedelta(days=90)])
+        prev_ = oi.sentiment(tx[(fd <= TODAY - pd.Timedelta(days=90)) & (fd > TODAY - pd.Timedelta(days=180))])
+        with st.container(border=True):
+            st.markdown("**Sentiment des dirigeants de l'univers** · 90 derniers jours, comparés aux 90 précédents")
+            k = st.columns(4)
+            for col, lbl, key_, fmt in ((k[0], "Acheteurs / vendeurs", "ratio_ins", "{:.3f}"),
+                                        (k[1], "Nb achats / nb ventes", "ratio_tx", "{:.3f}"),
+                                        (k[2], "Montants achats / ventes", "ratio_usd", "{:.3f}"),
+                                        (k[3], "Valeurs acheteurs > vendeurs", "valeurs_pos", "{:.0f}")):
+                a, b = now_.get(key_), prev_.get(key_)
+                col.metric(lbl, "–" if a is None else fmt.format(a),
+                           f"{(a / b - 1):+.0%} vs 90 j préc." if a is not None and b else None)
+            st.caption("Les ventes dépassent toujours largement les achats dans les grandes capitalisations : "
+                       "c'est l'évolution qui compte, pas le niveau.")
 
-        def _metric(col, label, key, fmt="{:.3f}"):
-            a = s_now.get(key)
-            b = s_prev.get(key) if s_prev else None
-            delta = f"{(a / b - 1):+.0%} {an.COMPARE_SHORT.get(cmp_mode, '')}" if a is not None and b else None
-            col.metric(label, "–" if a is None else fmt.format(a), delta,
-                       help=None if b is None else f"Période de comparaison : {fmt.format(b)}")
-        k = st.columns(4)
-        _metric(k[0], "Acheteurs / vendeurs", "ratio_ins")
-        _metric(k[1], "Nb achats / nb ventes", "ratio_tx")
-        _metric(k[2], "Montants achats / ventes", "ratio_usd")
-        _metric(k[3], "Valeurs acheteurs > vendeurs", "valeurs_pos", "{:.0f}")
-        st.caption("Les ventes dépassent toujours largement les achats dans les grandes capitalisations : "
-                   "c'est l'évolution qui compte, pas le niveau.")
-        with st.expander("Détail"):
-            st.dataframe(sent, hide_index=True, width="stretch",
-                         column_config={"Variation": st.column_config.NumberColumn(format="percent")})
-
-    views = {"union": ("Au moins une source", final["dr_ok"] | final["oi_ok"]),
-             "both": ("Les deux sources", final["dr_ok"] & final["oi_ok"]),
-             "oi": ("OpenInsider", final["oi_ok"]), "dr": ("Dataroma", final["dr_ok"])}
-    which = st.segmented_control("Afficher", list(views), default="union", key="ins_view",
-                                 format_func=lambda k: f"{views[k][0]} ({int(views[k][1].sum())})")
-    view = final[views[which or "union"][1]]
-    pick = st.multiselect("Secteur", sorted(final["sector"].dropna().unique()), key="ins_sector")
-    if pick:
-        view = view[view["sector"].isin(pick)]
-
-    t1, t4, t5 = st.tabs(["Tableau final", "Transactions", "Diagnostic"])
+    f1, f2 = st.columns([3, 1])
+    picks = f1.pills("Filtrer (dirigeants)", SIG_FILTERS + ["⚠️ sortie PDG / DAF", "🟢 dirigeants + 🟢 fonds"],
+                     selection_mode="multi", key="inv_pills") or []
+    sect = f2.multiselect("Secteur", sorted(final["sector"].dropna().unique()), key="inv_sector")
+    view = _sig_filter(final, [p for p in picks if p not in ("🟢 dirigeants + 🟢 fonds", "⚠️ sortie PDG / DAF")])
+    if "⚠️ sortie PDG / DAF" in picks:
+        view = view[view["sortie"] != ""]
+    if "🟢 dirigeants + 🟢 fonds" in picks:
+        view = view[view["concord"]]
+    if sect:
+        view = view[view["sector"].isin(sect)]
+    show = pd.DataFrame({
+        "Alerte 7 j": view["alerte"], "Ticker": view["ticker"], "Société": view["name"], "Secteur": view["sector"],
+        "Sortie PDG / DAF": view["sortie"],
+        "Dirigeants · signal": view["signal"], "Dirigeants · achats 6 mois": view["achats_txt"],
+        "Dirigeants · ventes 3 mois": view["ventes_txt"], "Dirigeants · net 12 mois": view["net12"],
+        "Dirigeants · 12 derniers mois": view["frise"], "Dirigeants · dernière opération": view["derniere_txt"],
+        "Fonds · signal": view["fonds"], "Fonds · dernier trimestre": view["fonds_q"],
+        "Fonds · trimestre précédent": view["fonds_p"],
+        "Fonds · détenteurs": view["owners"],
+        "Dataroma": dr_link(view["ticker"]), "OpenInsider": "http://openinsider.com/" + view["ticker"]})
+    t1, t2, t3 = st.tabs(["Tableau", "Transactions", "Diagnostic"])
     with t1:
-        if dr_df is not None and "ins_buy_n" in view:
-            missing = view.loc[view["ins_buy_n"].isna() & ~view["ticker"].isin(uni["ticker"]), "ticker"]
-            if len(missing):
-                c1, c2 = st.columns([3, 1])
-                c1.caption(f"Colonnes « DR » vides pour {len(missing)} valeur(s) hors univers superinvestors : "
-                           "leur fiche Dataroma n'est pas lue par défaut.")
-                if c2.button(f"Lire leur fiche Dataroma (≈ {max(1, round(len(missing) * 0.7))} s)", key="ins_dr_more"):
-                    with st.spinner("Lecture des fiches Dataroma…"):
-                        new = an.run_dataroma(pd.DataFrame({"ticker": missing.tolist()}))
-                    st.session_state["ins_dr_extra"] = new if extra is None else pd.concat([extra, new], ignore_index=True)
-                    st.rerun()
-        st.dataframe(an.display(view), width="stretch", hide_index=True, column_config=cfg)
-        st.caption("🟢🟢 achats groupés et plus d'acheteurs que de vendeurs · 🟢 plus d'acheteurs · 🟠 autant ou plus "
-                   "de vendeurs · ⚪ aucune transaction. Cas atypique : actionnaire >10 %, entité ou montant ≥ 50 M$.")
-    with t4:
-        tk = st.selectbox("Valeur", ["(toutes)"] + (sorted(tx["ticker"].unique()) if not tx.empty else []),
-                          key="ins_tx_tk")
-        st.dataframe(an.display_tx(tx if tk == "(toutes)" else tx[tx["ticker"] == tk]), width="stretch", hide_index=True)
-    with t5:
-        st.write(f"{len(raw_tx)} transactions OpenInsider lues, {len(tx)} après filtres.")
+        cfg = {(k if k == "Alerte 7 j" else f"Dirigeants · {k[0].lower()}{k[1:]}"): v
+               for k, v in _sig_columns("$").items()}
+        st.dataframe(show, width="stretch", hide_index=True, height=min(600, 38 + 35 * max(len(show), 1)),
+                     column_config=cfg | {
+            "Sortie PDG / DAF": st.column_config.TextColumn(help=(
+                "⚠️ un PDG, DAF, président ou fondateur a vendu au moins la moitié de sa détention dans les 6 derniers "
+                "mois, en lien avec une levée d'options — hors signal 🟢/🟠/🔴/⚪")),
+            "Dirigeants · signal": st.column_config.TextColumn(width="medium", help="dirigeants et administrateurs "
+                                                               "(OpenInsider, 12 mois)"),
+            "Dirigeants · dernière opération": st.column_config.TextColumn(width="medium",
+                                                                           help="dernière transaction d'un dirigeant"),
+            "Fonds · signal": st.column_config.TextColumn(width="medium", help=(
+                "superinvestors (Dataroma), dernier trimestre : 🟢 plus de fonds qui renforcent que de fonds qui "
+                "allègent · 🔴 l'inverse · 🟠 autant · ⚪ aucun mouvement ; ↗ / ↘ : solde meilleur / moins bon "
+                "qu'au trimestre précédent (écart ≥ 2 fonds)")),
+            "Fonds · dernier trimestre": st.column_config.TextColumn(help="▲ nb de superinvestors qui ont acheté ou "
+                                                                          "renforcé · ▼ nb qui ont vendu ou allégé"),
+            "Fonds · trimestre précédent": st.column_config.TextColumn(help="même lecture, trimestre d'avant (grille "
+                                                                            "« 6 mois » moins le dernier trimestre)"),
+            "Fonds · détenteurs": st.column_config.NumberColumn(help="nb de superinvestors qui détiennent la valeur"),
+            "Dataroma": st.column_config.LinkColumn(display_text="fiche"),
+            "OpenInsider": st.column_config.LinkColumn(display_text="fiche")})
+        st.caption("Colonnes « Dirigeants » : transactions des dirigeants et administrateurs (OpenInsider). " + sg.LEGEND
+                   + " Colonnes « Fonds » : superinvestors (Dataroma, déclarations trimestrielles 13F) — ▲ nb de fonds "
+                   "qui ont acheté ou renforcé, ▼ nb qui ont vendu ou allégé ; rond d'après le dernier trimestre, "
+                   "↗ / ↘ = solde meilleur / moins bon qu'au trimestre précédent, achats groupés = au moins 3 fonds "
+                   "acheteurs dans le trimestre. La frise et la dernière opération ne concernent que "
+                   "les dirigeants.")
+    with t2:
+        tk = st.selectbox("Valeur", ["(toutes)"] + (sorted(tx_all["ticker"].unique()) if not tx_all.empty else []),
+                          key="inv_tx_tk")
+        st.dataframe(an.display_tx(tx_all if tk == "(toutes)" else tx_all[tx_all["ticker"] == tk]), width="stretch",
+                     hide_index=True)
+        st.caption("Type « S - Sale+OE » : vente liée à une levée d'options — affichée ici, hors signal.")
+    with t3:
+        st.write(f"{len(raw_tx)} transactions OpenInsider lues sur 12 mois, {len(tx)} retenues pour le signal "
+                 f"(+ {len(tx_oe)} ventes liées à une levée d'options, hors signal).")
         st.dataframe(pd.DataFrame(log), width="stretch", hide_index=True)
 
-    # envoi vers l'analyse complète (même mécanisme que le Screener JV)
     sel = st.multiselect("Envoyer en analyse complète (onglet « Valeurs à étudier »)", list(view["ticker"]),
-                         default=list(view["ticker"])[:5], key="ins_sel")
-    if st.button("➜ Analyse complète", key="ins_full", disabled=not sel):
-        send_to_watchlist(sel, "Screener initiés", max_days, use_cache, use_oi)
+                         default=list(view["ticker"])[:5], key="inv_sel")
+    if st.button("➜ Analyse complète", key="inv_full", disabled=not sel):
+        send_to_watchlist(sel, "Screener investors", max_days, use_cache, use_oi)
+    _sig_exports(show, "investors", "Screener investors (S&P 500 × superinvestors)", {"Dirigeants · net 12 mois"},
+                 {"Dataroma", "OpenInsider"}, "inv",
+                 f"Univers : S&P 500 détenu par ≥ {int(min_si)} superinvestor(s) (Dataroma) ; dirigeants : OpenInsider "
+                 f"12 mois, seuil significatif {min_sig:,.0f} $.".replace(",", " "))
 
-    note = an.make_note(g, m, d, criterion, excl10, wdr, sc, min_value)
+
+def dr_link(tickers):
+    return "https://www.dataroma.com/m/stock.php?sym=" + tickers
+
+
+def _sig_exports(show, stem, title, money_cols, link_cols, key, note):
+    from exports import to_excel_bytes
+    out = show
     stamp = f"{TODAY:%Y%m%d}"
-    b = st.columns(3)
-    b[0].download_button("⬇️ Page HTML", an.export_html(view, "Superinvestors × initiés", note).encode("utf-8"),
-                         f"selection_{stamp}.html", "text/html", width="stretch", key="ins_dl_html")
-    b[1].download_button("⬇️ Excel (3 onglets)", an.export_excel(final, tx, note, sent), f"selection_{stamp}.xlsx",
+    b = st.columns(2)
+    b[0].download_button("⬇️ Excel", to_excel_bytes({title[:31]: out}, money_cols, link_cols, note),
+                         f"{stem}_{stamp}.xlsx",
                          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch",
-                         key="ins_dl_xlsx")
-    b[2].download_button("⬇️ CSV", an.display(view).to_csv(index=False).encode("utf-8-sig"), f"selection_{stamp}.csv",
-                         "text/csv", width="stretch", key="ins_dl_csv")
+                         key=f"{key}_dl_xlsx")
+    b[1].download_button("⬇️ CSV", out.to_csv(index=False, sep=";").encode("utf-8-sig"), f"{stem}_{stamp}.csv",
+                         "text/csv", width="stretch", key=f"{key}_dl_csv")
     st.caption(note + " Informations à titre indicatif, pas un conseil en investissement.")
+
+
+def _sbf120():
+    fn = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sbf120.csv")
+    return pd.read_csv(fn, sep=";", dtype=str) if os.path.exists(fn) else None
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _amf_load(universe):
+    import amf
+    from datetime import timedelta
+    bar = st.progress(0.0, text="Liste des déclarations AMF…")
+    rows = amf.list_declarations(TODAY.date() - timedelta(days=366), progress=lambda m: bar.progress(0.05, text=m))
+    names, missing = {}, []
+    if universe == "sbf120":
+        lst = _sbf120()
+        jm = amf.jetons_for_isins(list(lst["isin"]), os.path.join(CACHE_DIR, "amf_jetons.json"),
+                                  progress=lambda m: bar.progress(0.1, text=m))
+        nm = dict(zip(lst["isin"], lst["nom"]))
+        names = {j: nm[i] for i, (j, _) in jm.items()}
+        missing = [nm[i] for i in lst["isin"] if i not in jm]
+        rows = [r for r in rows if r["jeton"] in names]
+    tx, diag = amf.load_transactions(rows, os.path.join(CACHE_DIR, "amf"), progress=lambda k, n: bar.progress(
+        0.1 + 0.9 * k / max(n, 1), text=f"Déclarations AMF {k}/{n} (lues une seule fois, puis gardées sur disque)"))
+    bar.empty()
+    return len(rows), tx, diag, names, missing
+
+
+def render_amf_screener():
+    """Onglet « Screener AMF » : déclarations des dirigeants des sociétés cotées à Paris (base BDIF de l'AMF)."""
+    import signaux as sg
+    try:
+        import amf  # noqa: F401
+        import pypdf  # noqa: F401
+    except ImportError as e:
+        st.error(f"Module manquant ({e}) : placez amf.py et signaux.py dans le dossier du dashboard et installez "
+                 "pypdf (pip install -r requirements.txt).")
+        return
+    st.caption("Déclarations des dirigeants et personnes liées (article 19 du règlement MAR) publiées par l'AMF : "
+               "achats et ventes d'actions sur 12 mois. Actions gratuites ou de performance, options, conversions, "
+               "nantissements, donations, parts de FCPE et droits de souscription sont exclus.")
+    with st.expander("⚙️ Réglages", expanded="amf_data" not in st.session_state):
+        c = st.columns(3)
+        universe = c[0].radio("Sociétés", ["sbf120", "all"], key="amf_univ",
+                              format_func=lambda k: {"sbf120": "SBF 120",
+                                                     "all": "Toutes (Euronext Paris, Growth, Access)"}[k],
+                              help="SBF 120 : liste du fichier sbf120.csv (Euronext, novembre 2026), modifiable. "
+                                   "Toutes : environ 5 500 déclarations sur 12 mois — premier chargement de quelques "
+                                   "minutes, puis seules les nouvelles déclarations sont lues.")
+        min_sig = c[1].select_slider("Montant significatif", [10_000, 25_000, 50_000, 100_000, 250_000, 500_000],
+                                     50_000, key="amf_min_sig",
+                                     format_func=lambda v: f"{v:,.0f} €".replace(",", " "),
+                                     help="Sous ce montant, achats (6 mois) ou ventes (3 mois) ne comptent pas dans "
+                                          "le signal.")
+        go = c[2].button("Lancer l'analyse", type="primary", key="amf_go")
+    if universe == "sbf120" and _sbf120() is None:
+        st.error("Fichier sbf120.csv introuvable dans le dossier du dashboard.")
+        return
+    if go:
+        try:
+            st.session_state["amf_data"] = (_amf_load(universe), universe)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"AMF indisponible : {type(e).__name__} : {e}")
+    if "amf_data" not in st.session_state:
+        st.info("Réglez les paramètres puis cliquez sur **Lancer l'analyse**.")
+        return
+    (n_decl, tx, diag, names, missing), univ = st.session_state["amf_data"]
+    stx = (pd.DataFrame({"key": tx["jeton"], "date": tx["date"], "person": tx["person"], "side": tx["side"],
+                        "value": tx["value"], "mandate": tx["mandate"],
+                        "name": tx["declarant"] + tx["fonction"].map(lambda x: f" ({x})" if x else "")})
+           if not tx.empty else None)
+    sig = sg.summarize(stx, today=TODAY.date(), min_sig=min_sig, cur="€")
+    soc = (tx.sort_values("date_pub").groupby("jeton")["societe"].last().to_dict() if not tx.empty else {})
+    last_pdf = (tx.sort_values(["date", "date_pub"]).groupby("jeton")["pdf"].last().to_dict() if not tx.empty else {})
+    if univ == "sbf120":                       # toutes les valeurs de l'indice, même sans opération
+        base = pd.DataFrame({"key": list(names)})
+        sig = _sig_fill(base.merge(sig, on="key", how="left"))
+    sig["societe"] = sig["key"].map(lambda j: names.get(j) or soc.get(j) or j)
+    sig = sig.sort_values(["rank", "net12"], ascending=[True, False]).reset_index(drop=True)
+
+    c = st.columns(6)
+    c[5].metric("Alertes 7 j", f"🚨 {sig['alerte'].str.contains('🚨').sum()} · ✅ {sig['alerte'].str.contains('✅').sum()}")
+    c[0].metric("Sociétés", len(sig))
+    c[1].metric("🟢 favorables", int((sig["dot"] == "🟢").sum()))
+    c[2].metric("🟠 mitigées", int((sig["dot"] == "🟠").sum()))
+    c[3].metric("🔴 défavorables", int((sig["dot"] == "🔴").sum()))
+    c[4].metric("Achats groupés", int(sig["signal"].str.contains("achats groupés").sum()))
+    picks = st.pills("Filtrer", SIG_FILTERS, selection_mode="multi", key="amf_pills") or []
+    view = _sig_filter(sig, picks)
+    show = pd.DataFrame({
+        "Alerte 7 j": view["alerte"], "Signal": view["signal"], "Société": view["societe"],
+        "Achats 6 mois": view["achats_txt"],
+        "Ventes 3 mois": view["ventes_txt"], "Net 12 mois": view["net12"], "12 derniers mois": view["frise"],
+        "Dernière opération": view["derniere_txt"], "Opérations (12 mois)": view["n_tx"].astype(int),
+        "Dernière déclaration": view["key"].map(last_pdf)})
+    t1, t2, t3 = st.tabs(["Tableau", "Transactions", "Diagnostic"])
+    with t1:
+        st.dataframe(show, width="stretch", hide_index=True, height=min(600, 38 + 35 * max(len(show), 1)),
+                     column_config=_sig_columns("€") | {
+            "Signal": st.column_config.TextColumn(width="medium"),
+            "Dernière déclaration": st.column_config.LinkColumn(display_text="PDF AMF")})
+        st.caption(sg.LEGEND + " Ventes « (mandat) » : faites par un gérant sous mandat de gestion, moins "
+                   "parlantes qu'une vente décidée par le dirigeant lui-même.")
+        if missing:
+            st.caption("Sans déclaration trouvée sur la base AMF (sociétés étrangères qui déclarent à leur propre "
+                       "régulateur, ou aucune déclaration récente) : " + ", ".join(missing))
+    with t2:
+        if tx.empty:
+            st.caption("Aucune transaction retenue.")
+        else:
+            opts = sig.loc[sig["n_tx"] > 0, ["key", "societe"]]
+            pick = st.selectbox("Société", ["(toutes)"] + list(opts["societe"]), key="amf_tx_soc")
+            d = tx if pick == "(toutes)" else tx[tx["jeton"] == opts.set_index("societe")["key"].get(pick)]
+            d = d.sort_values("date", ascending=False)
+            st.dataframe(pd.DataFrame({
+                "Date": d["date"].dt.strftime("%d/%m/%Y"), "Société": d["jeton"].map(lambda j: names.get(j) or soc.get(j)),
+                "Déclarant": d["declarant"], "Fonction": d["fonction"],
+                "Sens": d["side"].map({"A": "🟢 achat", "V": "🔴 vente"}), "Nature": d["nature"],
+                "Prix": d["prix"], "Volume": d["volume"], "Montant": d["value"], "Devise": d["devise"],
+                "Lieu": d["lieu"], "Mandat": d["mandate"].map({True: "oui", False: ""}),
+                "Correction": d["correction"].map({True: "oui", False: ""}), "PDF": d["pdf"]}),
+                width="stretch", hide_index=True, column_config={
+                    "Prix": st.column_config.NumberColumn(format="%.4f"),
+                    "Volume": st.column_config.NumberColumn(format="%,.0f"),
+                    "Montant": st.column_config.NumberColumn(format="%,.0f"),
+                    "PDF": st.column_config.LinkColumn(display_text="PDF AMF")})
+    with t3:
+        ok = int((diag["motif"].fillna("") == "").sum()) if not diag.empty else 0
+        st.write(f"{n_decl} déclarations sur 12 mois · {len(diag)} opérations lues · {ok} achats/ventes d'actions "
+                 f"retenus ({len(tx)} après remplacement des déclarations corrigées).")
+        if not diag.empty:
+            st.dataframe(diag[diag["motif"].fillna("") != ""]["motif"].str.replace(r" : .*", "", regex=True)
+                         .value_counts().rename_axis("Motif d'exclusion").reset_index(name="Opérations"),
+                         hide_index=True)
+            err = diag[diag["motif"].fillna("").str.startswith(("lecture", "aucune"))]
+            if len(err):
+                st.markdown(f"**{len(err)} déclaration(s) illisible(s)**")
+                st.dataframe(err[["numero", "societe", "date_pub", "motif", "pdf"]], hide_index=True,
+                             column_config={"pdf": st.column_config.LinkColumn(display_text="PDF")})
+        st.caption(f"Source : base BDIF de l'AMF ({amf.FRONT}). Les PDF déjà lus sont gardés dans "
+                   f"{os.path.join(CACHE_DIR, 'amf')} ; la liste est relue à chaque analyse (cache 6 h).")
+    _sig_exports(show, "amf", "Screener AMF", {"Net 12 mois"}, {"Dernière déclaration"}, "amf",
+                 f"Source : AMF (BDIF), déclarations des dirigeants sur 12 mois ; "
+                 f"{'SBF 120' if univ == 'sbf120' else 'toutes sociétés'} ; seuil significatif "
+                 f"{min_sig:,.0f} €.".replace(",", " "))
 
 
 def reverse_txt(fv):
@@ -2980,9 +3210,146 @@ def bna_evol(e0, e1):
     return f"{e1:.2f} ({arrow} {g:+.0f} %)"
 
 
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fund_grid():
+    """Activité des superinvestors sur tout le S&P 500 (grilles Dataroma), comme le screener investors."""
+    an_, _, _ = _ins_modules()
+    return an_.investors_universe(0).set_index("ticker")
+
+
+def _sig_settings():
+    """Seuils du screener investors (mêmes réglages pour l'analyse des valeurs)."""
+    try:
+        return (st.session_state.get("inv_min_sig", 100_000), st.session_state.get("inv_min_value", 50_000),
+                st.session_state.get("inv_excl10", False))
+    except Exception:  # noqa: BLE001
+        return 100_000, 50_000, False
+
+
+def concord_insiders(ins, tk):
+    """Signal des dirigeants calculé comme dans le screener investors (signaux.summarize, mêmes seuils) :
+    ventes avec levée d'options exclues, achats sous le montant minimum ignorés."""
+    if not ins or ins.get("_tx") is None:
+        return ins
+    import signaux as sg
+    min_sig, min_buy, excl10 = _sig_settings()
+    rows = [t for t in ins["_tx"] if not (t["typ"] == "Sale" and t["oe"])
+            and not (t["typ"] == "Buy" and t["val"] * 1e6 < min_buy)
+            and not (excl10 and "10%" in (t["rel"] or ""))]
+    out = dict(ins)
+    oe_rows = [t for t in ins["_tx"] if t["typ"] == "Sale" and t["oe"]]
+    warn = sg.top_exit_warning(pd.DataFrame({
+        "date": [t["date"] for t in oe_rows], "name": [t["name"] for t in oe_rows],
+        "role": [(t["rel"] or "").split(" · ")[0] for t in oe_rows], "side": "V", "oe": True,
+        "pct_sold": [t.get("pct_sold") for t in oe_rows]}), today=TODAY.date()) if oe_rows else ""
+    out["Sortie dirigeant"] = warn
+    if not rows:
+        out["Signal"] = "⚪"
+        out["Résumé"] = (f"{warn} · " if warn else "") + "⚪ aucun achat ni vente significatif en bourse sur 12 mois"
+        return out
+    df = pd.DataFrame({"key": tk, "date": [t["date"] for t in rows], "person": [t["name"].lower() for t in rows],
+                       "side": ["A" if t["typ"] == "Buy" else "V" for t in rows],
+                       "value": [t["val"] * 1e6 for t in rows], "mandate": False,
+                       "name": [f"{t['name']} ({t['rel'].split(' · ')[0]})" if t["rel"] else t["name"] for t in rows]})
+    sm = sg.summarize(df, today=TODAY.date(), min_sig=min_sig, cur="$")
+    if sm.empty:                                  # transactions toutes antérieures aux 12 mois calendaires
+        out["Signal"] = "⚪"
+        out["Résumé"] = (f"{warn} · " if warn else "") + "⚪ aucun achat ni vente significatif en bourse sur 12 mois"
+        return out
+    r = sm.iloc[0]
+    net = f"{'+' if r['net12'] >= 0 else '−'}{sg.money(r['net12'], '$')}"
+    out.update({"Signal": r["signal"], "Frise": r["frise"], "Dernière opération": r["derniere_txt"],
+                "Alerte": r["alerte"],
+                "Résumé": (f"{r['alerte']} · " if r["alerte"] else "") + (f"{warn} · " if warn else "")
+                          + f"{r['signal']} · achats 6 m {r['achats_txt']} · ventes 3 m {r['ventes_txt']} · "
+                          f"net 12 m {net}"})
+    return out
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def amf_company_tx(isin):
+    """Transactions AMF des dirigeants d'une société (12 mois), lues comme dans le screener AMF."""
+    import amf
+    from datetime import timedelta
+    jeton, name, rows = amf.company_declarations(isin, TODAY.date() - timedelta(days=366),
+                                                 os.path.join(CACHE_DIR, "amf_jetons.json"))
+    tx, _ = amf.load_transactions(rows, os.path.join(CACHE_DIR, "amf")) if rows else (pd.DataFrame(), None)
+    return jeton, name, tx
+
+
+def amf_insiders(isin):
+    """Signal AMF des dirigeants (valeur française lue sur Zonebourse), même calcul et même seuil que le screener
+    AMF ; reprend directement les transactions du screener si la société y figure déjà."""
+    import signaux as sg
+    try:
+        min_sig = st.session_state.get("amf_min_sig", 50_000)
+    except Exception:  # noqa: BLE001
+        min_sig = 50_000
+    res = _guarded(f"amf_{isin}", lambda: amf_company_tx(isin))
+    if res is None:
+        return None
+    jeton, name, tx = res
+    if not jeton:
+        return {"Signal": "⚪", "Résumé": "⚪ société introuvable dans la base AMF (les sociétés étrangères déclarent "
+                                         "souvent à leur propre régulateur)", "Source": "déclarations AMF",
+                "Achats notables": []}
+    out = {"Source": "déclarations AMF", "Achats notables": [], "Achats 365j": 0.0, "Ventes 365j": 0.0, "Acheteurs": 0,
+           "Achats groupés (max en 30 j)": 0, "Achats PDG / DAF (M$)": None, "Hausse médiane de détention (%)": None,
+           "Ventes avec levée d'options (M$)": None, "Devise": "€"}
+    if tx is None or tx.empty:
+        out.update({"Signal": "⚪", "Résumé": "⚪ aucun achat ni vente d'actions déclaré à l'AMF sur 12 mois"})
+        return out
+    df = pd.DataFrame({"key": jeton, "date": tx["date"], "person": tx["person"], "side": tx["side"],
+                       "value": tx["value"], "mandate": tx["mandate"],
+                       "name": tx["declarant"] + tx["fonction"].map(lambda x: f" ({x})" if x else "")})
+    sm = sg.summarize(df, today=TODAY.date(), min_sig=min_sig, cur="€")
+    if sm.empty:
+        out.update({"Signal": "⚪", "Résumé": "⚪ aucun achat ni vente d'actions déclaré à l'AMF sur 12 mois"})
+        return out
+    r = sm.iloc[0]
+    b, v = tx[tx["side"] == "A"], tx[tx["side"] == "V"]
+    net = f"{'+' if r['net12'] >= 0 else '−'}{sg.money(r['net12'], '€')}"
+    out.update({
+        "Signal": r["signal"], "Frise": r["frise"], "Dernière opération": r["derniere_txt"],
+        "Alerte": r["alerte"],
+        "Résumé": (f"{r['alerte']} · " if r["alerte"] else "")
+                  + f"{r['signal']} · achats 6 m {r['achats_txt']} · ventes 3 m {r['ventes_txt']} · net 12 m {net}",
+        "Achats 365j": round(b["value"].sum() / 1e6, 2), "Ventes 365j": round(v["value"].sum() / 1e6, 2),
+        "Acheteurs": int(b["person"].nunique()), "Achats groupés (max en 30 j)": int(r["group_buy"]),
+        "Achats notables": [f"{x.declarant} ({x.fonction}) {x.date:%d/%m/%y} : {sg.money(x.value, '€')}"
+                            for x in b.sort_values("value", ascending=False).head(5).itertuples()],
+        "Ventes sous mandat": bool(v["mandate"].any())})
+    return out
+
+
+def concord_funds(si, tk):
+    """Signal des fonds calculé comme dans le screener investors (grilles Dataroma : dernier trimestre et tendance
+    par rapport au trimestre précédent) ; hors S&P 500, résumé de la fiche Dataroma inchangé."""
+    import signaux as sg
+    try:
+        g = _guarded("fund_grid", fund_grid)
+    except Exception:  # noqa: BLE001
+        g = None
+    k = (tk or "").replace("-", ".").upper()
+    if g is None or k not in g.index:
+        return si
+    r = g.loc[k]
+    aq, rq, ap, rp = sg.fund_quarters(r["add_q"], r["red_q"], r["add_6m"], r["red_6m"])
+    sig = sg.fund_signal(r["add_q"], r["red_q"], r["add_6m"], r["red_6m"])
+    out = dict(si)
+    out.update({"Signal": sig, "Grille": True, "Détenteurs": int(r["owners"]),
+                "Résumé": f"{sig} · {int(r['owners'])} fonds · trim. ▲ {aq} ▼ {rq} · préc. ▲ {ap} ▼ {rp}"
+                          + (f" · {si['Clés']}" if si.get("Clés") else "")})
+    return out
+
+
 def analyze(f, p, ov=None):
     fv, an = fair_value(f, p), analyst_stats(f)
     si, pc, ins = superinvestor_stats(f["dataroma"], f["price"]), put_call_stats(f["options"]), f["insiders"]
+    ins = concord_insiders(ins, f.get("ticker") or "")
+    if not ins and f.get("isin") and not str(f["isin"]).startswith("US"):    # valeur européenne (Zonebourse)
+        ins = amf_insiders(f["isin"])
+    si = concord_funds(si, f.get("ticker") or "")
     sc = scenarios(f, ov)
     jv = (f"{fv['JV centrale']:.0f} ({fv['JV basse']:.0f}–{fv['JV haute']:.0f})"
           if fv.get("JV centrale") else "n.d.")
@@ -3000,7 +3367,8 @@ def analyze(f, p, ov=None):
            "Analystes · objectif": ana,
            "Croissance implicite / attendue": reverse_txt(fv),
            "Initiés (12 m)": ins_txt,
-           "Super investors": si["Résumé"] if f["dataroma"].get("n") is not None and si["Résumé"] else "n.d.",
+           "Super investors": si["Résumé"] if (si.get("Grille") or f["dataroma"].get("n") is not None) and si["Résumé"]
+           else "n.d.",
            "Put/Call (total / ±10 %)": pcs,
            "BNA N": round(f["eps_this_y"], 2) if f["eps_this_y"] is not None else None,
            "BNA N+1 (évol.)": bna_evol(f["eps_this_y"], f["eps_next_y"]),
@@ -3037,8 +3405,8 @@ FMT = {
              "celle du scénario central (consensus Zonebourse compris). Fiche seule : croissance du flux libre / du BNA "
              "plafonnée. 🟢 attendue ≥ implicite + 5 pts : le marché est pessimiste ; 🔴 le cours suppose plus que "
              "prévu ; ⚪ cohérent."),
-    "Initiés (12 m)": st.column_config.TextColumn(width="large", help="🟢🟢 achats groupés (≥ 2 dirigeants en 30 j) ou du PDG/DAF ; 🟢 achats ; 🟠 ventes importantes (hors levées d'options) ; ⚪ peu de mouvements. Les ventes sont souvent programmées : un achat est plus parlant."),
-    "Super investors": st.column_config.TextColumn(width="large", help="Dataroma (13F, trimestre précédent) : 🟢🟢 plus d'entrées/renforcements que d'allègements avec un gérant convaincu (≥ 5 % de son portefeuille) ou ≥ 2 nouveaux ; 🟢 majorité d'achats ; 🟠 majorité d'allègements. % = poids de la ligne dans le portefeuille du gérant."),
+    "Initiés (12 m)": st.column_config.TextColumn(width="large", help="Même calcul et mêmes seuils que le screener investors : 🟢 achats des dirigeants sur 6 mois sans vente significative sur 3 mois · 🟠 achats et ventes récentes · 🔴 ventes récentes (3 mois) supérieures aux achats · ⚪ non significatif ; « achats groupés » = ≥ 3 dirigeants en 30 j. Ventes avec levée d'options exclues."),
+    "Super investors": st.column_config.TextColumn(width="large", help="Même calcul que le screener investors (grilles Dataroma, S&P 500) : rond d'après le dernier trimestre (🟢 plus de fonds qui renforcent, 🔴 plus qui allègent, 🟠 autant), ↗ / ↘ tendance par rapport au trimestre précédent ; trim. / préc. = ▲ renforcements ▼ allègements. Hors S&P 500 : résumé de la fiche Dataroma (dernier mouvement de chaque détenteur). % = poids de la ligne dans le portefeuille du gérant."),
     "Put/Call (total / ±10 %)": st.column_config.TextColumn(help="encours puts / calls ; >1 prudence, <0,7 optimisme"),
     "BNA N": st.column_config.NumberColumn(format="%.2f", help="BNA de l'exercice en cours (consensus)"),
     "BNA N+1 (évol.)": st.column_config.TextColumn(help="BNA prévu pour l'exercice suivant et sa progression ▲ / régression ▼ par rapport à N"),
@@ -3295,12 +3663,20 @@ def risk_points(f, d):
         bad.append(f"l'objectif des analystes suppose un PER de {f['target'] / f['eps_next_y']:.0f}x le BNA N+1")
     for a_ in fv.get("_alerts") or []:
         (bad if a_.startswith("⚠️") else good if "redressement" in a_ else bad).append(a_.lstrip("⚠️ℹ️ ").strip())
+    if ins and ins.get("Sortie dirigeant"):
+        bad.append("dirigeant de premier rang sorti après levée d'options : " + ins["Sortie dirigeant"])
+    if ins and "🚨" in (ins.get("Alerte") or ""):
+        bad.append("vente d'un dirigeant dans les 7 derniers jours : " + ins["Alerte"])
+    if ins and "✅" in (ins.get("Alerte") or ""):
+        good.append("achat d'un dirigeant dans les 7 derniers jours : " + ins["Alerte"])
     if ins and str(ins.get("Signal", "")).startswith("🟢"):
         good.append("achats des dirigeants : " + ins["Résumé"])
-    elif ins and str(ins.get("Signal", "")).startswith("🟠"):
-        bad.append("ventes des dirigeants : " + ins["Résumé"])
-    if si and si.get("Lignes") and str(si.get("Signal", "")).startswith("🟢"):
+    elif ins and str(ins.get("Signal", "")).startswith(("🟠", "🔴")):
+        bad.append("ventes récentes des dirigeants : " + ins["Résumé"])
+    if si and (si.get("Lignes") or si.get("Grille")) and str(si.get("Signal", "")).startswith("🟢"):
         good.append("super investors : " + si["Résumé"])
+    elif si and si.get("Grille") and str(si.get("Signal", "")).startswith("🔴"):
+        bad.append("super investors : " + si["Résumé"])
     if fv.get("Écart (%)") is not None and fv["Écart (%)"] > 15 and precision_txt(fv).startswith("🟢"):
         good.append(f"juste valeur supérieure au cours de {fv['Écart (%)']:.0f} % avec des méthodes concordantes")
     if fv.get("Probabilité JV DCF > cours (%)") is not None and fv["Probabilité JV DCF > cours (%)"] >= 75:
@@ -3493,16 +3869,18 @@ def report_model(f, d, t):
     B.append(("h", "9. Signaux de marché"))
     ins = d.get("ins")
     if ins:
-        B.append(("p", f"Initiés ({f.get('insider_source', 'fiche Finviz')}) : {ins['Résumé']}"))
+        B.append(("p", f"Initiés ({ins.get('Source') or f.get('insider_source', 'fiche Finviz')}) : {ins['Résumé']}"))
         keys = ("Achats 365j", "Ventes 365j", "Acheteurs", "Achats groupés (max en 30 j)", "Achats PDG / DAF (M$)",
                 "Hausse médiane de détention (%)", "Ventes avec levée d'options (M$)")
-        B.append(("table", ["Initiés, 12 mois", "Valeur"], [[k, _fmt(ins.get(k))] for k in keys]))
+        B.append(("table", ["Initiés, 12 mois", "Valeur"], [[k.replace("M$", "M€") if ins.get("Devise") == "€" else k,
+                                                             _fmt(ins.get(k))] for k in keys if ins.get(k) is not None]))
         if ins.get("Achats notables"):
             B.append(("ul", ["Achat : " + x for x in ins["Achats notables"]]))
     else:
         B.append(("p", "Initiés : non disponible pour cette source."))
     si = d.get("si") or {}
-    B.append(("p", "Super investors (Dataroma) : " + (si.get("Résumé") if si.get("Lignes") else "aucune donnée.")))
+    B.append(("p", "Super investors (Dataroma) : " + (si.get("Résumé") if si.get("Lignes") or si.get("Grille")
+                                                      else "aucune donnée.")))
     nb = f" · {f['n_analysts']} analystes" if f.get("n_analysts") else ""
     B.append(("p", f"Analystes : consensus {an.get('Consensus') or 'n.d.'}{nb}"
                    + (f", {an['Relèvements 180j']} relèvement(s) / {an['Abaissements 180j']} abaissement(s) sur 180 j"
@@ -4112,13 +4490,30 @@ def render_detail(f, d, t=None, ns=""):
     st.markdown("##### 9. Signaux de marché")
     a, b = st.columns(2)
     with a:
-        st.markdown(f"**Initiés ({f.get('insider_source', 'fiche Finviz')}) — achats et ventes en bourse**")
         ins = d["ins"]
+        st.markdown(f"**Initiés ({(ins or {}).get('Source') or f.get('insider_source', 'fiche Finviz')}) — achats et "
+                    "ventes en bourse**")
         if ins:
+            if ins.get("Alerte"):
+                (st.error if "🚨" in ins["Alerte"] else st.success)(
+                    "Opération d'un dirigeant dans les 7 derniers jours : " + ins["Alerte"])
+            if ins.get("Sortie dirigeant"):
+                st.warning(ins["Sortie dirigeant"] + " — vente liée à une levée d'options : hors signal, mais un "
+                           "dirigeant de premier rang qui cède l'essentiel de sa détention est souvent mal perçu.")
             st.markdown(ins["Résumé"])
+            if ins.get("Frise"):
+                st.markdown(f"12 derniers mois : {ins['Frise']} · dernière opération : {ins['Dernière opération']}")
+                st.caption(("Même calcul que le screener AMF (même seuil). " if ins.get("Source") == "déclarations AMF"
+                            else "Même calcul que le screener investors (mêmes seuils). ") + "🟢 achats sur 6 mois sans vente "
+                           "significative sur 3 mois · 🟠 achats et ventes récentes · 🔴 ventes récentes supérieures aux "
+                           "achats · ⚪ non significatif. Frise : 🟩 achats nets, 🟥 ventes nettes, ⬜ rien.")
             keep = ("Achats 365j", "Ventes 365j", "Acheteurs", "Achats groupés (max en 30 j)", "Achats PDG / DAF (M$)",
                     "Hausse médiane de détention (%)", "Ventes avec levée d'options (M$)")
-            st.dataframe(pd.DataFrame([{k: ins[k] for k in keep}]).T.rename(columns={0: "12 mois"}))
+            st.dataframe(pd.DataFrame([{k.replace("M$", "M€") if ins.get("Devise") == "€" else k: ins.get(k)
+                                        for k in keep if ins.get(k) is not None}]).T.rename(columns={0: "12 mois"}))
+            if ins.get("Devise") == "€":
+                st.caption("Montants en millions d'euros (déclarations à l'AMF). Ventes sous mandat de gestion comptées"
+                           + (" — il y en a sur 12 mois." if ins.get("Ventes sous mandat") else "."))
             for x in ins["Achats notables"]:
                 st.caption("Achat : " + x)
             st.caption("Un achat (argent personnel du dirigeant) est un signal plus fort qu'une vente : diversification, "
@@ -4126,10 +4521,18 @@ def render_detail(f, d, t=None, ns=""):
         else:
             st.caption("Non disponible pour cette source.")
     with b:
-        st.markdown("**Super investors (Dataroma, 13F du dernier trimestre)**")
+        st.markdown("**Super investors (Dataroma, déclarations 13F)**")
         si = d["si"]
+        if si.get("Grille") and not si["Lignes"]:
+            st.markdown(si["Résumé"])
+        if si.get("Grille"):
+            st.caption("Signal calculé comme dans le screener investors : nombre de fonds qui renforcent (▲) ou allègent "
+                       "(▼) au dernier trimestre, comparé au trimestre précédent (↗ / ↘).")
         if si["Lignes"]:
             st.markdown(si["Résumé"])
+            if si.get("Grille"):
+                st.caption("Tableau ci-dessous : fonds détenteurs et dernier mouvement déclaré par chacun (il peut "
+                           "dater du trimestre précédent si le fonds n'a pas encore publié son 13F).")
             if si["Cours vs prix moyen (%)"] is not None:
                 st.caption(f"Prix de détention moyen des fonds : {si['Prix de détention moyen']:.2f} — cours "
                            f"{si['Cours vs prix moyen (%)']:+d} % " + ("(sous leur prix : vous achèteriez moins cher qu'eux)"
@@ -4452,9 +4855,9 @@ def main():
     st.session_state["wl_errs"] = list(st.session_state.get("wl_errs_pages") or []) + \
         list(st.session_state.get("wl_errs_scr") or [])
 
-    tab1, tab2, tab4, tab5, tab6, tab7, tab3 = st.tabs(["📋 Portefeuille", "🛒 Valeurs à étudier", "😨 Fear & Greed",
-                                                        "🔥 Sentiment screener", "🔎 Screener JV", "👥 Screener initiés",
-                                                        "ℹ️ Méthode"])
+    tab1, tab2, tab4, tab5, tab6, tab7, tab8, tab3 = st.tabs(
+        ["📋 Portefeuille", "🛒 Valeurs à étudier", "😨 Fear & Greed", "🔥 Sentiment screener", "🔎 Screener JV",
+         "🇺🇸 Screener investors", "🇫🇷 Screener AMF", "ℹ️ Méthode"])
 
     # ---------- calculs (avant les onglets : une erreur n'empêche pas l'affichage des autres onglets)
     pf_res, pf_err = None, None
@@ -4543,7 +4946,9 @@ def main():
         render_screener(p, use_cache, max_days, use_oi)
 
     with tab7:
-        render_insider_screener(max_days, use_cache, use_oi)
+        render_investors_screener(max_days, use_cache, use_oi)
+    with tab8:
+        render_amf_screener()
 
     with tab3:
         st.markdown("""
@@ -4636,11 +5041,12 @@ dernier exercice alors que la marge d'EBITDA tient et que le CA repart en N+1), 
 repartent de la base pro forma N du consensus ; le bond du BNA entre l'exercice publié et N n'est pas lu comme un pic.
 Une valeur cyclique est valorisée sur un flux normalisé et 8x le BNA N+1, et ses scénarios supposent un plateau en N+2.
 
-**Initiés** : signal 🟢🟢 = achats groupés (au moins 2 dirigeants en 30 jours) ou achats du PDG / directeur financier (≥ 0,25 M$) ;
-🟢 = achats ≥ 0,1 M$ ; 🟠 = ventes ≥ 10 M$ hors levées d'options, sans achat ; ⚪ = peu de mouvements. Source : OpenInsider (formulaires 4 de la SEC, 12 mois, achats « P » et ventes « S » en bourse ; « avec levée d'options »
-= vente accompagnée d'un exercice de stock-options), ou à défaut la fiche Finviz ; dédoublonnés. **Super investors** : Dataroma ; signal 🟢🟢 si plus d'entrées / renforcements que d'allègements avec au moins un gérant
-convaincu (ligne ≥ 5 % de son portefeuille) ou 2 nouveaux entrants ; 🟢 majorité d'achats ; 🟠 majorité d'allègements (déclarations 13F,
-décalées d'un trimestre). **Put/Call** : encours (open interest) puts / calls, toutes échéances jusqu'à N jours ;
+**Initiés** et **Super investors** (portefeuille, valeurs à étudier, fiche détaillée) : même calcul et mêmes seuils que le
+screener investors (voir « Signal des initiés » plus bas), pour que les deux onglets concordent. Initiés : OpenInsider
+(formulaires 4 de la SEC, 12 mois, achats « P » et ventes « S » en bourse, ventes avec levée d'options exclues), ou à défaut la
+fiche Finviz ; dédoublonnés. Super investors : grilles Dataroma du S&P 500 (dernier trimestre et trimestre précédent) ; hors
+S&P 500, résumé de la fiche Dataroma (dernier mouvement déclaré par chaque fonds détenteur, déclarations 13F décalées d'un
+trimestre). **Put/Call** : encours (open interest) puts / calls, toutes échéances jusqu'à N jours ;
 > 1 = couverture ou prudence, < 0,7 = positionnement haussier ; la version ± 10 % ne garde que les prix d'exercice proches du cours.
 
 **Scénarios** : EBITDA N+1 = EBITDA TTM × (1 + croissance du CA sur 12 mois, plafonnée à 50 %), N+2 = croissance à 5 ans plafonnée à 25 % ;
@@ -4676,12 +5082,32 @@ les prévisions du consensus sur 2 à 3 ans : le scénario central reprend ces p
 (mines, acier, charbon… par défaut), calcule une juste valeur rapide sur la fiche Finviz seule et garde les actions
 dont la marge dépasse le seuil ; les meilleures partent en analyse complète dans « Valeurs à étudier ».
 
-**👥 Screener initiés** : univers = valeurs du S&P 500 de la grille Dataroma détenues par au moins N superinvestors
-(ou tout le S&P 500 pour OpenInsider). Deux analyses séparées : A. résumé initiés 6 mois de chaque fiche Dataroma (solde $ > 0) ;
-B. transactions OpenInsider sur la période choisie, levées d'options exclues (critère au choix : acheteurs distincts > vendeurs,
-nb d'achats > nb de ventes, ou solde $ > 0 ; achats sous le montant minimum ignorés, ventes toutes comptées). Une valeur est
-retenue dès qu'une des deux analyses la sélectionne. Le sentiment des initiés (ratios acheteurs/vendeurs, achats/ventes) est
-comparé à la même période l'an dernier ou à la période précédente : c'est l'évolution qui compte, pas le niveau.
+**Signal des initiés** (screeners investors et AMF, même règle) : 🟢 achats de dirigeants ≥ seuil sur 6 mois sans
+vente significative sur 3 mois · 🟠 achats sur 6 mois mais aussi des ventes récentes (3 mois) · 🔴 ventes récentes
+supérieures aux achats des 6 mois · ⚪ montants sous le seuil ou mouvements anciens. « Achats groupés » / « ventes
+groupées » : au moins 3 dirigeants distincts dans la même fenêtre de 30 jours. Frise : solde mensuel achats − ventes
+sur 12 mois (🟩 achats nets, 🟥 ventes nettes, ⬜ rien), pour voir d'un coup d'œil si les achats se répètent et si des
+ventes sont récentes. Alerte 7 j : 🚨 vente / ✅ achat d'un dirigeant dans les 7 derniers jours (date de l'opération),
+aussi affichée en tête de la colonne Initiés et dans la fiche détaillée. Ventes liées à une levée d'options : hors
+signal ; mais « ⚠️ sortie PDG / DAF » si un PDG, DAF, président ou fondateur a vendu au moins la moitié de sa détention
+dans les 6 derniers mois en lien avec une levée d'options (part vendue = titres vendus / (détention après + titres
+vendus)) — colonne du screener investors, en tête de la colonne Initiés, point de vigilance de la fiche (valeurs
+américaines : les déclarations AMF n'indiquent pas la détention restante).
+
+**🇺🇸 Screener investors** : univers = valeurs du S&P 500 détenues par au moins N superinvestors (grille Dataroma
+« Ownership »). Colonne Dirigeants : transactions OpenInsider sur 12 mois (levées d'options exclues, achats sous le montant
+minimum ignorés, ventes toutes comptées). Colonnes Fonds : nombre de superinvestors qui renforcent / allègent la valeur
+au dernier trimestre et au trimestre précédent (grilles « Last qtr buys / sells », et « 6 months » moins le dernier
+trimestre) — rond d'après le dernier trimestre (🟢 plus de renforcements, 🔴 plus d'allègements, 🟠 autant, ⚪ aucun
+mouvement), « ↗ en amélioration » / « ↘ en dégradation » si le solde a changé d'au moins 2 fonds par rapport au trimestre
+précédent, « achats groupés » dès 3 fonds acheteurs dans le trimestre. Sentiment de l'univers : ratios
+acheteurs / vendeurs des 90 derniers jours comparés aux 90 précédents.
+
+**🇫🇷 Screener AMF** : déclarations des dirigeants publiées par l'AMF (base BDIF, article 19 du règlement MAR), sur
+12 mois, pour le SBF 120 (fichier sbf120.csv) ou toutes les sociétés cotées à Paris (Euronext, Growth, Access). Chaque PDF
+est lu une fois puis gardé sur disque. Retenus : acquisitions, souscriptions et cessions d'actions à prix > 0 ; exclus :
+actions gratuites ou de performance, options, conversions, nantissements, prêts, donations, parts de FCPE, droits de
+souscription. Une déclaration corrigée remplace l'initiale. Les ventes sous mandat de gestion sont comptées mais signalées.
 
 **🔥 Sentiment screener** : les actions les plus citées sur Reddit (ApeWisdom, 24 h, hors ETF) sont passées au crible du ton
 de leurs titres d'actualité Finviz ; sont retenues celles à l'actualité nettement positive (≥ 15 sur 30 j avec au moins 5 titres,

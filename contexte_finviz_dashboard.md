@@ -14,14 +14,28 @@ concises et pratiques. Déploiement prévu : GitHub (dépôt privé) + Streamlit
   gardés seulement si Yahoo les rattache au symbole ; titres en anglais ; à défaut de titre sur 7 j, liste 30 j.
 - Zonebourse : uniquement des pages HTML enregistrées et déposées par l'utilisateur (onglets Finances + Valorisation) ;
   jamais de récupération automatique.
+- AMF — base BDIF (API publique sans clé `bdif.amf-france.org/back/api/v1/`) : déclarations des dirigeants
+  (article 19 MAR) ; liste JSON + un PDF par déclaration (formulaire standard, lu avec pypdf, gardé sur disque dans
+  `cache_finviz/amf/`). Société identifiée par son « jeton » AMF (l'ISIN peut changer : Capital B, regroupement
+  d'actions → FR0014019Y19). SBF 120 : fichier `sbf120.csv` (Euronext, 08/11/2026 ; l'API Euronext est chiffrée).
 - Cache disque 2 h (`./cache_finviz`).
 
 ## Onglets
 Portefeuille · Valeurs à étudier (pages HTML + valeurs envoyées par le Screener JV, gardées séparément) · Sentiment
 (VADER + lexique financier) · Sentiment screener (Reddit : 10 valeurs les plus citées à l'actualité positive) ·
-Screener JV (lit un screener Finviz, exclut des industries, JV rapide, envoi en analyse complète) · Screener initiés
-(superinvestors Dataroma × achats des dirigeants OpenInsider, sentiment des initiés, exports ; modules analyse.py,
-openinsider.py, dataroma_scraper.py, exports.py dans le même dossier) · Méthode.
+Screener JV (lit un screener Finviz, exclut des industries, JV rapide, envoi en analyse complète) · Screener investors (🇺🇸 S&P 500 détenu par les
+superinvestors, grille Dataroma « Ownership » ; colonnes Dirigeants = OpenInsider 12 mois et Fonds = renforcements /
+allègements Dataroma, rond du dernier trimestre + tendance ↗/↘ vs trimestre précédent) · Screener AMF (🇫🇷 SBF 120 ou toutes sociétés de Paris) · Méthode. Les deux screeners partagent
+le module signaux.py : 🟢 achats ≥ seuil sur 6 mois sans vente significative sur 3 mois, 🟠 achats 6 mois + ventes
+récentes, 🔴 ventes 3 mois > achats 6 mois, ⚪ non significatif ; « achats / ventes groupés » ≥ 3 dirigeants en 30 j ;
+frise 12 mois 🟩/🟥/⬜. Ventes sous mandat de gestion comptées mais signalées. Choix de l'utilisateur : deux onglets
+séparés (pas de tableau commun NYSE / Euronext). Concordance : les colonnes Initiés et Super investors du portefeuille /
+valeurs à étudier / fiche détaillée utilisent le même calcul et les mêmes seuils que le screener investors
+(concord_insiders, concord_funds). Valeurs européennes (Zonebourse, ISIN hors US) : signal AMF des dirigeants
+(amf_insiders → amf.company_declarations : jeton via ISIN, recherche ISIN + raison sociale), seuil du screener AMF.
+Ventes avec levée d'options : hors signal (choix de l'utilisateur) ; avertissement « ⚠️ sortie PDG / DAF » si PDG/DAF/
+président/fondateur vend ≥ 50 % de sa détention en 6 mois après levée d'options (US seulement). Alerte 7 j 🚨 vente / ✅ achat.
+Fusion OpenInsider + Finviz : ligne Finviz ignorée si même dirigeant, même sens, ±3 jours (_oi_covers). Le tableau « Total insider Buys/Sells » de Dataroma = dirigeants, pas les fonds.
 
 ## Juste valeur (JV)
 - Avec états financiers : **DCF d'entreprise** (FCFF sur 10 ans, CMPC avec bêta ajusté Blume, valeur terminale =

@@ -23,6 +23,9 @@ python-docx>=1.1
 reportlab>=4.0
 matplotlib>=3.8
 
+# Screener AMF : lecture des déclarations des dirigeants (PDF de l'AMF)
+pypdf>=4.0
+
 # Indice Fear & Greed (onglet « Fear & Greed »)
 plotly>=5.20
 # anthropic  # facultatif : commentaire automatique de l'onglet Fear & Greed

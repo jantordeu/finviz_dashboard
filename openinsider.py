@@ -131,9 +131,9 @@ def date_range(days: int, years_back: int = 0, today: Optional[date] = None,
     return start, end
 
 
-def _params(batch, days, page, period: Optional[tuple[date, date]] = None):
+def _params(batch, days, page, period: Optional[tuple[date, date]] = None, include_oe: bool = False):
     p = {"s": " ".join(batch), "fd": days, "xp": 1, "xs": 1,
-         "excludeDerivRelated": 1, "cnt": PAGE_SIZE, "page": page}
+         "excludeDerivRelated": 0 if include_oe else 1, "cnt": PAGE_SIZE, "page": page}
     if period:                                  # dates de déclaration explicites
         p["fd"] = -1
         p["fdr"] = f"{period[0]:%m/%d/%Y} - {period[1]:%m/%d/%Y}"
@@ -143,8 +143,10 @@ def _params(batch, days, page, period: Optional[tuple[date, date]] = None):
 def fetch_transactions(tickers: list[str], days: int = 90, delay: float = 0.5,
                        session: Optional[requests.Session] = None,
                        progress: Optional[Callable[[int, int, str], None]] = None,
-                       period: Optional[tuple[date, date]] = None
+                       period: Optional[tuple[date, date]] = None, include_oe: bool = False
                        ) -> tuple[pd.DataFrame, list[dict]]:
+    """include_oe=True : garde aussi les ventes liées à une levée d'options (type « S - Sale+OE »), repérées
+    ensuite par la colonne trade_type (servent à l'avertissement « sortie d'un dirigeant », pas au signal)."""
     """Retourne (transactions, journal de diagnostic)."""
     s = session or requests.Session()
     s.headers.update(HEADERS)
@@ -158,7 +160,7 @@ def fetch_transactions(tickers: list[str], days: int = 90, delay: float = 0.5,
             part, entry = None, {"lot": b, "page": page, "tickers": len(batch)}
             for url in URLS:                      # http puis https
                 try:
-                    r = s.get(url, params=_params(batch, days, page, period), timeout=30)
+                    r = s.get(url, params=_params(batch, days, page, period, include_oe), timeout=30)
                     entry.update(url=r.url, http=r.status_code, octets=len(r.text))
                     if r.status_code == 200 and has_table(r.text):
                         part = parse_screener(r.text)
