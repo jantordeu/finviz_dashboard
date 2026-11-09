@@ -105,7 +105,8 @@ def jetons_for_isins(isins: list[str], cache_file: str, max_age_days: int = 30,
         except (OSError, ValueError):
             cache = {}
     limit = (date.today() - timedelta(days=max_age_days)).isoformat()
-    todo = [i for i in isins if i not in cache or cache[i][2] < limit]
+    limit_empty = (date.today() - timedelta(days=7)).isoformat()      # société introuvable : revérifiée après 7 j
+    todo = [i for i in isins if i not in cache or cache[i][2] < (limit if cache[i][0] else limit_empty)]
     if todo:
         s = session()
         with ThreadPoolExecutor(8) as ex:

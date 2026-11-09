@@ -3226,6 +3226,15 @@ def _sig_settings():
         return 100_000, 50_000, False
 
 
+def _inner(txt):
+    """Détails d'un bloc entre parenthèses, « / » (ou « · ») séparant les blocs achats / ventes / net :
+    « 78,50 M$ · 4 dirig. » -> « 78,50 M$ (4 dirig.) » ; « 418 k$ · 1 dirig. (1 mois) » -> « 418 k$ (1 dirig., 1 mois) »."""
+    m = re.match(r"^(.*?) · (\d+ dirig\.)(?: \((.*)\))?$", txt or "")
+    if not m:
+        return txt
+    return f"{m.group(1)} ({m.group(2)}" + (f", {m.group(3)}" if m.group(3) else "") + ")"
+
+
 def concord_insiders(ins, tk):
     """Signal des dirigeants calculé comme dans le screener investors (signaux.summarize, mêmes seuils) :
     ventes avec levée d'options exclues, achats sous le montant minimum ignorés."""
@@ -3261,7 +3270,7 @@ def concord_insiders(ins, tk):
     out.update({"Signal": r["signal"], "Frise": r["frise"], "Dernière opération": r["derniere_txt"],
                 "Alerte": r["alerte"],
                 "Résumé": (f"{r['alerte']} · " if r["alerte"] else "") + (f"{warn} · " if warn else "")
-                          + f"{r['signal']} · achats 6 m {r['achats_txt']} · ventes 3 m {r['ventes_txt']} · "
+                          + f"{r['signal']} · achats 6 m {_inner(r['achats_txt'])} · ventes 3 m {_inner(r['ventes_txt'])} · "
                           f"net 12 m {net}"})
     return out
 
@@ -3313,7 +3322,7 @@ def amf_insiders(isin):
         "Signal": r["signal"], "Frise": r["frise"], "Dernière opération": r["derniere_txt"],
         "Alerte": r["alerte"],
         "Résumé": (f"{r['alerte']} · " if r["alerte"] else "")
-                  + f"{r['signal']} · achats 6 m {r['achats_txt']} · ventes 3 m {r['ventes_txt']} · net 12 m {net}",
+                  + f"{r['signal']} · achats 6 m {_inner(r['achats_txt'])} · ventes 3 m {_inner(r['ventes_txt'])} · net 12 m {net}",
         "Achats 365j": round(b["value"].sum() / 1e6, 2), "Ventes 365j": round(v["value"].sum() / 1e6, 2),
         "Acheteurs": int(b["person"].nunique()), "Achats groupés (max en 30 j)": int(r["group_buy"]),
         "Achats notables": [f"{x.declarant} ({x.fonction}) {x.date:%d/%m/%y} : {sg.money(x.value, '€')}"
