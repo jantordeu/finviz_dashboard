@@ -2085,10 +2085,14 @@ def superinvestor_stats(d, price=None):
     short = lambda n: n.split()[-1] if len(n.split()) == 2 else n
     txt = ", ".join(f"{short(r['Gérant'])} {r.get('% portefeuille') or 0:.1f} %"
                     + (" (nouveau)" if r in new else f" (+{pct_of(r):.0f} %)") for r in key)
+    import signaux as sg
+    conv = sg.conviction_signal(rows)                 # signal pondéré par la conviction (poids des lignes)
+    res["Conviction"] = conv
+    sig = conv["dot"] if rows else sig
     res["Clés"] = txt
     res["Signal"] = sig
-    res["Résumé"] = (f"{sig} {res['Super investors']} fonds · {len(new)} nouv. {len(add)} renf. {len(red) + len(out_)} allèg."
-                     + (f" · {txt}" if txt else "")) if rows else ""
+    res["Résumé"] = (f"{conv['txt']} · {res['Super investors']} fonds · {len(new)} nouv. {len(add)} renf. "
+                     f"{len(red) + len(out_)} allèg.") if rows else ""
     return res
 
 
@@ -2919,6 +2923,28 @@ def _inv_load(min_si):
     return uni, raw_tx, log
 
 
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _inv_conviction(tickers):
+    """Fiches Dataroma (détenteurs, poids, dernier mouvement) des valeurs de l'univers -> {ticker: lignes}."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    bar = st.progress(0.0, text="Fiches Dataroma (conviction des fonds)…")
+
+    def one(t):
+        return t, parse_dataroma(_get(_session(), f"https://www.dataroma.com/m/stock.php?sym={t}", (0.2, 0.5)))["rows"]
+    out = {}
+    with ThreadPoolExecutor(4) as ex:
+        futs = [ex.submit(one, t) for t in tickers]
+        for i, fu in enumerate(as_completed(futs), 1):
+            try:
+                t, rows = fu.result()
+                out[t] = rows
+            except Exception:  # noqa: BLE001 — fiche illisible : signal par le nombre de fonds
+                pass
+            bar.progress(i / len(futs), text=f"Fiches Dataroma {i}/{len(futs)}")
+    bar.empty()
+    return out
+
+
 def render_investors_screener(max_days, use_cache, use_oi):
     """Onglet « Screener investors » : valeurs du S&P 500 détenues par les superinvestors (grille Dataroma
     « Ownership ») ; signal des dirigeants (OpenInsider, 12 mois) et signal des fonds (activité Dataroma)."""
@@ -2946,12 +2972,18 @@ def render_investors_screener(max_days, use_cache, use_oi):
                                        help="Ignore les petits achats symboliques ; les ventes sont toutes comptées.")
         excl10 = c[2].checkbox("Exclure les actionnaires >10 %", value=False, key="inv_excl10",
                                help="Ex. Berkshire Hathaway, déclaré initié chez Lennar.")
+        use_conv = c[2].checkbox("Fonds : pondérer par la conviction", value=True, key="inv_conv",
+                                 help="Lit la fiche Dataroma de chaque valeur (poids de la ligne dans le portefeuille de "
+                                      "chaque gérant) : ≈ 1 à 2 min la première fois, puis gardée 6 h. Décoché : "
+                                      "nombre de fonds qui renforcent / allègent.")
         go = c[2].button("Lancer l'analyse", type="primary", key="inv_go")
     if go:
         try:
             if not use_cache:
                 _inv_load.clear()
             st.session_state["inv_data"] = _inv_load(int(min_si))
+            st.session_state["inv_conv_rows"] = (_inv_conviction(tuple(st.session_state["inv_data"][0]["ticker"]))
+                                                 if use_conv else None)
         except Exception as e:  # noqa: BLE001
             st.error(f"Erreur : {e}")
     if "inv_data" not in st.session_state:
@@ -2966,6 +2998,10 @@ def render_investors_screener(max_days, use_cache, use_oi):
     warn = {k: sg.top_exit_warning(g, today=TODAY.date()) for k, g in ex.groupby("key")} if not ex.empty else {}
     final["sortie"] = final["ticker"].map(warn).fillna("")
     final["fonds"] = [sg.fund_signal(*r) for r in final[["add_q", "red_q", "add_6m", "red_6m"]].itertuples(index=False)]
+    conv_rows = st.session_state.get("inv_conv_rows")
+    if conv_rows:                          # conviction (poids des lignes) : même calcul que l'analyse des valeurs
+        cv = {t: sg.conviction_signal(r)["txt"] for t, r in conv_rows.items() if r}
+        final["fonds"] = final["ticker"].map(cv).fillna(final["fonds"])
     final["fonds_dot"] = final["fonds"].str[:1]
     qs = [sg.fund_quarters(*r) for r in final[["add_q", "red_q", "add_6m", "red_6m"]].itertuples(index=False)]
     final["fonds_q"] = [f"▲ {a}  ▼ {r}" for a, r, _, _ in qs]
@@ -3035,7 +3071,10 @@ def render_investors_screener(max_days, use_cache, use_oi):
                                                                "(OpenInsider, 12 mois)"),
             "Dirigeants · dernière opération": st.column_config.TextColumn(width="medium",
                                                                            help="dernière transaction d'un dirigeant"),
-            "Fonds · signal": st.column_config.TextColumn(width="medium", help=(
+            "Fonds · signal": st.column_config.TextColumn(width="large", help=(
+                "Pondéré par la conviction (case cochée) : chaque mouvement compte pour le poids qu'il représente dans "
+                "le portefeuille du gérant (points), 5 points au plus par fonds — 🟢 ≥ +0,5 · 🔴 ≤ −0,5 · 🟠 achats et "
+                "ventes qui se compensent · ⚪ symbolique. Sinon : "
                 "superinvestors (Dataroma), dernier trimestre : 🟢 plus de fonds qui renforcent que de fonds qui "
                 "allègent · 🔴 l'inverse · 🟠 autant · ⚪ aucun mouvement ; ↗ / ↘ : solde meilleur / moins bon "
                 "qu'au trimestre précédent (écart ≥ 2 fonds)")),
@@ -3047,8 +3086,9 @@ def render_investors_screener(max_days, use_cache, use_oi):
             "Dataroma": st.column_config.LinkColumn(display_text="fiche"),
             "OpenInsider": st.column_config.LinkColumn(display_text="fiche")})
         st.caption("Colonnes « Dirigeants » : transactions des dirigeants et administrateurs (OpenInsider). " + sg.LEGEND
-                   + " Colonnes « Fonds » : superinvestors (Dataroma, déclarations trimestrielles 13F) — ▲ nb de fonds "
-                   "qui ont acheté ou renforcé, ▼ nb qui ont vendu ou allégé ; rond d'après le dernier trimestre, "
+                   + " Colonnes « Fonds » : superinvestors (Dataroma, déclarations trimestrielles 13F) — rond pondéré par la "
+                   "conviction (poids des lignes dans le portefeuille de chaque gérant, case cochée) ; ▲ nb de fonds "
+                   "qui ont acheté ou renforcé, ▼ nb qui ont vendu ou allégé ; sans conviction : rond d'après le dernier trimestre, "
                    "↗ / ↘ = solde meilleur / moins bon qu'au trimestre précédent, achats groupés = au moins 3 fonds "
                    "acheteurs dans le trimestre. La frise et la dernière opération ne concernent que "
                    "les dirigeants.")
@@ -3401,11 +3441,15 @@ def concord_funds(si, tk):
         return si
     r = g.loc[k]
     aq, rq, ap, rp = sg.fund_quarters(r["add_q"], r["red_q"], r["add_6m"], r["red_6m"])
-    sig = sg.fund_signal(r["add_q"], r["red_q"], r["add_6m"], r["red_6m"])
     out = dict(si)
-    out.update({"Signal": sig, "Grille": True, "Détenteurs": int(r["owners"]),
-                "Résumé": f"{sig} · {int(r['owners'])} fonds · trim. ▲ {aq} ▼ {rq} · préc. ▲ {ap} ▼ {rp}"
-                          + (f" · {si['Clés']}" if si.get("Clés") else "")})
+    counts = f"{int(r['owners'])} fonds · trim. ▲ {aq} ▼ {rq} · préc. ▲ {ap} ▼ {rp}"
+    if si.get("Lignes"):                  # fiche Dataroma lue : signal pondéré par la conviction (même calcul que le
+        conv = si["Conviction"]           # screener investors)
+        out.update({"Signal": conv["dot"], "Grille": True, "Détenteurs": int(r["owners"]),
+                    "Résumé": f"{conv['txt']} · {counts}"})
+    else:                                 # sinon : nombre de fonds (grilles)
+        sig = sg.fund_signal(r["add_q"], r["red_q"], r["add_6m"], r["red_6m"])
+        out.update({"Signal": sig, "Grille": True, "Détenteurs": int(r["owners"]), "Résumé": f"{sig} · {counts}"})
     return out
 
 
@@ -3474,7 +3518,7 @@ FMT = {
              "plafonnée. 🟢 attendue ≥ implicite + 5 pts : le marché est pessimiste ; 🔴 le cours suppose plus que "
              "prévu ; ⚪ cohérent."),
     "Initiés (12 m)": st.column_config.TextColumn(width="large", help="Même calcul et mêmes seuils que le screener investors : 🟢 achats des dirigeants sur 6 mois sans vente significative sur 3 mois · 🟠 achats et ventes récentes · 🔴 ventes récentes (3 mois) supérieures aux achats · ⚪ non significatif ; « achats groupés » = ≥ 3 dirigeants en 30 j. Ventes avec levée d'options exclues."),
-    "Super investors (6 m)": st.column_config.TextColumn(width="large", help="Activité des fonds sur 6 mois (dernier trimestre et trimestre précédent). Même calcul que le screener investors (grilles Dataroma, S&P 500) : rond d'après le dernier trimestre (🟢 plus de fonds qui renforcent, 🔴 plus qui allègent, 🟠 autant), ↗ / ↘ tendance par rapport au trimestre précédent ; trim. / préc. = ▲ renforcements ▼ allègements. Hors S&P 500 : résumé de la fiche Dataroma (dernier mouvement de chaque détenteur). % = poids de la ligne dans le portefeuille du gérant."),
+    "Super investors (6 m)": st.column_config.TextColumn(width="large", help="Rond pondéré par la conviction (fiche Dataroma lue) : chaque mouvement compte pour le poids qu'il représente dans le portefeuille du gérant, en points (5 au plus par fonds) — 🟢 ≥ +0,5 pt · 🔴 ≤ −0,5 pt · 🟠 achats et ventes qui se compensent · ⚪ symbolique ; puis le nombre de fonds : trim. / préc. = ▲ renforcements ▼ allègements sur 6 mois (dernier trimestre et trimestre précédent). Sans fiche lue : même calcul que le screener investors (grilles Dataroma, S&P 500) : rond d'après le dernier trimestre (🟢 plus de fonds qui renforcent, 🔴 plus qui allègent, 🟠 autant), ↗ / ↘ tendance par rapport au trimestre précédent ; trim. / préc. = ▲ renforcements ▼ allègements. Hors S&P 500 : résumé de la fiche Dataroma (dernier mouvement de chaque détenteur). % = poids de la ligne dans le portefeuille du gérant."),
     "Put/Call (total / ±10 %)": st.column_config.TextColumn(help="encours puts / calls ; >1 prudence, <0,7 optimisme"),
     "BNA N": st.column_config.NumberColumn(format="%.2f", help="BNA de l'exercice en cours (consensus)"),
     "BNA N+1 (évol.)": st.column_config.TextColumn(help="BNA prévu pour l'exercice suivant et sa progression ▲ / régression ▼ par rapport à N"),
@@ -3754,7 +3798,7 @@ def risk_points(f, d):
         bad.append("ventes récentes des dirigeants : " + ins["Résumé"])
     if si and (si.get("Lignes") or si.get("Grille")) and str(si.get("Signal", "")).startswith("🟢"):
         good.append("super investors : " + si["Résumé"])
-    elif si and si.get("Grille") and str(si.get("Signal", "")).startswith("🔴"):
+    elif si and (si.get("Lignes") or si.get("Grille")) and str(si.get("Signal", "")).startswith("🔴"):
         bad.append("super investors : " + si["Résumé"])
     if fv.get("Écart (%)") is not None and fv["Écart (%)"] > 15 and precision_txt(fv).startswith("🟢"):
         good.append(f"juste valeur supérieure au cours de {fv['Écart (%)']:.0f} % avec des méthodes concordantes")
@@ -5182,6 +5226,13 @@ signal ; mais « ⚠️ sortie PDG / DAF » si un PDG, DAF, président ou fondat
 dans les 6 derniers mois en lien avec une levée d'options (part vendue = titres vendus / (détention après + titres
 vendus)) — colonne du screener investors, en tête de la colonne Initiés, point de vigilance de la fiche (valeurs
 américaines : les déclarations AMF n'indiquent pas la détention restante).
+
+**Conviction des super investors** (portefeuille, valeurs à étudier, fiche détaillée, screener investors) : chaque
+mouvement du dernier 13F compte pour le poids qu'il représente dans le portefeuille du gérant — achat d'une ligne à 15 % =
++15 points, allègement de 41 % d'une ligne restée à 15 % = −10,7 points (part vendue exprimée en poids actuel), sortie
+complète = au moins −0,5 point ; 5 points au plus par fonds, pour qu'un seul gérant ne décide pas de tout. 🟢 score ≥ +0,5,
+🔴 ≤ −0,5, 🟠 achats et ventes significatifs qui se compensent, ⚪ mouvements symboliques. Le poids mesure la conviction du
+gérant, pas le montant investi (0,6 % du portefeuille de Bridgewater = une grosse somme, mais une petite conviction).
 
 **🇺🇸 Screener investors** : univers = valeurs du S&P 500 détenues par au moins N superinvestors (grille Dataroma
 « Ownership »). Colonne Dirigeants : transactions OpenInsider sur 12 mois (levées d'options exclues, achats sous le montant

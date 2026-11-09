@@ -71,3 +71,9 @@ JV centrale = milieu de cycle : DCF sur la marge de trésorerie moyenne du cycle
 médiane) et marge d'EBITDA moyenne ; PER cible et comparables sur le BNA moyen (publiés + N + N+1, cycle_eps).
 Colonne « JV si bénéfices actuels durent » = même synthèse avec les multiples sur le BNA N+1 (JV si pic). Ex. SanDisk :
 JV 510 $ (milieu de cycle) / 1 400 $ (si le pic dure) pour un cours de 886 $.
+
+## Conviction des super investors (09/11/2026)
+signaux.conviction_signal : chaque mouvement du 13F = poids de la ligne dans le portefeuille du gérant (points ;
+allègement x % d'une ligne restée à w % = −w·x/(100−x)), plafond 5 pts par fonds ; 🟢 ≥ +0,5, 🔴 ≤ −0,5, 🟠 compensé,
+⚪ symbolique. Utilisé dans l'analyse (fiche Dataroma) et le screener investors (case « pondérer par la conviction »,
+fiches Dataroma lues, cache 6 h). Ex. Micron : 🔴 −5,0 pts (Tepper allège 41 % d'une ligne à 15 %).

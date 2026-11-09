@@ -184,6 +184,65 @@ def top_exit_warning(rows: pd.DataFrame, today: Optional[date] = None) -> str:
     return " · ".join(out[:2])
 
 
+CONV_CAP = 5.0       # apport maximal d'un fonds au score de conviction (points de portefeuille)
+CONV_MIN = 0.5       # score (points de portefeuille) en dessous duquel les mouvements sont jugés symboliques
+
+
+def _mv(txt: str) -> tuple[str, Optional[float]]:
+    """« Reduce 41.44% » -> ("Reduce", 41.44) ; « Buy » -> ("Buy", None) ; « = » -> ("=", None)."""
+    m = re.match(r"\s*(Buy|Add|Reduce|Sell)\b\s*([\d.,]+)?", txt or "", re.I)
+    if not m:
+        return "=", None
+    return m.group(1).capitalize(), float(m.group(2).replace(",", "")) if m.group(2) else None
+
+
+def conviction_signal(rows: list[dict]) -> dict:
+    """Signal des superinvestors pondéré par la conviction : chaque mouvement compte pour la part du portefeuille du
+    gérant qu'il représente (achat d'une ligne à 15 % = +15 points ; allègement de 41 % d'une ligne restée à 15 % =
+    −10,7 points), plafonnée à CONV_CAP points par fonds. rows : [{Gérant, % portefeuille, Mouvement}] (Dataroma).
+    -> {dot, score, pos, neg, txt, top}"""
+    contrib = []
+    for r in rows or []:
+        kind, pct = _mv(r.get("Mouvement"))
+        w = float(r.get("% portefeuille") or 0.0)
+        if kind == "Buy":
+            c = w
+        elif kind == "Add" and pct:
+            c = w * pct / (100 + pct)                 # part ajoutée, exprimée en poids actuel
+        elif kind == "Reduce" and pct and pct < 100:
+            c = -w * pct / (100 - pct)                # part vendue, exprimée en poids actuel
+        elif kind == "Sell":
+            c = -max(w, CONV_MIN)                     # sortie complète : poids antérieur inconnu, au moins le seuil
+        else:
+            continue
+        name = (r.get("Gérant") or "?").split()
+        short = name[-1] if len(name) == 2 else " ".join(name[:2])
+        verb = {"Buy": "entre", "Add": f"renforce {pct:.0f} %" if pct else "renforce",
+                "Reduce": f"allège {pct:.0f} %" if pct else "allège", "Sell": "sort"}[kind]
+        contrib.append((c, short, verb))
+    capped = [max(-CONV_CAP, min(CONV_CAP, c)) for c, _, _ in contrib]
+    score = sum(capped)
+    pos, neg = sum(c for c in capped if c > 0), sum(c for c in capped if c < 0)
+    if not contrib:
+        dot = "⚪"
+    elif pos >= CONV_MIN and neg <= -CONV_MIN and abs(score) < 0.5 * max(pos, -neg):
+        dot = "🟠"
+    elif score >= CONV_MIN:
+        dot = "🟢"
+    elif score <= -CONV_MIN:
+        dot = "🔴"
+    else:
+        dot = "⚪"
+    top = sorted(contrib, key=lambda x: -abs(x[0]))[:2]
+    fmt = lambda v: f"{v:+.1f}".replace(".", ",").replace("-", "−")
+    top_txt = ", ".join(f"{n} {v} : {fmt(c)} pt" for c, n, v in top if abs(c) >= 0.05)
+    txt = (f"{dot} conviction {fmt(score)} pts" + (f" — {top_txt}" if top_txt else "")
+           if contrib else "⚪ aucun mouvement")
+    if contrib and dot == "⚪":
+        txt = f"⚪ mouvements symboliques ({fmt(score)} pt)"
+    return {"dot": dot, "score": score, "pos": pos, "neg": neg, "txt": txt, "top": top}
+
+
 def fund_quarters(add_q: int, red_q: int, add_6m: int, red_6m: int) -> tuple[int, int, int, int]:
     """(renforcements, allègements) du dernier trimestre et du trimestre précédent : les grilles « 6 mois » de
     Dataroma incluent le dernier trimestre, le trimestre précédent s'en déduit par différence."""
