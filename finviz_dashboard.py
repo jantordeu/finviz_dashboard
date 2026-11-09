@@ -2850,7 +2850,7 @@ def _sig_columns(cur):
     return {
         "Alerte 7 j": st.column_config.TextColumn(help="transaction d'un dirigeant dans les 7 derniers jours (date de "
                                                       "l'opération) : 🚨 vente · ✅ achat"),
-        "Achats 6 mois": st.column_config.TextColumn(help="montant · dirigeants distincts · mois avec achat"),
+        "Achats 6 mois": st.column_config.TextColumn(help="montant · dirigeants distincts (nb de mois avec au moins un achat)"),
         "Ventes 3 mois": st.column_config.TextColumn(help="montant · dirigeants distincts ; (mandat) = ventes faites "
                                                           "surtout par un gérant sous mandat"),
         "Net 12 mois": st.column_config.NumberColumn(format=f"%,.0f {cur}", help="achats − ventes sur 12 mois"),
@@ -3366,9 +3366,9 @@ def analyze(f, p, ov=None):
                                                  else ""),
            "Analystes · objectif": ana,
            "Croissance implicite / attendue": reverse_txt(fv),
-           "Initiés (12 m)": ins_txt,
-           "Super investors": si["Résumé"] if (si.get("Grille") or f["dataroma"].get("n") is not None) and si["Résumé"]
-           else "n.d.",
+           "Initiés (12 m)": ins_txt.replace(" · ", " / "),              # « / » : plus lisible dans le tableau
+           "Super investors (6 m)": si["Résumé"].replace(" · ", " / ")
+           if (si.get("Grille") or f["dataroma"].get("n") is not None) and si["Résumé"] else "n.d.",
            "Put/Call (total / ±10 %)": pcs,
            "BNA N": round(f["eps_this_y"], 2) if f["eps_this_y"] is not None else None,
            "BNA N+1 (évol.)": bna_evol(f["eps_this_y"], f["eps_next_y"]),
@@ -3406,7 +3406,7 @@ FMT = {
              "plafonnée. 🟢 attendue ≥ implicite + 5 pts : le marché est pessimiste ; 🔴 le cours suppose plus que "
              "prévu ; ⚪ cohérent."),
     "Initiés (12 m)": st.column_config.TextColumn(width="large", help="Même calcul et mêmes seuils que le screener investors : 🟢 achats des dirigeants sur 6 mois sans vente significative sur 3 mois · 🟠 achats et ventes récentes · 🔴 ventes récentes (3 mois) supérieures aux achats · ⚪ non significatif ; « achats groupés » = ≥ 3 dirigeants en 30 j. Ventes avec levée d'options exclues."),
-    "Super investors": st.column_config.TextColumn(width="large", help="Même calcul que le screener investors (grilles Dataroma, S&P 500) : rond d'après le dernier trimestre (🟢 plus de fonds qui renforcent, 🔴 plus qui allègent, 🟠 autant), ↗ / ↘ tendance par rapport au trimestre précédent ; trim. / préc. = ▲ renforcements ▼ allègements. Hors S&P 500 : résumé de la fiche Dataroma (dernier mouvement de chaque détenteur). % = poids de la ligne dans le portefeuille du gérant."),
+    "Super investors (6 m)": st.column_config.TextColumn(width="large", help="Activité des fonds sur 6 mois (dernier trimestre et trimestre précédent). Même calcul que le screener investors (grilles Dataroma, S&P 500) : rond d'après le dernier trimestre (🟢 plus de fonds qui renforcent, 🔴 plus qui allègent, 🟠 autant), ↗ / ↘ tendance par rapport au trimestre précédent ; trim. / préc. = ▲ renforcements ▼ allègements. Hors S&P 500 : résumé de la fiche Dataroma (dernier mouvement de chaque détenteur). % = poids de la ligne dans le portefeuille du gérant."),
     "Put/Call (total / ±10 %)": st.column_config.TextColumn(help="encours puts / calls ; >1 prudence, <0,7 optimisme"),
     "BNA N": st.column_config.NumberColumn(format="%.2f", help="BNA de l'exercice en cours (consensus)"),
     "BNA N+1 (évol.)": st.column_config.TextColumn(help="BNA prévu pour l'exercice suivant et sa progression ▲ / régression ▼ par rapport à N"),

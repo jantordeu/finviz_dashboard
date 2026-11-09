@@ -137,7 +137,7 @@ def summarize(tx: pd.DataFrame, today: Optional[date] = None, min_sig: float = 5
             "frise": "".join("🟩" if per.get(m, 0.0) > 0 else "🟥" if per.get(m, 0.0) < 0 else "⬜" for m in months),
             "group_buy": gb, "group_sell": gs,
             "last_date": last["date"], "last_side": last["side"],
-            "achats_txt": (f"{money(buy6, cur)} · {b6['person'].nunique()} dirig. · {months6} mois"
+            "achats_txt": (f"{money(buy6, cur)} · {b6['person'].nunique()} dirig. ({months6} mois)"
                            if buy6 else "—"),
             "ventes_txt": (f"{money(sell3, cur)} · {s3['person'].nunique()} dirig."
                            + (" (mandat)" if mshare >= 0.5 else "") if sell3 else "—"),
