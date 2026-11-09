@@ -323,8 +323,21 @@ def parse_openinsider(html):
 
 
 def fetch_openinsider(t, s=None, days=365):
+    """OpenInsider, 12 mois : http puis https, délai 40 s, deux essais (site parfois lent juste après un screener)."""
     s = s or _session()
-    return parse_openinsider(_get(s, f"http://openinsider.com/screener?s={t}&fd={days}&xp=1&xs=1&cnt=500", (0.8, 1.5)))
+    err = None
+    for attempt in range(2):
+        for base in ("http", "https"):
+            try:
+                r = s.get(f"{base}://openinsider.com/screener?s={t}&fd={days}&xp=1&xs=1&cnt=500", headers=UA,
+                          timeout=40)
+                r.raise_for_status()
+                time.sleep(random.uniform(0.8, 1.5))
+                return parse_openinsider(r.text)
+            except Exception as e:  # noqa: BLE001
+                err = e
+        time.sleep(3)
+    raise err
 
 
 def parse_screener_rows(html):
@@ -358,7 +371,7 @@ def add_peers(raw, t, s=None, log=print):
     return raw
 
 
-ONLINE_KEYS = ("IA", "BA", "CA", "options", "dataroma", "insiders", "insider_source", "peers_data")
+ONLINE_KEYS = ("IA", "BA", "CA", "options", "dataroma", "insiders", "insider_source", "peers_data", "oi_failed")
 
 
 def clear_caches():
@@ -389,6 +402,11 @@ def complete_online_cached(raw, t, max_days=200, use_cache=True, log=print, open
     if use_cache and os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_HOURS * 3600:
         with open(path, encoding="utf-8") as fh:
             raw.update(json.load(fh))
+        if openinsider and not raw.get("insider_source") and time.time() - raw.get("oi_failed", 0) > 600:
+            add_openinsider(raw, t, None, log, openinsider)
+            if raw.get("insider_source"):
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump({k: raw.get(k) for k in ONLINE_KEYS if k in raw}, fh)
         return raw, True
     complete_online(raw, t, max_days, log, None, openinsider)
     with open(path, "w", encoding="utf-8") as fh:
@@ -444,7 +462,14 @@ def complete_online(raw, t, max_days=200, log=print, s=None, openinsider=True):
     """Ajoute en ligne ce qui manque : états financiers, initiés (OpenInsider), options, super investors."""
     s = s or _session()
     add_peers(raw, t, s, log)
+    add_openinsider(raw, t, s, log, openinsider)
+    _complete_rest(raw, t, max_days, log, s)
+
+
+def add_openinsider(raw, t, s=None, log=print, openinsider=True):
+    """Initiés OpenInsider (12 mois) fusionnés avec la fiche Finviz ; en cas d'échec, la fiche Finviz reste."""
     if openinsider and not raw.get("insider_source"):
+        s = s or _session()
         try:
             rows = fetch_openinsider(t, s)
             if rows:                                     # sinon (société non suivie) : on garde la fiche Finviz
@@ -452,8 +477,20 @@ def complete_online(raw, t, max_days=200, log=print, s=None, openinsider=True):
                          and not _oi_covers(rows, r)]   # transactions de la fiche Finviz absentes d'OpenInsider
                 raw["insiders"] = rows + extra
                 raw["insider_source"] = f"OpenInsider + fiche Finviz, 12 mois ({len(rows) + len(extra)} transactions)"
+            elif rows is not None:                       # réponse sans transaction : pas de nouvel essai
+                raw["insider_source"] = "fiche Finviz (aucune transaction sur OpenInsider)"
+            if rows is None:                             # page sans tableau (erreur du site) : nouvel essai plus tard
+                raw["oi_failed"] = time.time()
+            else:
+                raw.pop("oi_failed", None)
         except Exception as e:
-            log(f"{t} : OpenInsider indisponible, initiés Finviz utilisés ({e})")
+            raw["oi_failed"] = time.time()               # nouvel essai au plus tôt dans 10 minutes
+            log(f"{t} : OpenInsider indisponible, initiés Finviz utilisés ({e}) — nouvel essai au prochain affichage "
+                "(après 10 min)")
+
+
+def _complete_rest(raw, t, max_days, log, s):
+    """États financiers, options, super investors… (tout sauf les initiés)."""
     for code in ("IA", "BA", "CA"):                      # compte de résultat, bilan, flux (annuels + TTM)
         if raw.get(code):
             continue
@@ -498,6 +535,11 @@ def fetch_ticker(t, max_days=200, use_cache=True, log=print, openinsider=True):
         with open(path, encoding="utf-8") as f:
             cached = json.load(f)
         if not _news_old(cached):
+            if openinsider and not cached.get("insider_source") and time.time() - cached.get("oi_failed", 0) > 600:
+                add_openinsider(cached, t, None, log, openinsider)
+                if cached.get("insider_source"):
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(cached, f)
             return cached
     s = _session()
     raw = {"ticker": t, "fetched": datetime.now().isoformat(timespec="minutes")}
@@ -2408,6 +2450,7 @@ def fear_greed_commentary(api_key, score, rating, prev_close, prev_w, prev_m, pr
     return msg.content[0].text
 
 
+@st.fragment      # un clic dans cet onglet ne relance que l'onglet, pas le portefeuille
 def render_fear_greed():
     st.subheader("Indice CNN Fear & Greed — sentiment du marché américain")
     try:
@@ -2641,6 +2684,7 @@ def send_to_watchlist(sel, label, max_days, use_cache, use_oi):
     st.rerun()
 
 
+@st.fragment      # un clic dans cet onglet ne relance que l'onglet, pas le portefeuille
 def render_reddit_top(p, use_cache, max_days=200, use_oi=True):
     st.subheader("Reddit : 10 actions les plus citées à l'actualité positive")
     c1, c2 = st.columns([1, 3])
@@ -2774,6 +2818,7 @@ def screen_values(tickers, p, use_cache=True, progress=None, log=print):
     return pd.DataFrame(rows)
 
 
+@st.fragment      # un clic dans cet onglet ne relance que l'onglet, pas le portefeuille
 def render_screener(p, use_cache, max_days, use_oi):
     st.subheader("Screener : actions dont la juste valeur dépasse le cours")
     url = st.text_input("Adresse du screener Finviz", value=SCREENER_URL, key="scr_url",
@@ -2945,6 +2990,7 @@ def _inv_conviction(tickers):
     return out
 
 
+@st.fragment      # un clic dans cet onglet ne relance que l'onglet, pas le portefeuille
 def render_investors_screener(max_days, use_cache, use_oi):
     """Onglet « Screener investors » : valeurs du S&P 500 détenues par les superinvestors (grille Dataroma
     « Ownership ») ; signal des dirigeants (OpenInsider, 12 mois) et signal des fonds (activité Dataroma)."""
@@ -3157,6 +3203,7 @@ def _amf_load(universe):
     return len(rows), tx, diag, names, missing
 
 
+@st.fragment      # un clic dans cet onglet ne relance que l'onglet, pas le portefeuille
 def render_amf_screener():
     """Onglet « Screener AMF » : déclarations des dirigeants des sociétés cotées à Paris (base BDIF de l'AMF)."""
     import signaux as sg
@@ -3557,6 +3604,22 @@ def company_name(f, n=32):
         nm = re.sub(r",?\s+(Inc\.?|Corp\.?|Corporation|Co\.?|Ltd\.?|PLC|plc|N\.V\.|NV|SE|S\.A\.|SA|AG|Holdings?)$",
                     "", nm).strip(" ,")
     return nm[:n] + ("…" if len(nm) > n else "")
+
+
+def evaluate_memo(name, facts, p, ov, pf=None):
+    """evaluate() mémorisé : tant que les valeurs, les réglages et les seuils des signaux ne changent pas, un clic
+    ailleurs dans l'application (screener, sélection…) ne recalcule pas toutes les justes valeurs (DCF, Monte Carlo)."""
+    import pickle
+    try:
+        key = hashlib.md5(pickle.dumps((facts, p, ov, pf, _sig_settings(), st.session_state.get("amf_min_sig"),
+                                        TODAY.date()))).hexdigest()
+    except Exception:  # noqa: BLE001 — objet non sérialisable : pas de mémorisation
+        return evaluate(facts, p, ov, pf)
+    memo = st.session_state.setdefault("_eval_memo", {})
+    if memo.get(name, (None,))[0] != key:
+        memo[name] = (key, evaluate(facts, p, ov, pf))
+        memo.pop(name + "_xlsx", None)
+    return copy.deepcopy(memo[name][1])          # copie : l'affichage ne modifie jamais le résultat mémorisé
 
 
 def evaluate(facts, p, ov, pf=None):
@@ -4990,7 +5053,7 @@ def main():
     pf_res, pf_err = None, None
     if raws:
         try:
-            pf_res = evaluate(portfolio_facts(raws, st.session_state.get("zb_store") or {}), p, ov, pf)
+            pf_res = evaluate_memo("pf", portfolio_facts(raws, st.session_state.get("zb_store") or {}), p, ov, pf)
         except Exception as e:
             pf_err = e
     wl_res, wl_err, wl_notes = None, None, []
@@ -4999,7 +5062,7 @@ def main():
             wl = st.session_state["wl"]
             # valeurs déjà en portefeuille (toutes devises, même hors NYSE) : prix d'entrée
             in_pf = not pf_all.empty and bool({_base(t) for t in wl} & set(pf_all["Ticker"]))
-            wl_res = evaluate(wl, p, ov, pf_all if in_pf else None)
+            wl_res = evaluate_memo("wl", wl, p, ov, pf_all if in_pf else None)
             PE = "Prix d'entrée"
             for t, f in wl.items():                # position dans une autre devise : prix d'entrée non comparable
                 pos = pf_all[pf_all["Ticker"] == _base(t)] if not pf_all.empty else pf_all
@@ -5023,19 +5086,22 @@ def main():
             st.dataframe(df, hide_index=True, width="stretch", column_config=FMT)
             st.caption("⟳ = valeur cyclique (bénéfices proches d'un pic). 📄 = combinée avec les pages Zonebourse déposées "
                        "dans « Valeurs à étudier » (date des pages). Survolez les en-têtes pour la définition des colonnes.")
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf) as xw:
-                df.to_excel(xw, sheet_name="Synthèse", index=False)
-                for t, (_, d) in det.items():
-                    if not d["sc"].empty:
-                        d["sc"].to_excel(xw, sheet_name=f"Scénarios {t}"[:31], index=False)
-                    if d["fv"].get("_dcfx"):                       # modèle DCF complet par valeur
-                        proj, scen, wacc = dcfx_tables(d["fv"]["_dcfx"])
-                        row = 0
-                        for tb in (scen, wacc, proj):
-                            tb.to_excel(xw, sheet_name=f"DCF {t}"[:31], index=False, startrow=row)
-                            row += len(tb) + 3
-            st.download_button("💾 Excel (synthèse, scénarios, modèles DCF)", buf.getvalue(), "finviz_dashboard.xlsx")
+            memo = st.session_state.setdefault("_eval_memo", {})
+            if "pf_xlsx" not in memo:                       # fichier reconstruit seulement si les résultats changent
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf) as xw:
+                    df.to_excel(xw, sheet_name="Synthèse", index=False)
+                    for t, (_, d) in det.items():
+                        if not d["sc"].empty:
+                            d["sc"].to_excel(xw, sheet_name=f"Scénarios {t}"[:31], index=False)
+                        if d["fv"].get("_dcfx"):                       # modèle DCF complet par valeur
+                            proj, scen, wacc = dcfx_tables(d["fv"]["_dcfx"])
+                            row = 0
+                            for tb in (scen, wacc, proj):
+                                tb.to_excel(xw, sheet_name=f"DCF {t}"[:31], index=False, startrow=row)
+                                row += len(tb) + 3
+                memo["pf_xlsx"] = buf.getvalue()
+            st.download_button("💾 Excel (synthèse, scénarios, modèles DCF)", memo["pf_xlsx"], "finviz_dashboard.xlsx")
             st.divider()
             detail_and_scenarios(df, det, keys, "pf")
 
