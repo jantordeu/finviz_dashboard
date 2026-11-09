@@ -64,3 +64,10 @@ pas de PER sur BNA N+2. Les clés d'API éventuelles ne sont jamais écrites dan
 Historique long des valeurs US (cycliques, PER historique) : API officielle SEC EDGAR (gratuite), si besoin ;
 Exclure le pétrole et le gaz par défaut dans le Screener JV ; comparables et modèle de dividendes pour les banques ;
 vérifier que Finviz accepte les requêtes depuis Streamlit Cloud.
+
+
+## Valeurs cycliques (09/11/2026)
+JV centrale = milieu de cycle : DCF sur la marge de trésorerie moyenne du cycle (jusqu'à 8 exercices, moyenne et non
+médiane) et marge d'EBITDA moyenne ; PER cible et comparables sur le BNA moyen (publiés + N + N+1, cycle_eps).
+Colonne « JV si bénéfices actuels durent » = même synthèse avec les multiples sur le BNA N+1 (JV si pic). Ex. SanDisk :
+JV 510 $ (milieu de cycle) / 1 400 $ (si le pic dure) pour un cours de 886 $.

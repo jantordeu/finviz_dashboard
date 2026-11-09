@@ -1293,10 +1293,12 @@ def dcfx_from_finviz(IA, BA, CA, sn):
     sbc = s(IA, "Stock Option Compensation Expense") or s(IA, "Stock Option Compensation Expense", 1) or 0.0
     # marge de trésorerie d'exploitation avant investissements, après impôt, avant intérêts, rémunération en
     # actions déduite : (flux d'exploitation + intérêts × (1 − impôt) − rémunération en actions) / CA
-    cfo = [s(CA, "Cash from Operating Activities", i) for i in range(6)]
-    itr = [s(IA, "Interest Expense", i) or 0.0 for i in range(6)]
-    sb = [s(IA, "Stock Option Compensation Expense", i) or (sbc if i == 0 else 0.0) for i in range(6)]
-    ocf_m = [(cfo[i] + itr[i] * (1 - tax) - sb[i]) / rev[i] for i in range(6) if cfo[i] is not None and rev[i]]
+    NH = 9                                       # 12 derniers mois + jusqu'à 8 exercices (cycle complet)
+    rv = [s(IA, "Total Revenue", i) for i in range(NH)]
+    cfo = [s(CA, "Cash from Operating Activities", i) for i in range(NH)]
+    itr = [s(IA, "Interest Expense", i) or 0.0 for i in range(NH)]
+    sb = [s(IA, "Stock Option Compensation Expense", i) or (sbc if i == 0 else 0.0) for i in range(NH)]
+    ocf_m = [(cfo[i] + itr[i] * (1 - tax) - sb[i]) / rv[i] for i in range(NH) if cfo[i] is not None and rv[i]]
     debt = (s(BA, "Short Term Debt Incl. Current Port. of LT Debt") or 0) + (s(BA, "Long Term Debt") or 0)
     cash = s(BA, "Cash & Short Term Investments") or 0
     return {"src": "états financiers Finviz (12 derniers mois)", "rev0": rev[0], "m0": eb[0] / rev[0],
@@ -1396,7 +1398,9 @@ def dcfx_project(x, g0, dm, wacc, tg, exit_mult, cyclical, g_shift=0.0, years=DC
     reprises pour les premières années, décalées de g_shift (scénario) ; dm : décalage de marge EBITDA."""
     fc = x.get("fc") or {}
     fg, fm, fcap = fc.get("g") or [], fc.get("m") or [], fc.get("capex") or []
-    m_norm = _med(x["m_hist"]) if x["m_hist"] else x["m0"]
+    # valeur cyclique : marge « de milieu de cycle » = moyenne du cycle (creux et pic compris), pas la médiane, qui
+    # retient une année de creux ou de pic quand l'historique est court
+    m_norm = ((sum(x["m_hist"]) / len(x["m_hist"]) if cyclical else _med(x["m_hist"])) if x["m_hist"] else x["m0"])
     m_base = m_norm if cyclical else x["m0"]
     capex_term = max(x["da_pct"] * 1.05, min(x["capex0"], x["capex_norm"]))
     if asset_light(x):        # amortissements = incorporels rachetés, pas des investissements à renouveler
@@ -1406,7 +1410,7 @@ def dcfx_project(x, g0, dm, wacc, tg, exit_mult, cyclical, g_shift=0.0, years=DC
     ocf = None
     if x.get("ocf0") is not None:
         h = x.get("ocf_hist") or []
-        ocf = (_med(h[:5]) if cyclical and h else (x["ocf0"] + (_med(h[:3]) if h else x["ocf0"])) / 2)
+        ocf = (sum(h) / len(h) if cyclical and h else (x["ocf0"] + (_med(h[:3]) if h else x["ocf0"])) / 2)
         if x["m0"] and x["m0"] > 0:
             ocf_ratio = ocf / (m_base if m_base else x["m0"])     # part de l'EBITDA convertie en trésorerie
     ronic = max(wacc + 0.02, 0.10)                  # rentabilité des nouveaux investissements (prudente)
@@ -1753,6 +1757,22 @@ def fair_value(f, p):
     # --- 2. PER cible x BNA N+1 (redressement : BNA N+2 actualisé d'un an) ---
     eps = f["eps_next_y"]
     e_lbl = f"BNA N+1 {eps:.2f}" if eps else ""
+    eps_mid = None
+    if f["cyclical"]:                                  # milieu de cycle : jamais le BNA d'une année de pic ou de creux
+        eps_mid, n_mid, n_pub = cycle_eps(f)
+        if eps_mid and eps_mid > 0 and eps:
+            out["_eps_mid"], out["_eps_peak"] = eps_mid, eps
+            e_lbl = f"BNA de milieu de cycle {eps_mid:.2f} (moyenne de {n_mid} exercices publiés et prévus)"
+            eps = eps_mid
+            out["notes"].append(f"cyclique : multiples appliqués au BNA de milieu de cycle {eps_mid:.2f} (moyenne de "
+                                f"{n_mid} exercices) au lieu du BNA N+1 {out['_eps_peak']:.2f}")
+            if n_pub < 5:
+                out["_alerts"].append(f"ℹ️ historique court ({n_pub} exercices publiés) : milieu de cycle approximatif")
+        else:
+            eps_mid = None
+            if eps:
+                out["notes"].append("cyclique : BNA de milieu de cycle non calculable (historique trop court ou "
+                                    "moyenne négative) — multiples sur le BNA N+1")
     rec = recovery_eps(f, p)
     if rec:
         eps, e_lbl = rec[0], rec[1]
@@ -1765,7 +1785,7 @@ def fair_value(f, p):
         out.update({"PER bas": eps * pe * 0.85, "PER": eps * pe, "PER haut": eps * pe * 1.15})
         out.setdefault("_mult", {})["PER"] = f"PER cible {pe:.1f}x × {e_lbl.split(' (')[0].split(' —')[0]}"
         out["notes"].append(f"PER cible {pe:.1f}x sur {e_lbl}")
-    eps = f["eps_next_y"]                                # comparables et PER historique : BNA N+1
+    eps = eps_mid or f["eps_next_y"]                    # comparables : même BNA que le PER cible
     # --- 3. comparables : sociétés comparables désignées par Finviz (médianes), sinon moyenne de l'industrie ---
     med = lambda xs: (sorted(xs)[len(xs) // 2] if len(xs) % 2 else
                       (sorted(xs)[len(xs) // 2 - 1] + sorted(xs)[len(xs) // 2]) / 2) if xs else None
@@ -1799,6 +1819,20 @@ def fair_value(f, p):
                                 f"P/FCF {im.get('pfcf') or 0:.1f}x (bornés)")
     # --- synthèse ---
     add_hist_pe(f, out)
+    if out.get("_eps_mid"):                    # même synthèse, multiples sur le BNA N+1 : « si les bénéfices durent »
+        k = out["_eps_peak"] / out["_eps_mid"]
+        pk = {kk: (list(v) if isinstance(v, list) else v) for kk, v in out.items()}
+        for m in ("PER", "Comparables"):
+            for sfx in ("", " bas", " haut"):
+                if pk.get(m + sfx):
+                    pk[m + sfx] *= k
+        if out.get("_dcfx"):
+            synthese_dcf(pk, p.get("w_dcf", 0.5))
+        else:
+            synthese(pk, ("DCF", "PER", "PER hist.", "Comparables"))
+        if pk.get("JV centrale"):
+            out.update({"JV si pic": pk["JV centrale"], "JV si pic basse": pk.get("JV basse"),
+                        "JV si pic haute": pk.get("JV haute")})
     if out.get("_dcfx"):
         synthese_dcf(out, p.get("w_dcf", 0.5))
         if out.get("JV centrale") and f["price"]:
@@ -1814,6 +1848,19 @@ def fair_value(f, p):
     if f["cyclical"] and "DCF" in (out.get("_excl") or []):
         out["_peak_only"] = True                     # PER et comparables appliqués au même BNA de pic : pas indépendants
     return out
+
+
+def cycle_eps(f):
+    """BNA de milieu de cycle (valeur cyclique) : moyenne des BNA publiés (jusqu'à 5 exercices) et prévus (N, N+1).
+    -> (BNA, nb d'exercices) ou (None, n) si moins de 4 valeurs."""
+    ser = [(v, kind) for lbl, v, kind in _eps_series(f)
+           if v is not None and (kind == "publié" or lbl in ("N (en cours)", "N+1")
+                                 or (f.get("zb") and f["zb"].get("N") and int(lbl) <= f["zb"]["N"] + 1))]
+    vals = [v for v, _ in ser]
+    n_pub = sum(1 for _, k in ser if k == "publié")
+    if len(vals) < 4:
+        return None, len(vals), n_pub
+    return sum(vals) / len(vals), len(vals), n_pub
 
 
 def recovery_eps(f, p):
@@ -2712,6 +2759,7 @@ def screen_values(tickers, p, use_cache=True, progress=None, log=print):
                      "Juste valeur (fourchette)": (f"{fv['JV centrale']:.0f} ({fv['JV basse']:.0f}–{fv['JV haute']:.0f})"
                                                    if fv.get("JV centrale") else "n.d."),
                      "Écart JV (%)": fv.get("Écart (%)"),
+                     "JV si bénéfices actuels durent": peak_txt(fv, f.get("price")),
                      "Précision JV": precision_txt(fv),
                      "Lecture de l'écart": divergence_txt(f, fv),
                      "Croissance implicite / attendue": reverse_txt(fv),
@@ -2784,7 +2832,8 @@ def render_screener(p, use_cache, max_days, use_oi):
     if only_prec:
         v = v[v["Précision JV"].astype(str).str.startswith(("🟢", "🟠"))]
     v = v.sort_values("Écart JV (%)", ascending=False)
-    cols = ["Ticker", "Société", "Industrie", "Cours", "Juste valeur (fourchette)", "Écart JV (%)", "Précision JV",
+    cols = ["Ticker", "Société", "Industrie", "Cours", "Juste valeur (fourchette)", "Écart JV (%)",
+            "JV si bénéfices actuels durent", "Précision JV",
             "Lecture de l'écart", "Croissance implicite / attendue", "Analystes · objectif", "BNA N+1 (évol.)", "Résultats"]
     st.dataframe(v[cols], hide_index=True, width="stretch", column_config=FMT)
     st.caption(f"Calcul du {when} : {len(v)} action(s) sur {len(res)} avec une marge ≥ {marge} %. Juste valeur rapide "
@@ -3187,6 +3236,14 @@ def render_amf_screener():
                  f"{min_sig:,.0f} €.".replace(",", " "))
 
 
+def peak_txt(fv, price):
+    """Valeur cyclique : « 1326 (+50 %) » = juste valeur si les bénéfices actuels durent (multiples sur le BNA N+1)."""
+    v = fv.get("JV si pic")
+    if not v:
+        return "—"
+    return f"{v:.0f}" + (f" ({(v / price - 1) * 100:+.0f} %)" if price else "")
+
+
 def reverse_txt(fv):
     """« 🟢 −3 % / +12 % » : croissance que suppose le cours (DCF inversé) / croissance attendue
     (DCF d'entreprise : croissance annuelle moyenne du CA sur 5 ans)."""
@@ -3371,6 +3428,7 @@ def analyze(f, p, ov=None):
     row = {"Cours": f["price"], "Devise": f.get("currency", "USD"),
            "Juste valeur (fourchette)": jv,
            "Écart JV (%)": fv.get("Écart (%)"),                      # (JV centrale / cours - 1) : >0 = sous-évaluée
+           "JV si bénéfices actuels durent": peak_txt(fv, f["price"]),
            "Précision JV": precision_txt(fv) + (" ⚠️" if any(a_.startswith("⚠️") for a_ in fv.get("_alerts") or [])
                                                  else ""),
            "Analystes · objectif": ana,
@@ -3400,6 +3458,7 @@ FMT = {
     "Prix d'entrée": st.column_config.NumberColumn(format="%.2f", help="prix d'entrée du fichier de positions"),
     "JV / prix d'entrée (%)": st.column_config.NumberColumn(format="%+.0f %%", help="(JV centrale / prix d'entrée − 1) : positif = acheté sous la juste valeur"),
     "Écart JV (%)": st.column_config.NumberColumn(format="%+.0f %%", help="(JV centrale / cours − 1) : positif = cours sous la juste valeur"),
+    "JV si bénéfices actuels durent": st.column_config.TextColumn(help="Valeurs cycliques (⟳) : la juste valeur centrale est calculée en milieu de cycle (DCF sur la trésorerie moyenne du cycle, multiples sur le BNA moyen publié et prévu). Ici, la même juste valeur si les bénéfices actuels durent (multiples sur le BNA N+1) — l'écart entre les deux mesure le pari sur la durée du cycle. « — » : valeur non cyclique."),
     "Lecture de l'écart": st.column_config.TextColumn(width="large",
         help="⚠️ / ℹ️ en tête : ajustement important du calcul (scission, flux de trésorerie non représentatifs, DCF non "
              "retenu, redressement durable) — détail dans « 🔍 Détail ». Puis, pour une précision 🟠 / 🔴 : pourquoi le "
@@ -3568,8 +3627,14 @@ def render_fv_tables(fv, cur):
                      f"Centrale ({cur})": fv[k], f"Haute ({cur})": fv.get(k + " haut"),
                      "Retenue": "✓" if not keep or k in keep else "écartée"})
     if fv.get("JV centrale"):
-        rows.append({"Méthode": "➜ Juste valeur", "Hypothèse": "", f"Basse ({cur})": fv.get("JV basse"),
+        rows.append({"Méthode": "➜ Juste valeur" + (" (milieu de cycle)" if fv.get("JV si pic") else ""),
+                     "Hypothèse": "", f"Basse ({cur})": fv.get("JV basse"),
                      f"Centrale ({cur})": fv["JV centrale"], f"Haute ({cur})": fv.get("JV haute"), "Retenue": ""})
+    if fv.get("JV si pic"):
+        rows.append({"Méthode": "Si les bénéfices actuels durent", "Hypothèse": f"multiples sur le BNA N+1 "
+                     f"{fv['_eps_peak']:.2f}", f"Basse ({cur})": fv.get("JV si pic basse"),
+                     f"Centrale ({cur})": fv["JV si pic"], f"Haute ({cur})": fv.get("JV si pic haute"),
+                     "Retenue": "information"})
     if rows:
         st.dataframe(pd.DataFrame(rows).round(1), hide_index=True, width="stretch")
         st.caption(f"Valeurs par action en {cur.strip()} (pas des ratios) : multiple ou taux utilisé dans « Hypothèse »."
@@ -3578,7 +3643,8 @@ def render_fv_tables(fv, cur):
                       if fv.get("Multiples (médiane)") and fv.get("_w_dcf") is not None else
                       " Juste valeur = médiane des méthodes (moyenne s'il n'y en a que deux)." if fv.get("JV centrale") else ""))
     skip = {m for k, _ in METHODS for m in (k, k + " bas", k + " haut")} | {
-        "JV centrale", "JV basse", "JV haute", "Multiples (médiane)", "notes"}
+        "JV centrale", "JV basse", "JV haute", "Multiples (médiane)", "notes", "JV si pic", "JV si pic basse",
+        "JV si pic haute"}
     ind = {k: v for k, v in fv.items() if k not in skip and not k.startswith("_") and isinstance(v, (int, float))}
     if ind:
         st.dataframe(pd.DataFrame([ind]).round(1), hide_index=True)
@@ -3646,6 +3712,10 @@ def en_bref(f, d, cur):
         s.append("À noter : " + " ; ".join(a.lstrip("⚠️ℹ️ ").strip() for a in al) + ".")
     elif f.get("cyclical"):
         s.append("Valeur classée cyclique : calcul prudent (bénéfices possiblement proches d'un pic).")
+    if fv.get("JV si pic") and f.get("price"):
+        s.append(f"Valeur cyclique : juste valeur de milieu de cycle (BNA moyen {fv['_eps_mid']:.2f}) ; si les bénéfices "
+                 f"actuels durent (BNA N+1 {fv['_eps_peak']:.2f}), elle serait de {fv['JV si pic']:.0f} {cur.strip()} "
+                 f"({(fv['JV si pic'] / f['price'] - 1) * 100:+.0f} % par rapport au cours).")
     return " ".join(s)
 
 
@@ -3844,7 +3914,11 @@ def report_model(f, d, t):
              _fmt(fv.get(k + " bas")), _fmt(fv[k]), _fmt(fv.get(k + " haut")), "oui" if not keep or k in keep else "écartée"]
             for k, lbl in METHODS if fv.get(k) is not None]
     if fv.get("JV centrale"):
-        rows.append(["-> Juste valeur", "", _fmt(fv["JV basse"]), _fmt(fv["JV centrale"]), _fmt(fv["JV haute"]), ""])
+        rows.append(["-> Juste valeur" + (" (milieu de cycle)" if fv.get("JV si pic") else ""), "",
+                     _fmt(fv["JV basse"]), _fmt(fv["JV centrale"]), _fmt(fv["JV haute"]), ""])
+    if fv.get("JV si pic"):
+        rows.append(["Si les bénéfices actuels durent", f"BNA N+1 {fv['_eps_peak']:.2f}", _fmt(fv.get("JV si pic basse")),
+                     _fmt(fv["JV si pic"]), _fmt(fv.get("JV si pic haute")), "information"])
     if rows:
         B.append(("table", ["Méthode", "Hypothèse", f"Basse ({cur})", f"Centrale ({cur})", f"Haute ({cur})", "Retenue"], rows))
         B.append(("p", f"Valeurs par action en {cur}. Précision : {precision_txt(fv)}. Croissance implicite / attendue : "
@@ -5090,6 +5164,12 @@ les prévisions du consensus sur 2 à 3 ans : le scénario central reprend ces p
 **🔎 Screener JV** : lit toutes les pages d'un screener Finviz (adresse collée), exclut les industries choisies
 (mines, acier, charbon… par défaut), calcule une juste valeur rapide sur la fiche Finviz seule et garde les actions
 dont la marge dépasse le seuil ; les meilleures partent en analyse complète dans « Valeurs à étudier ».
+
+**Valeurs cycliques (⟳)** : la juste valeur centrale est une valeur de **milieu de cycle** — DCF sur la marge de trésorerie
+moyenne du cycle (12 derniers mois exclus, jusqu'à 8 exercices, creux et pic compris) et marge d'EBITDA moyenne du cycle ;
+PER cible et comparables appliqués au BNA moyen (exercices publiés + N + N+1), jamais au BNA d'une année de pic ou de creux.
+Colonne « JV si bénéfices actuels durent » : même calcul avec les multiples sur le BNA N+1 — l'écart entre les deux mesure
+le pari du marché sur la durée du cycle. Moins de 6 exercices : milieu de cycle approximatif (signalé).
 
 **Signal des initiés** (screeners investors et AMF, même règle) : 🟢 achats de dirigeants ≥ seuil sur 6 mois sans
 vente significative sur 3 mois · 🟠 achats sur 6 mois mais aussi des ventes récentes (3 mois) · 🔴 ventes récentes
