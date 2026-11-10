@@ -833,6 +833,16 @@ def parse_zonebourse(htmls, name=""):
         f["cyclical"] and not CYCLICAL_ZB.search(f["zb_sector"]) and e0 and e1 and e2 and e0 > 0 and e1 >= 1.10 * e0 and e2 >= 1.10 * e1
         and None not in mg and mg[0] < mg[1] < mg[2]
         and g(ca, N) and g(ca, N + 2) and (g(ca, N + 2) / g(ca, N)) ** 0.5 - 1 >= 0.05)
+    # redressement après une crise (pertes ou BNA quasi nul) dans un secteur non cyclique (santé, services…) : le saut
+    # du BNA vient de la sortie de crise, pas d'un cycle ; le consensus prévoit un BNA qui continue de monter
+    pub = [bna[y] for y in act[-4:] if bna.get(y) is not None]
+    f["recovery"] = bool(
+        f["cyclical"] and f["zb_sector"] and not CYCLICAL_ZB.search(f["zb_sector"]) and pub and e1 and e1 > 0
+        and min(pub[-3:]) <= 0.1 * e1 and (e0 is None or e1 > e0) and (e2 is None or e2 >= 0.95 * e1))
+    if f["recovery"] and not f["turnaround"]:
+        f["turnaround"] = True
+        f["recovery_note"] = (f"redressement après une crise (BNA publiés {', '.join(f'{v:.2f}' for v in pub[-3:])}, "
+                              f"consensus N+1 {e1:.2f}) dans un secteur non cyclique : non classé cyclique")
     if f["turnaround"]:
         f["cyclical"] = False
     # croissance du CA (dernier exercice publié -> N+2) : plafonne la croissance du DCF
@@ -1682,6 +1692,13 @@ def implied_growth(fcf, price, shares, tg, ke):
     return (lo + hi) / 2
 
 
+def near_zero_base(f):
+    """BNA de départ quasi nul ou négatif (sortie de pertes) : une croissance en % n'a pas de sens."""
+    e_last = f.get("eps_ttm")
+    e1 = f.get("eps_next_y")
+    return bool(e1 and e1 > 0 and (e_last is None or e_last <= 0.1 * e1)) or (f.get("eps_5y") or 0) > 100
+
+
 def fair_value(f, p):
     if f.get("bank"):
         return fair_value_bank(f, p)
@@ -1689,13 +1706,18 @@ def fair_value(f, p):
     g5, capped = growth_expected(f)
     if capped:
         out["notes"].append(f"croissance du BNA ramenée à {g5:.0f} % (CA + 10 points ; consensus 5 ans "
-                            + (f"{f['eps_5y']:.0f} %)" if f.get("eps_5y") is not None else "absent, 8 % par défaut)"))
+                            + ("non significatif : BNA de départ quasi nul)" if near_zero_base(f) else
+                               f"{f['eps_5y']:.0f} %)" if f.get("eps_5y") is not None else "absent, 8 % par défaut)"))
     out["_alerts"] = []
+    if f.get("recovery_note"):
+        out["notes"].append(f["recovery_note"])
     if f.get("spin_note"):
         out["notes"].append(f["spin_note"])
     if f.get("spin_short"):
         out["_alerts"].append("⚠️ " + f["spin_short"])
-    if f.get("turnaround") and not f.get("cyclical"):
+    if f.get("recovery_note") and not f.get("cyclical"):
+        out["_alerts"].append("ℹ️ redressement après une crise : non classée cyclique")
+    elif f.get("turnaround") and not f.get("cyclical"):
         out["_alerts"].append("ℹ️ redressement durable : non classée cyclique")
         out["notes"].append("redressement durable : bond du BNA mais consensus encore en hausse en N+1 et N+2 (marges et CA "
                             "en progression) → non classée cyclique (correction possible dans « Forcer le classement cyclique »)")
@@ -1724,9 +1746,16 @@ def fair_value(f, p):
                                 f"pages Zonebourse pour un DCF qui intègre le CA attendu de ces investissements")
             out["_alerts"].append("⚠️ DCF non retenu : investissements massifs sans consensus (JV = multiples)")
             res, f = None, dict(f, fcf_hist=[])
+            out["_no_dcf_debt"] = True
         if res and res["central"] <= 0:
-            out["notes"].append("DCF d'entreprise négatif (flux trop faibles ou dette élevée) : non retenu")
-            res = None
+            lev_ = (f["net_debt"] / f["ebitda"] if f.get("net_debt") is not None and f.get("ebitda")
+                    and f["ebitda"] > 0 else None)
+            out["notes"].append("DCF d'entreprise négatif (flux trop faibles ou dette élevée) : non retenu ; pas de DCF "
+                                "simplifié de secours (il ignorerait la dette)")
+            out["_alerts"].append("⚠️ DCF non retenu : " + (f"dette nette {lev_:.1f}× l'EBITDA, " if lev_ else "")
+                                  + "la valeur d'entreprise ne couvre pas la dette dans le DCF (JV = multiples)")
+            res, f = None, dict(f, fcf_hist=[])
+            out["_no_dcf_debt"] = True
     if res:
         out.update({"DCF bas": res["p10"], "DCF": res["central"], "DCF haut": res["p90"],
                     "CMPC (%)": res["wacc"]["wacc"] * 100, "Coût fonds propres (%)": res["wacc"]["ke"] * 100,
@@ -1824,6 +1853,15 @@ def fair_value(f, p):
         if f.get("pe_hist") and not f["cyclical"] and pe > 1.25 * f["pe_hist"]:
             pe = 1.25 * f["pe_hist"]
             out["notes"].append(f"PER cible plafonné à 1,25 × le PER historique ({f['pe_hist']:.1f}x)")
+        lev_ = (f["net_debt"] / f["ebitda"] if f.get("net_debt") is not None and f.get("ebitda") and f["ebitda"] > 0
+                else None)
+        if lev_ and lev_ > 3 and not f["cyclical"]:
+            # actionnaire très endetté : bénéfice plus risqué, multiple plus bas (−10 % par point de dette nette /
+            # EBITDA au-delà de 3, au plus −40 %)
+            k_ = max(0.6, 1 - 0.1 * (lev_ - 3))
+            pe *= k_
+            out["notes"].append(f"PER cible réduit de {(1 - k_) * 100:.0f} % : dette nette {lev_:.1f}× l'EBITDA "
+                                f"(au-delà de 3×, −10 % par point)")
         out.update({"PER bas": eps * pe * 0.85, "PER": eps * pe, "PER haut": eps * pe * 1.15})
         out.setdefault("_mult", {})["PER"] = f"PER cible {pe:.1f}x × {e_lbl.split(' (')[0].split(' —')[0]}"
         out["notes"].append(f"PER cible {pe:.1f}x sur {e_lbl}")
@@ -1882,8 +1920,9 @@ def fair_value(f, p):
         return out
     synthese(out, ("DCF", "PER", "PER hist.", "Comparables"))
     if sum(1 for m in ("DCF", "PER", "PER hist.", "Comparables") if out.get(m)) == 1:
-        out["notes"].append("⚠️ une seule méthode disponible : juste valeur fragile "
-                            "(pour une page Zonebourse, ajoutez l'onglet Finances pour le DCF)")
+        out["notes"].append("⚠️ une seule méthode disponible : juste valeur fragile " + (
+            "(DCF écarté : dette trop élevée)" if out.get("_no_dcf_debt") else
+            "(pour une page Zonebourse, ajoutez l'onglet Finances pour le DCF)"))
     if out.get("JV centrale") and f["price"]:
         out["Écart (%)"] = (out["JV centrale"] / f["price"] - 1) * 100
     precision(out, ("DCF", "PER", "PER hist.", "Comparables"))
@@ -1959,6 +1998,29 @@ def precision(out, methods):
     jv = out.get("JV centrale")
     if jv and len(vals) >= 2:
         out["Dispersion (%)"] = max(abs(v / jv - 1) for v in vals) * 100
+
+
+def gap_causes(f, fv, lev=None):
+    """Raisons probables de l'écart juste valeur / objectif des analystes (fiche à l'écran et export PDF / Word)."""
+    causes = []
+    why = _divergence_causes(f, fv)
+    if why:
+        causes.append("écart entre méthodes : " + why)
+    wv = wacc_effect(f, fv)
+    if wv:
+        causes.append(wv)
+    g5, cap_ = growth_expected(f)
+    if cap_:
+        causes.append(f"croissance du BNA plafonnée à {g5:.0f} % (" + (
+            "consensus en % non significatif : BNA de départ quasi nul" if near_zero_base(f) else
+            f"consensus {f.get('eps_5y') or 0:.0f} %") + ") ; les analystes retiennent souvent la croissance du "
+            "consensus et le BNA N+2")
+    if lev is not None and lev > 3:
+        causes.append(f"endettement : dette nette {lev:.1f}× l'EBITDA déduite de la valeur")
+    if f.get("cyclical"):
+        causes.append("classement cyclique : PER cible 8x, croissance ≤ 5 % (correction possible dans "
+                      "« Forcer le classement cyclique »)")
+    return causes
 
 
 def divergence_txt(f, fv):
@@ -2040,7 +2102,8 @@ def _divergence_causes(f, fv):
                 if ke and ke >= 11:
                     causes.append((3, f"taux d'actualisation élevé ({ke:.1f} %)"))
             elif conv is not None and conv > 1.3:
-                causes.append((3, f"flux libre supérieur aux bénéfices ({conv * 100:.0f} % du résultat)"))
+                causes.append((3, "flux libre très supérieur au bénéfice, quasi nul" if conv > 10 else
+                               f"flux libre supérieur aux bénéfices ({conv * 100:.0f} % du résultat)"))
             causes.append((0.5, "DCF simplifié (fiche seule) : lancez l'analyse complète pour le DCF d'entreprise"))
     if fv.get("_excl") and not causes:
         causes.append((1, "méthode(s) " + ", ".join(fv["_excl"]) + " trop éloignée(s) de la médiane"))
@@ -4043,9 +4106,10 @@ def report_model(f, d, t):
         if f.get("eps_next_y") and f["eps_next_y"] > 0:
             txt += f" L'objectif correspond à un PER de {f['target'] / f['eps_next_y']:.1f}x le BNA N+1."
         B.append(("p", txt))
-        why = _divergence_causes(f, fv)
-        if why:
-            B.append(("p", "Écart entre méthodes : " + why))
+        causes = gap_causes(f, fv, d.get("lev")) if abs(e) > 10 else []
+        if causes:
+            B.append(("p", "Raisons probables de l'écart :"))
+            B.append(("ul", causes))
     else:
         B.append(("p", "Objectif des analystes non disponible."))
     # 8
@@ -4644,23 +4708,8 @@ def render_detail(f, d, t=None, ns=""):
         st.caption(" ".join(txt))
         if f.get("merge_notes"):
             st.caption("Finviz + Zonebourse — " + " · ".join(f["merge_notes"]))
-        why = _divergence_causes(f, fv)
         if abs(e) > 10:
-            causes = []
-            if why:
-                causes.append("écart entre méthodes : " + why)
-            wv = wacc_effect(f, fv)
-            if wv:
-                causes.append(wv)
-            g5, cap_ = growth_expected(f)
-            if cap_:
-                causes.append(f"croissance du BNA plafonnée à {g5:.0f} % (consensus {f.get('eps_5y') or 0:.0f} %) ; "
-                              "les analystes retiennent souvent la croissance du consensus et le BNA N+2")
-            if lev is not None and lev > 3:
-                causes.append(f"endettement : dette nette {lev:.1f}× l'EBITDA déduite de la valeur")
-            if f.get("cyclical"):
-                causes.append("classement cyclique : PER cible 8x, croissance ≤ 5 % (correction possible dans "
-                              "« Forcer le classement cyclique »)")
+            causes = gap_causes(f, fv, lev)
             if causes:
                 st.markdown(_md("Raisons probables de l'écart :\n" + "\n".join(f"- {x}" for x in causes)))
         st.caption("L'objectif des analystes est une comparaison utile, il vise souvent un cours dans 12 mois, "

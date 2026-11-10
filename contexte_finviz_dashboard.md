@@ -77,3 +77,11 @@ signaux.conviction_signal : chaque mouvement du 13F = poids de la ligne dans le 
 allègement x % d'une ligne restée à w % = −w·x/(100−x)), plafond 5 pts par fonds ; 🟢 ≥ +0,5, 🔴 ≤ −0,5, 🟠 compensé,
 ⚪ symbolique. Utilisé dans l'analyse (fiche Dataroma) et le screener investors (case « pondérer par la conviction »,
 fiches Dataroma lues, cache 6 h). Ex. Micron : 🔴 −5,0 pts (Tepper allège 41 % d'une ligne à 15 %).
+
+## Redressements et dette (10/11/2026, cas Clariane)
+- Zonebourse : bond du BNA après pertes / BNA quasi nul dans un secteur non cyclique (hors CYCLICAL_ZB) = redressement
+  (f['recovery']), pas cyclique : PER sur BNA N+1.
+- DCF d'entreprise négatif : DCF écarté, plus de DCF simplifié de secours (il ignorait la dette).
+- PER cible réduit de 10 % par point de dette nette / EBITDA au-delà de 3× (au plus −40 %), valeurs non cycliques.
+- Croissance en % sur base quasi nulle affichée « non significative » ; raisons de l'écart identiques écran / PDF (gap_causes).
+- Clariane : JV 10,2 € -> 4,6 € (objectif analystes 4,7 €). Boeing 108 -> 102 $.
