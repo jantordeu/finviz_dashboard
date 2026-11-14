@@ -26,6 +26,9 @@ matplotlib>=3.8
 # Screener AMF : lecture des déclarations des dirigeants (PDF de l'AMF)
 pypdf>=4.0
 
+# Graphique des cours (section 12 de chaque valeur) : yfinance/data_yfinance.py
+yfinance>=0.2.40
+
 # Indice Fear & Greed (onglet « Fear & Greed »)
 plotly>=5.20
 # anthropic  # facultatif : commentaire automatique de l'onglet Fear & Greed

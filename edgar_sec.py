@@ -72,8 +72,11 @@ def _get(url, timeout=30):
 def _cached_json(url, name, max_age_h):
     p = _path(name)
     if os.path.exists(p) and time.time() - os.path.getmtime(p) < max_age_h * 3600:
-        with gzip.open(p, "rt", encoding="utf-8") as fh:
-            return json.load(fh)
+        try:
+            with gzip.open(p, "rt", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError, EOFError):
+            pass                                       # cache illisible (écriture interrompue) : relu en ligne
     data = _get(url).json()
     with gzip.open(p, "wt", encoding="utf-8") as fh:
         json.dump(data, fh)

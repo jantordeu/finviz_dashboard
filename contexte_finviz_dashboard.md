@@ -130,3 +130,60 @@ NVIDIA 346 -> 302 $, S&P Global (ZB seul) 403 -> 318 $ (PER hist. écarté par l
    ⚠️ Non testé en réel : la SEC est inaccessible depuis la session de développement (proxy) ; testé sur données simulées au format officiel.
 
 ## Carte du portefeuille (11/11/2026) — supprimée à la demande de l'utilisateur (encombrante, peu utile)
+
+## Sociétés comparables : tableau + pairs européens (13/11/2026)
+- `zb_peers` lit le drapeau de chaque ligne (`i.flag__xx`) → `cc` ; `EUROPE_CC`, `CC_NAMES`, `cc_region`. PAGE_PARSE_VERSION 4 (+ `parse_zonebourse_cached(..., version=4)`).
+- `comparables` (branche Zonebourse) : société européenne → seuls les pairs européens, s'il y en a ≥ 3 (sinon tous, noté) ; sociétés US inchangées. `fv["_peers_tab"]` = (lignes, multiples de la société, libellé PER).
+- `peers_rows(fv, f)` : tableau Société / Pays / PER / VE/EBITDA / VE/CA (ou P/FCF Finviz) / Retenu (✓ ou « autre région ») + médiane des retenus + la société ; section 5 (expander « Sociétés comparables (n retenues sur m) ») et PDF.
+- Effets : Bouygues comparables 109,7 → 89,3 € (toujours écartés : Ferrovial 58x, Hochtief 26x, ACS 22x), Engie 45,8 → 34,4 (JV 29,3 → 27,8), Technip Energies 37,4 → 25,9 (JV 45,0 → 42,6), Sanofi 185 → 154 (JV inchangée). ASM, BESI, Siemens Energy, Clariane, Renault, Air France : < 3 pairs européens → tous conservés.
+
+## Screener AMF : sociétés néerlandaises via le registre AFM (13/11/2026)
+- Les sociétés de droit néerlandais du SBF 120 (Airbus, Stellantis, STMicro, Euronext, Pluxee, Technip Energies) déclarent à l'AFM, pas à l'AMF → absentes de la BDIF.
+- Nouveau module `afm_nl.py` : export XML du registre « Transacties leidinggevenden MAR 19 » (`/export.aspx?KeyWords=<nom>&DateFrom=jj-mm-aaaa&DateTill=…&type=0ee836dc-5520-459d-bcf4-a4a689de6614&format=xml` → meldingid, transactiedatum M/D/YYYY, émetteur, déclarant, nom, personne liée, fonction, LEI) puis page de détail `/en/sector/registers/meldingenregisters/transacties-leidinggevenden-mar19-/details?id=<meldingid>` (tableau « Transactions » : Instrument type, ISIN, Transaction category, Transaction type, Stock option program, Trading place, Price, Quantity, Unit ; nombres au format néerlandais 14.363,00).
+- Règles : achat = Verwerving/Aankoop, vente = Vervreemding/Verkoop ; exclus : programme d'options « Ja », instruments performance/restricted/award/option/right/warrant…, non-actions, schenking/verpanding/uitoefening…, prix ou volume nul. Liste en cache 6 h, détails en cache disque définitif (cache_finviz/afm_nl).
+- `_amf_load` (univers SBF 120) : ISIN NL absents de la BDIF → `afm_nl.load_companies` ; jeton « AFM:<ISIN> » ; mêmes colonnes que amf.load_transactions. Luxembourg (CSSF) et Belgique (FSMA) restent listés sous le tableau.
+- ⚠️ Testé sur les pages réelles déposées (Technip Energies) avec réseau simulé : afm.nl inaccessible depuis la session de développement.
+
+## Faux cyclique corrigé : EBIT en hausse régulière (14/11/2026)
+- Palo Alto Networks classée cyclique à tort : BNA comptable 1,60 → 0,40 → 1,54 (amortissements et charges de l'acquisition CyberArk, émission d'actions) → bond > 150 %. EBIT pourtant en hausse chaque année (2,2 → 2,7 → 3,4 → 4,2 → 5,0 Md$).
+- `parse_zonebourse` : `f["ebit_steady"]` = EBIT de L−4 à N+1 (≥ 5 valeurs), positif, jamais en baisse de plus de 5 %, secteur hors CYCLICAL_ZB, hors banque → `cyclical = False` + `steady_note` (note + alerte ℹ️ dans fair_value) ; prioritaire aussi dans la fusion Finviz + Zonebourse.
+- Effet sur les pages déposées : seul PANW change (JV pages Zonebourse 46 → 77 $). Bouygues, Oracle, S&P Global « steady » mais déjà non cycliques.
+
+## Section 12 : graphique des cours via yfinance (14/11/2026)
+- Nouveau dossier `yfinance/` (sans __init__.py, n'écrase pas la bibliothèque yfinance) : `data_yfinance.py` (script de l'utilisateur, inchangé hormis une ligne de docstring ; lancé seul il lit data.txt et écrit data/<TICKER>.csv). Le dashboard le charge par `importlib` (`_yf_module`) et utilise `download()` / `save()` (CSV copiés dans yfinance/data/).
+- `yahoo_symbol(f)` : ticker Finviz pour une valeur US (BRK.B → BRK-B), sinon recherche Yahoo par ISIN (cache 24 h). `yf_history(sym, "2y")` (st.cache_data 1 h) ; `money_flow_index(df, 14)` ; `price_chart` : Plotly 3 panneaux (chandeliers + MM 20 j, volumes colorés hausse/baisse, MFI avec zones 80/20), week-ends masqués.
+- `render_price_chart` (fragment) après « 11. Actualités et sentiment » : choix 3 mois / 6 mois / 1 an / 2 ans (indicateurs calculés sur 2 ans), légende : clôture vs MM20, lecture du MFI. requirements : yfinance>=0.2.40.
+- Testé avec des cours simulés (Yahoo inaccessible depuis la session de développement).
+- Symbole Yahoo (14/11) : recherche Yahoo par ISIN (10 cotations), `pick_yahoo_symbol` : 1) racine du symbole = ticker Zonebourse (STMPA → STMPA.PA, ENR → ENR.DE) ; 2) place préférée selon le pays de l'ISIN (`YAHOO_EXCH` : FR → PAR, NL/LU → PAR puis AMS, DE → GER…) ; 3) première action. Champ « Symbole Yahoo » modifiable dans la section 12 (correction gardée pour la session).
+
+## Simplification de l'interface (14/11/2026)
+- Barre latérale : expander « Réglages de la juste valeur » supprimé (p = DEFAULT_P : hypothèses et scénarios pessimiste/central/optimiste par défaut) ; champ « Forcer le classement cyclique » supprimé.
+- Tableaux Portefeuille et Valeurs à étudier : colonne case à cocher « Cyclique » juste après « Ticker » (à la place du sigle ⟳ dans le ticker) ; `cyc_table` (st.data_editor, seule la case modifiable) → `st.session_state["cyc_ov"]` {ticker: "oui"/"non"}, supprimé quand on revient au classement automatique ; `ov` construit depuis cyc_ov ; légende des corrections sous le tableau. Le screener JV garde ⟳ et son filtre.
+
+## Audit du code et revue de la méthode (14/11/2026, modèle Fable)
+### Corrections appliquées (aucune juste valeur modifiée — vérifié sur 31 valeurs)
+- Caches : `_read_json` (fichier illisible = cache manquant, plus d'erreur pendant 2 h après une écriture interrompue) et `_write_json` (écriture atomique) pour fetch_ticker, complete_online_cached, fiche du screener ; lectures tolérantes dans afm_nl et edgar_sec.
+- `yf_history` : seuls les succès sont mis en mémoire (`_yf_history_cached`) ; après un échec, nouvel essai possible au bout de 2 min (avant : échec gardé 1 h).
+- « Vider le cache » vide aussi grilles Dataroma, AMF, Yahoo (actualités, cours), Fear & Greed, et lève les blocages « _fail_ ».
+- afm_nl : pages de détail lues par 3 en parallèle ; fichier de liste unique par société (avant : un fichier par jour).
+- Affichage DCF : « croissance du CA an 1 » = celle réellement projetée (consensus), note et tableau des scénarios (`res["g1"]`).
+### Constats de méthode NON appliqués (à décider) — mesurés sur 31 valeurs Zonebourse
+- Calibrage : JV/objectif médian 0,80 ; croissance modérée 0,92 ; croissance CA ≥ 12 % 0,67 ; cycliques 0,59.
+- M1 « trou de trésorerie » années 4–7 du DCF : après le consensus, FCFF = NOPAT × (1 − g / RONIC) avec RONIC fixe 11 % → flux quasi nul quand g ≈ 10 % (GE Vernova 10,1 → 0,7 Md$ en année 6, Schneider 7,6 → 3,0 Md€). Variante testée (RONIC observé en fin de consensus, plafonné 50 %, décroissant vers 11 % en année 10) : DCF +5 à +35 % sur les valeurs de croissance, JV/objectif croissance 0,67 → 0,73. Code de la variante : /tmp (à refaire) — remplacer `drv` dans dcfx_project.
+- M2 acquisition en cours d'exercice : CA consensus avec la cible mais dette nette d'avant (Constellation/Calpine : 19,4 Md$ = 55 $/action ; Engie : 16,6 Md€ = 6,8 €/action). Règle proposée : sorties hors flux libre et dividendes en N > 10 % de la capitalisation et dette N > dette L → les ajouter à la dette nette du DCF.
+- M3 cycliques avec consensus : le DCF reprend 3 ans de consensus de pic (SanDisk : JV 1 628 $ par Zonebourse contre 580 $ par Finviz) ; milieu de cycle calculé avec N et N+1 prévus ; historique court → JV à marquer « peu fiable ».
+- M4 chocs de marge des scénarios et du Monte Carlo en points absolus (±2 pts = −29 % d'EBITDA pour Boeing, −3 % pour Broadcom) → fourchettes trop larges pour les faibles marges, trop étroites pour les fortes.
+- M5 date de valeur : DCF daté de la fin du dernier exercice publié, non capitalisé jusqu'à aujourd'hui (≈ +5 % en fin d'année).
+- M6 « précision ±x % » = accord entre méthodes, pas incertitude (SanDisk ±8 %).
+- Lenteur : options Finviz = une requête par échéance (≈ 13 sur 200 jours, 15–20 s par valeur) ; limiter aux mensuelles + 2 hebdomadaires diviserait par ~2 le chargement.
+
+## M1 et M2 appliqués (14/11/2026)
+- M1 `dcfx_project` : après le consensus, RONIC = celui observé en fin de consensus (g / taux de réinvestissement, borné [RONIC long terme ; 50 %], 50 % si flux libre ≥ NOPAT) décroissant linéairement vers max(CMPC + 2 pts, 10 %) en année 10. GE Vernova années 4–7 : 9,8 / 9,1 / 7,9 / 8,7 Md$ (avant : 6,7 / 3,5 / 0,7 / 3,0).
+- M2 `parse_zonebourse` (hors scission) : sorties hors flux libre et dividendes en N = (dette N − dette L) + flux libre N − dividendes N ; si > 10 % de la capitalisation et dette N > dette L → ajoutées à `dcfx["net_debt"]` (`acq_adj`, `acq_note` ; note + alerte ℹ️). Déclenché sur Constellation (19,4 Md$), Engie (16,6 Md€), Air France-KLM (1,5 Md€).
+- Effets (JV) : ASM 748→799, Broadcom 443→506, Coherent 243→279, GE Vernova 585→618, NVIDIA 302→340, Oracle 255→304, Schneider 246→257, Siemens Energy 131→141, Vertiv 202→225, argenx 671→735, Palo Alto 77→82 ; Constellation 265→246, Engie 28→25, Air France 28→25. JV/objectif médian : croissance 0,67→0,73, croissance modérée 0,92→0,88.
+
+## M3 appliqué : cycliques (14/11/2026)
+- `dcfx_project` : pour une cyclique, une marge du consensus supérieure à la marge de milieu de cycle n'est reprise qu'à moitié (`k_c` = moyenne consensus / milieu de cycle ; flux libre du consensus réduit dans la même proportion ; même décote `k_last` sur le point de départ de l'après-consensus). Consensus sous le milieu de cycle (creux) : inchangé.
+- Cyclique avec moins de 4 exercices publiés : `fv["_low_conf"]`, alerte « ⚠️ juste valeur peu fiable », précision « 🔴 peu fiable (cycle : n exercice(s) publié(s)) », plus de point fort « x % des simulations dépassent le cours ».
+- Effets (pages Zonebourse) : SanDisk 1 633 → 1 507 $ (peu fiable ; 580 $ par le chemin Finviz, inchangé), Seagate 288 → 256 $, First Solar 165 → 157 $, BESI 80 → 79 €, Renault inchangé.
+- Non fait : M4 (chocs de marge relatifs), M5 (date de valeur — voir discussion : capitaliser au coût des fonds propres moins le rendement du dividende depuis la clôture, mois de clôture à lire sur Zonebourse).

@@ -403,6 +403,29 @@ ONLINE_KEYS = ("IA", "BA", "CA", "options", "dataroma", "insiders", "insider_sou
                "edgar")
 
 
+def _read_json(path):
+    """Lecture d'un fichier de cache ; None s'il est absent ou illisible (écriture interrompue…) : il sera refait."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _write_json(path, data):
+    """Écriture atomique (fichier temporaire puis remplacement) : jamais de cache à moitié écrit."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
 def clear_caches():
     """Vide tous les caches : fichiers du dossier de cache, pages lues en mémoire, multiples d'industrie, Reddit."""
     n = 0
@@ -414,11 +437,16 @@ def clear_caches():
                     n += 1
                 except OSError:
                     pass
-    for fn_ in (parse_zonebourse_cached, raws_from_finviz_pages_cached, fetch_apewisdom):
+    # toutes les lectures gardées en mémoire (pages, Reddit, grilles Dataroma, AMF, Yahoo…)
+    for name_ in ("parse_zonebourse_cached", "raws_from_finviz_pages_cached", "fetch_apewisdom", "fund_grid",
+                  "amf_company_tx", "fetch_yahoo_news", "_yf_history_cached", "_inv_load", "_inv_conviction",
+                  "_amf_load", "fetch_fear_greed"):
         try:
-            fn_.clear()
-        except Exception:
+            globals()[name_].clear()
+        except Exception:  # noqa: BLE001
             pass
+    for k_ in [k for k in st.session_state if str(k).startswith("_fail_")]:   # échecs réseau : nouvel essai permis
+        st.session_state.pop(k_, None)
     _IND.update(data=None, t=0.0)
     return n
 
@@ -428,30 +456,29 @@ def complete_online_cached(raw, t, max_days=200, use_cache=True, log=print, open
     pages ne relance pas les téléchargements déjà faits (le cours et la fiche restent ceux de la page)."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     path = os.path.join(CACHE_DIR, f"{t}_complements{'_oi' if openinsider else ''}_{max_days}_v{INS_MERGE_VERSION}.json")
-    if use_cache and os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_HOURS * 3600:
-        with open(path, encoding="utf-8") as fh:
-            raw.update(json.load(fh))
+    hit = (_read_json(path) if use_cache and os.path.exists(path)
+           and time.time() - os.path.getmtime(path) < CACHE_HOURS * 3600 else None)
+    if hit is not None:
+        raw.update(hit)
         dirty = _ensure_edgar(raw, t, log)
         if openinsider and not raw.get("insider_source") and time.time() - raw.get("oi_failed", 0) > 600:
             add_openinsider(raw, t, None, log, openinsider)
             dirty = dirty or bool(raw.get("insider_source"))
         if dirty:
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump({k: raw.get(k) for k in ONLINE_KEYS if k in raw}, fh)
+            _write_json(path, {k: raw.get(k) for k in ONLINE_KEYS if k in raw})
         return raw, True
     complete_online(raw, t, max_days, log, None, openinsider)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump({k: raw.get(k) for k in ONLINE_KEYS if k in raw}, fh)
+    _write_json(path, {k: raw.get(k) for k in ONLINE_KEYS if k in raw})
     return raw, False
 
 
 @st.cache_data(show_spinner=False, max_entries=300)
-def parse_zonebourse_cached(htmls, name=""):
+def parse_zonebourse_cached(htmls, name="", version=4):      # version : à augmenter avec PAGE_PARSE_VERSION
     """Lecture des pages Zonebourse, gardée en mémoire : une page déjà lue (même contenu) n'est pas relue."""
     return parse_zonebourse(list(htmls), name)
 
 
-PAGE_PARSE_VERSION = 3          # à augmenter quand la lecture des pages change (invalide la mémoire)
+PAGE_PARSE_VERSION = 4          # à augmenter quand la lecture des pages change (invalide la mémoire)
 
 
 @st.cache_data(show_spinner=False, max_entries=1000)
@@ -597,24 +624,22 @@ def _news_old(raw):
 def fetch_ticker(t, max_days=200, use_cache=True, log=print, openinsider=True):
     os.makedirs(CACHE_DIR, exist_ok=True)
     path = os.path.join(CACHE_DIR, f"{t}{'_oi' if openinsider else ''}_v{INS_MERGE_VERSION}.json")
-    if use_cache and os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_HOURS * 3600:
-        with open(path, encoding="utf-8") as f:
-            cached = json.load(f)
+    cached = (_read_json(path) if use_cache and os.path.exists(path)
+              and time.time() - os.path.getmtime(path) < CACHE_HOURS * 3600 else None)
+    if cached is not None:
         if not _news_old(cached):
             dirty = _ensure_edgar(cached, t, log)
             if openinsider and not cached.get("insider_source") and time.time() - cached.get("oi_failed", 0) > 600:
                 add_openinsider(cached, t, None, log, openinsider)
                 dirty = dirty or bool(cached.get("insider_source"))
             if dirty:
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(cached, f)
+                _write_json(path, cached)
             return cached
     s = _session()
     raw = {"ticker": t, "fetched": datetime.now().isoformat(timespec="minutes")}
     raw.update(parse_quote(_get(s, f"https://finviz.com/quote.ashx?t={t}&p=d")))
     complete_online(raw, t, max_days, log, s, openinsider)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(raw, f)
+    _write_json(path, raw)
     return raw
 
 
@@ -746,6 +771,23 @@ def zb_stamp(html):
     return (m.group(4), m.group(3), m.group(2), m.group(1)) if m else ("", "", "", "")
 
 
+EUROPE_CC = {"fr", "de", "nl", "be", "lu", "it", "es", "pt", "ie", "at", "ch", "gb", "uk", "se", "no", "dk", "fi",
+             "pl", "gr", "cz", "hu", "is", "mc", "je", "gg", "im", "ro", "si", "sk", "ee", "lv", "lt", "hr", "cy", "mt"}
+CC_NAMES = {"fr": "France", "de": "Allemagne", "nl": "Pays-Bas", "be": "Belgique", "it": "Italie", "es": "Espagne",
+            "pt": "Portugal", "ch": "Suisse", "gb": "Royaume-Uni", "uk": "Royaume-Uni", "se": "Suède", "no": "Norvège",
+            "dk": "Danemark", "fi": "Finlande", "at": "Autriche", "ie": "Irlande", "lu": "Luxembourg", "pl": "Pologne",
+            "us": "États-Unis", "ca": "Canada", "cn": "Chine", "hk": "Hong Kong", "jp": "Japon", "in": "Inde",
+            "kr": "Corée du Sud", "tw": "Taïwan", "au": "Australie", "br": "Brésil", "sa": "Arabie saoudite",
+            "ae": "Émirats arabes unis", "il": "Israël", "sg": "Singapour", "mx": "Mexique", "za": "Afrique du Sud"}
+
+
+def cc_region(cc):
+    """Code pays (drapeau Zonebourse) -> région : Europe, Amérique du Nord, autre pays."""
+    if not cc:
+        return None
+    return "Europe" if cc in EUROPE_CC else "Amérique du Nord" if cc in ("us", "ca") else cc
+
+
 def zb_peers(soups, company=""):
     """Tableau des sociétés comparables de l'onglet Valorisation (colonnes « PER (N) », « VE / CA (N) »,
     « VE / EBITDA (N) », ou « (Y) » sur les pages plus anciennes) -> (pairs, ligne de la société)."""
@@ -771,8 +813,10 @@ def zb_peers(soups, company=""):
                 c = [td.get_text(" ", strip=True) for td in tr.find_all(["th", "td"])]
                 if len(c) <= max(ip, ie) or not c[1] or c[1].startswith("Moyenne"):
                     continue
+                fl = tr.select_one("i[class*=flag__]")
+                cc = next((k.split("__")[1] for k in (fl.get("class") or []) if "__" in k), None) if fl else None
                 rows.append({"name": c[1], "pe": x_(c[ip]), "ev_ebitda": x_(c[ie]),
-                             "ev_sales": x_(c[ic]) if ic is not None and len(c) > ic else None})
+                             "ev_sales": x_(c[ic]) if ic is not None and len(c) > ic else None, "cc": cc})
             if not rows:
                 continue
             key = re.sub(r"[^a-z]", "", company.lower())[:8]
@@ -956,6 +1000,18 @@ def parse_zonebourse(htmls, name=""):
                               f"consensus N+1 {e1:.2f}) dans un secteur non cyclique : non classé cyclique")
     if f["turnaround"]:
         f["cyclical"] = False
+    # résultat d'exploitation (EBIT) en hausse chaque année, publié et prévu, dans un secteur non cyclique : le bond du
+    # BNA vient d'une baisse comptable (amortissement d'une acquisition, charges d'intégration, impôts), pas d'un cycle
+    # (ex. Palo Alto Networks 2026 : BNA 1,60 → 0,40 → 1,54 avec un EBIT 2,7 → 3,4 → 4,2 Md$)
+    eb_s = [(y, _eb[y]) for y in sorted(_eb) if _eb.get(y) is not None and L and L - 4 <= y <= (N or L) + 1]
+    f["ebit_steady"] = bool(len(eb_s) >= 5 and eb_s[0][1] > 0
+                            and all(b >= 0.95 * a for (_, a), (_, b) in zip(eb_s, eb_s[1:]))
+                            and not CYCLICAL_ZB.search(f["zb_sector"]) and not f["bank"])
+    if f["cyclical"] and f["ebit_steady"]:
+        f["cyclical"] = False
+        f["steady_note"] = ("BNA comptable heurté (acquisition, charges non récurrentes, impôts) mais résultat "
+                            f"d'exploitation en hausse chaque année de {eb_s[0][0]} à {eb_s[-1][0]} "
+                            f"({', '.join(f'{v / 1000:.1f}'.replace('.', ',') for _, v in eb_s)} Md) : non classée cyclique")
     # croissance du CA (dernier exercice publié -> N+2) : plafonne la croissance du DCF
     c2 = g(ca, N + 2) or g(ca, N + 1)
     f["sales_cagr"] = ((c2 / g(ca, L)) ** (1 / (3 if g(ca, N + 2) else 2)) - 1) * 100 if c2 and g(ca, L) else None
@@ -982,6 +1038,24 @@ def parse_zonebourse(htmls, name=""):
             f["dcfx"]["src"] += f" — base pro forma {N}"
             if g(net_debt, N) is not None:
                 f["net_debt"] = g(net_debt, N)
+        elif f["dcfx"] and f["dcfx"].get("fc"):
+            # acquisition (ou autre sortie de trésorerie hors flux libre) pendant l'exercice N : le consensus intègre
+            # déjà l'activité achetée, mais la dette nette du dernier exercice publié ne contient pas son prix.
+            # Sorties hors flux libre et dividendes = (dette N − dette L) + flux libre N − dividendes N.
+            ndL, ndN, fN = g(net_debt, L), g(net_debt, N), g(fcf, N)
+            if None not in (ndL, ndN, fN) and f.get("mcap") and shares:
+                out_ = (ndN - ndL) + fN - (g(div, N) or 0.0) * shares
+                if ndN > ndL and out_ > 0.10 * f["mcap"]:
+                    x_ = f["dcfx"]
+                    x_["net_debt"] += out_
+                    x_["debt"] = max(x_["net_debt"], 0.0)
+                    x_["cash"] = max(-x_["net_debt"], 0.0)
+                    x_["acq_adj"] = out_
+                    x_["acq_note"] = (
+                        f"acquisition ou sortie de trésorerie exceptionnelle prévue en {N} : dette nette {L} "
+                        f"{ndL / 1e3:.1f} Md → {N} {ndN / 1e3:.1f} Md malgré un flux libre de {fN / 1e3:.1f} Md ; "
+                        f"{out_ / 1e3:.1f} Md ({out_ / shares:.1f} par action) ajoutés à la dette nette déduite dans "
+                        f"le DCF, le consensus intégrant déjà l'activité acquise").replace(".", ",")
     except Exception:
         f["dcfx"] = None
     return f
@@ -1112,7 +1186,9 @@ def merge_facts(fv, zb):
         f["capex"], f["fcf_hist"] = zb["capex"], zb["fcf_hist"]
     if not f.get("dataroma"):
         f["dataroma"] = {"n": None, "rows": []}
-    f["cyclical"] = bool(fv.get("cyclical") or zb.get("cyclical"))
+    f["cyclical"] = bool(fv.get("cyclical") or zb.get("cyclical")) and not zb.get("steady_note")
+    if zb.get("steady_note"):
+        f["steady_note"] = zb["steady_note"]
     if fv.get("dcfx") and (zb.get("dcfx") or {}).get("fc"):          # DCF Finviz + consensus Zonebourse (CA, marges, capex)
         fc = dict(zb["dcfx"]["fc"])
         revs = fc.get("rev") or []
@@ -1602,13 +1678,22 @@ def dcfx_project(x, g0, dm, wacc, tg, exit_mult, cyclical, g_shift=0.0, years=DC
     ronic = max(wacc + 0.02, 0.10)                  # rentabilité des nouveaux investissements (prudente)
     rev, pv, rows = x["rev0"], 0.0, []
     nf = len(fg)
+    k_last = 1.0                                    # cyclique : décote du dernier flux du consensus (pic)
+    ronic0 = None                                   # RONIC observé en fin de consensus (calculé à la 1re année suivante)
     # après le consensus : la décroissance vers la croissance perpétuelle part au plus de 25 % (même borne que la
     # croissance de l'année 1 sans consensus) — une hyper-croissance prévue sur 3 ans n'est pas prolongée telle quelle
     g_start = min(fg[-1], 0.25) if fg else g0
     for t in range(1, years + 1):
+        k_c = 1.0
         if t <= nf:                                           # années couvertes par le consensus
             g = fg[t - 1] + g_shift * fc_shift
-            m = (fm[t - 1] if fm[t - 1] is not None else m_base) + dm
+            m_c = fm[t - 1] if fm[t - 1] is not None else m_base
+            if cyclical and x["m_hist"] and m_c > m_norm > 0:
+                # valeur cyclique : un consensus au-dessus de la marge de milieu de cycle (pic) n'est repris qu'à
+                # moitié — la juste valeur centrale reste une valeur de milieu de cycle, pas un pari sur le pic
+                k_c = (m_c + m_norm) / 2 / m_c
+                m_c *= k_c
+            m = m_c + dm
             cpx = fcap[t - 1] if t - 1 < len(fcap) and fcap[t - 1] is not None else x["capex0"]
         else:
             base = g0 if not fg else g_start + g_shift
@@ -1616,6 +1701,9 @@ def dcfx_project(x, g0, dm, wacc, tg, exit_mult, cyclical, g_shift=0.0, years=DC
                 base = min(base, 0.05 + g_shift)
             g = base + (tg - base) * (t - nf - 1) / max(years - nf - 1, 1)
             m_last = (fm[-1] if fm and fm[-1] is not None else m_base)
+            if cyclical and fm and x["m_hist"] and m_last > m_norm > 0:
+                k_last = (m_last + m_norm) / 2 / m_last        # même décote que sur les années du consensus
+                m_last *= k_last
             if cyclical:                                      # retour vers la marge médiane du cycle en 4 ans
                 tgt = min(m_norm, m_last) if fm else m_norm     # jamais au-dessus du consensus
                 m_last = m_last + (tgt - m_last) * min(1.0, (t - nf) / 4)
@@ -1632,14 +1720,25 @@ def dcfx_project(x, g0, dm, wacc, tg, exit_mult, cyclical, g_shift=0.0, years=DC
             ocf_t = ocf * (m - dm) / m_base if fm and m_base and m_base > 0 else ocf
             fcff = new * (ocf_t + dm * (ocf_ratio if x["m0"] and x["m0"] > 0 else 1.0)) - new * cpx
         elif t <= nf and t - 1 < len(ffm) and ffm[t - 1] is not None:      # flux libre du consensus
-            fcff = new * (ffm[t - 1] + dm * (x.get("conv") or 0.5))
+            fcff = new * (ffm[t - 1] * k_c + dm * (x.get("conv") or 0.5))
         elif ffm and ffm[-1] is not None:
             # après le consensus : transition sur 3 ans du dernier flux prévu vers le flux « économique »
             # NOPAT × (1 − g / RONIC) (résultat d'exploitation après impôt, moins l'investissement nécessaire à la
             # croissance) — intègre loyers et amortissements, que l'EBITDA × conversion surestime
-            drv = ebit * (1 - x["tax"]) * (1 - max(g, 0.0) / ronic)
+            # Le taux de réinvestissement g / RONIC part de la rentabilité des nouveaux investissements observée
+            # en fin de consensus (plafonnée à 50 %) et rejoint le niveau prudent de long terme en année 10 : avec un
+            # RONIC fixe de 11 %, une croissance de 10 % absorbait presque tout le bénéfice (flux quasi nul en
+            # années 4 à 7 alors que l'EBITDA montait).
+            if ronic0 is None:
+                nop_ = rows[-1]["_nopat"]
+                reinv_ = 1 - rows[-1]["FCFF"] / nop_ if nop_ > 0 else None
+                g_ = rows[-1]["Croissance CA (%)"] / 100
+                ronic0 = (clamp(g_ / reinv_, ronic, 0.5) if reinv_ and reinv_ > 0.02 and g_ > 0
+                          else (0.5 if nop_ > 0 else ronic))
+            r_t = ronic0 + (ronic - ronic0) * (t - nf) / max(years - nf, 1)
+            drv = ebit * (1 - x["tax"]) * (1 - max(g, 0.0) / r_t)
             a_ = min(1.0, (t - nf) / 3)
-            fcff = (1 - a_) * new * ffm[-1] + a_ * drv
+            fcff = (1 - a_) * new * ffm[-1] * k_last + a_ * drv
         elif x.get("conv") is not None:                                    # EBITDA × conversion observée / prévue
             fcff = ebitda * x["conv"]
         else:
@@ -1691,7 +1790,7 @@ def dcf_entreprise(f, p, x, g_rev, mc_n=2000):
         r = dcfx_project(x, g_rev + dg, dm_, w, tg, exit_mult, cyc, g_shift=dg)
         v_p, v_x = r["eq_perp"] / sh, r["eq_exit"] / sh
         v = (v_p + v_x) / 2
-        scen.append({"Scénario": name, "Poids": wgt, "Croissance CA an 1 (%)": (g_rev + dg) * 100,
+        scen.append({"Scénario": name, "Poids": wgt, "Croissance CA an 1 (%)": r["rows"][0]["Croissance CA (%)"],
                      "Écart de marge (pts)": dm_ * 100, "Valeur / action (croiss. perpétuelle)": v_p,
                      "Valeur / action (multiple de sortie)": v_x, "Valeur / action": v,
                      "Valeur terminale (% VE)": (r["tv_share"] or 0) * 100, "_rows": r["rows"]})
@@ -1716,6 +1815,7 @@ def dcf_entreprise(f, p, x, g_rev, mc_n=2000):
             "p90": float(np.percentile(vals, 90)),
             "prob_up": float((vals > pr).mean() * 100) if pr else None,
             "scen": scen, "wacc": wc, "tg": tg, "exit_mult": exit_mult, "g_rev": g_rev,
+            "g1": base["_rows"][0]["Croissance CA (%)"] / 100,      # croissance de l'année 1 du scénario central
             "gap_tv": abs(base["Valeur / action (croiss. perpétuelle)"] / base["Valeur / action (multiple de sortie)"] - 1)
             if base["Valeur / action (multiple de sortie)"] > 0 else None,
             "src": x["src"], "x": x}
@@ -1849,6 +1949,9 @@ def comparables(f, p, eps_mid=None):
     nd = f.get("net_debt") or 0.0
     if len(pr) >= 3:
         base, n = "Finviz", len(pr)
+        peer_tab = [{"Société": x["ticker"], "Pays": "", "PER": x.get("fpe"), "VE/EBITDA": x.get("ev_ebitda"),
+                     "P/FCF": x.get("pfcf"), "Retenu": "✓"} for x in pr]
+        reg_note = ""
         pe_l = [x["fpe"] for x in pr if 0 < x["fpe"] < 80]
         ev_l = [x["ev_ebitda"] for x in pr if x.get("ev_ebitda") and 0 < x["ev_ebitda"] < 40]
         pf_l = [x["pfcf"] for x in pr if x.get("pfcf") and 0 < x["pfcf"] < 80]
@@ -1857,6 +1960,18 @@ def comparables(f, p, eps_mid=None):
         self_pe, self_ev = f.get("fwd_pe"), (f.get("dcfx") or {}).get("ev_ebitda")
         lbl_pe = "PER prév."
     elif len(zp) >= 3:
+        reg = cc_region((f.get("zb_self") or {}).get("cc"))
+        reg = reg if reg == "Europe" else None          # société européenne : pairs européens seulement
+        same = [x for x in zp if reg and cc_region(x.get("cc")) == reg]
+        reg_note = ""
+        if reg and len(same) >= 3 and len(same) < len(zp):
+            reg_note = f" ; pairs de la même région ({reg}) seulement : {len(same)} sur {len(zp)}"
+            zp = same
+        elif reg and len(same) < len(zp):
+            reg_note = f" ; moins de 3 pairs de la même région ({reg}) : tous conservés"
+        peer_tab = [{"Société": x["name"].title(), "Pays": CC_NAMES.get(x.get("cc"), (x.get("cc") or "").upper()),
+                     "PER": x.get("pe"), "VE/EBITDA": x.get("ev_ebitda"), "VE/CA": x.get("ev_sales"),
+                     "Retenu": "✓" if x in zp else "autre région"} for x in (f.get("zb_peers") or [])]
         base, n = "Zonebourse", len(zp)
         pe_l = [x["pe"] for x in zp if x.get("pe") and 0 < x["pe"] < 80]
         ev_l = [x["ev_ebitda"] for x in zp if x.get("ev_ebitda") and 0 < x["ev_ebitda"] < 40]
@@ -1881,6 +1996,7 @@ def comparables(f, p, eps_mid=None):
         pe_l = [im["fpe"]] if im.get("fpe") else []
         pf_l = [im["pfcf"]] if im.get("pfcf") else []
         ev_l, eps_c, ebitda_c, names, self_pe, self_ev, lbl_pe = [], f.get("eps_next_y"), None, "", None, None, "PER prév."
+        peer_tab, reg_note = [], ""
     eps_peak = eps_c
     if cyc and eps_mid:
         eps_c = eps_mid
@@ -1944,11 +2060,36 @@ def comparables(f, p, eps_mid=None):
     out = {"mid": avg(parts, 0), "lo": avg(parts, 1), "hi": avg(parts, 2), "label": " · ".join(labels),
            "note": (f"comparables — {n} pairs {base} ({names}) : " if n else f"comparables — moyennes de l'{base} : ")
                    + ", ".join(labels) + " (médianes bornées ; fourchette 1er–3e quartile)"
-                   + (" ; BNA et EBITDA de milieu de cycle" if cyc else "") + ev_note,
-           "pos": " · ".join(pos)}
+                   + (" ; BNA et EBITDA de milieu de cycle" if cyc else "") + ev_note + reg_note,
+           "pos": " · ".join(pos), "tab": peer_tab, "self": {"PER": self_pe, "VE/EBITDA": self_ev},
+           "lbl_pe": lbl_pe}
     if cyc and eps_mid:
         out["peak"] = (avg(peak, 1), avg(peak, 0), avg(peak, 2))
     return out
+
+
+def peers_rows(fv, f):
+    """Tableau des sociétés comparables (pairs retenus et écartés) + médiane des retenus + la société.
+    -> (colonnes, lignes de texte) ou None."""
+    pt = fv.get("_peers_tab")
+    if not pt:
+        return None
+    tab, self_, lbl_pe = pt
+    cols = [c for c in ("Société", "Pays", "PER", "VE/EBITDA", "VE/CA", "P/FCF", "Retenu") if any(c in r for r in tab)]
+    if not any(r.get("Pays") for r in tab):
+        cols.remove("Pays")
+    x_ = lambda v: f"{v:.1f}x".replace(".", ",") if isinstance(v, (int, float)) and v > 0 else "n.s."
+    rows = [[r.get(c) if c in ("Société", "Pays", "Retenu") else x_(r.get(c)) for c in cols] for r in tab]
+    kept = [r for r in tab if r.get("Retenu") == "✓"]
+    med = {c: _med([r[c] for r in kept if isinstance(r.get(c), (int, float)) and 0 < r[c] < 80]) for c in cols
+           if c not in ("Société", "Pays", "Retenu")}
+    rows.append([f"Médiane des {len(kept)} pairs retenus" if c == "Société" else "" if c in ("Pays", "Retenu")
+                 else x_(med.get(c)) for c in cols])
+    sf = {"PER": self_.get("PER"), "VE/EBITDA": self_.get("VE/EBITDA"),
+          "VE/CA": (f.get("zb_self") or {}).get("ev_sales")}
+    rows.append([(company_name(f, 40) or f.get("ticker") or "Société") + " (la société)" if c == "Société"
+                 else "" if c in ("Pays", "Retenu") else x_(sf.get(c)) for c in cols])
+    return [c if c != "PER" else lbl_pe for c in cols], rows
 
 
 def near_zero_base(f):
@@ -1973,6 +2114,13 @@ def fair_value(f, p):
         out["notes"].append(f["long_note"])
     if f.get("recovery_note"):
         out["notes"].append(f["recovery_note"])
+    if (f.get("dcfx") or {}).get("acq_note"):
+        out["notes"].append(f["dcfx"]["acq_note"])
+        out["_alerts"].append("ℹ️ acquisition en cours d'exercice : dette nette du DCF relevée de "
+                              f"{f['dcfx']['acq_adj'] / 1e3:.1f} Md".replace(".", ","))
+    if f.get("steady_note") and not f.get("cyclical"):
+        out["notes"].append(f["steady_note"])
+        out["_alerts"].append("ℹ️ BNA comptable heurté mais EBIT en hausse régulière : non classée cyclique")
     if f.get("spin_note"):
         out["notes"].append(f["spin_note"])
     if f.get("spin_short"):
@@ -1982,7 +2130,7 @@ def fair_value(f, p):
     elif f.get("turnaround") and not f.get("cyclical"):
         out["_alerts"].append("ℹ️ redressement durable : non classée cyclique")
         out["notes"].append("redressement durable : bond du BNA mais consensus encore en hausse en N+1 et N+2 (marges et CA "
-                            "en progression) → non classée cyclique (correction possible dans « Forcer le classement cyclique »)")
+                            "en progression) → non classée cyclique (correction possible avec la case « Cyclique » du tableau)")
     if f.get("low_fpe"):
         out["notes"].append(f"PER prévisionnel {f['fwd_pe']:.1f} < 7 : bénéfices traités comme un haut de cycle")
     # --- 1. DCF d'entreprise (états financiers disponibles) : méthode centrale ---
@@ -2034,7 +2182,7 @@ def fair_value(f, p):
             out["g implicite (%)"], out["g attendue (%)"] = gg[0] * 100, gg[1] * 100
             out["_g5"] = True                         # moyennes sur 5 ans
         out["notes"].append(f"DCF d'entreprise ({res['src']}) : CMPC {res['wacc']['wacc'] * 100:.1f} %, croissance du CA "
-                            f"an 1 {res['g_rev'] * 100:.0f} %, 3 scénarios 25/50/25, valeur terminale moyenne croissance "
+                            f"an 1 {res.get('g1', res['g_rev']) * 100:.0f} %, 3 scénarios 25/50/25, valeur terminale moyenne croissance "
                             f"perpétuelle {res['tg'] * 100:.1f} % / multiple de sortie {res['exit_mult']:.1f}x EBITDA ; "
                             f"fourchette P10–P90 de 2 000 simulations")
         if f.get("cash_unrep") and "reconstruits" in res.get("src", ""):
@@ -2103,7 +2251,14 @@ def fair_value(f, p):
             eps = eps_mid
             out["notes"].append(f"cyclique : multiples appliqués au BNA de milieu de cycle {eps_mid:.2f} (moyenne de "
                                 f"{n_mid} exercices) au lieu du BNA N+1 {out['_eps_peak']:.2f}")
-            if n_pub < 5:
+            if n_pub < 4:
+                out["_low_conf"] = n_pub
+                out["_alerts"].append(f"⚠️ juste valeur peu fiable : {n_pub} exercice(s) publié(s) seulement, le milieu "
+                                      "de cycle n'est pas mesurable")
+                out["notes"].append(f"valeur cyclique à l'historique trop court ({n_pub} exercice(s) publié(s)) : le "
+                                    "bénéfice et la marge de milieu de cycle reposent surtout sur les prévisions — "
+                                    "juste valeur indicative")
+            elif n_pub < 5:
                 out["_alerts"].append(f"ℹ️ historique court ({n_pub} exercices publiés) : milieu de cycle approximatif")
         else:
             eps_mid = None
@@ -2145,6 +2300,8 @@ def fair_value(f, p):
         out["notes"].append(comp["note"])
         if comp.get("pos"):
             out["_peers_txt"] = comp["pos"]
+        if comp.get("tab"):
+            out["_peers_tab"] = (comp["tab"], comp["self"], comp["lbl_pe"])
         if comp.get("peak"):
             out["_comp_peak"] = comp["peak"]
     # --- synthèse ---
@@ -2733,8 +2890,8 @@ def gap_causes(f, fv, lev=None):
         causes.append(f"endettement : dette nette {lev:.1f}× l'EBITDA déduite de la valeur")
     if f.get("cyclical"):
         causes.append(("classement cyclique : PER cible 11x sur le BNA de milieu de cycle" if fv.get("_eps_mid") else
-                       "classement cyclique : PER cible 8x sur le BNA N+1") + ", croissance ≤ 5 % (correction possible dans "
-                      "« Forcer le classement cyclique »)")
+                       "classement cyclique : PER cible 8x sur le BNA N+1") + ", croissance ≤ 5 % (correction possible avec la "
+                      "case « Cyclique » du tableau)")
     return causes
 
 
@@ -2834,6 +2991,8 @@ def precision_txt(fv):
     tail = (" · " + ", ".join(excl) + (" écarté" if len(excl) == 1 else " écartés")) if excl else ""
     if fv.get("_peak_only"):
         return "🔴 multiples du seul BNA de pic" + tail
+    if fv.get("_low_conf") is not None:
+        return f"🔴 peu fiable (cycle : {fv['_low_conf']} exercice(s) publié(s))" + tail
     if fv.get("_mode") == "dcf" and d is not None:
         return ("🟢" if d <= 15 else "🟠" if d <= 35 else "🔴") + f" ±{d:.0f} % (DCF / multiples)" + tail
     if d is None:
@@ -3368,16 +3527,14 @@ def fetch_quote(t, use_cache=True):
     os.makedirs(CACHE_DIR, exist_ok=True)
     path = os.path.join(CACHE_DIR, f"{t}_quote.json")
     if use_cache and os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_HOURS * 3600:
-        with open(path, encoding="utf-8") as f:
-            cached = json.load(f)
-            if not _news_old(cached):
-                return cached
+        cached = _read_json(path)
+        if cached is not None and not _news_old(cached):
+            return cached
     raw = {"ticker": t, "fetched": datetime.now().isoformat(timespec="minutes")}
     s = _session()
     raw.update(parse_quote(_get(s, f"https://finviz.com/quote.ashx?t={t}&p=d", pause=(0.6, 1.2))))
     add_peers(raw, t, s, log=lambda *_: None)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(raw, f)
+    _write_json(path, raw)
     return raw
 
 
@@ -3979,7 +4136,24 @@ def _amf_load(universe):
         missing = [nm[i] for i in lst["isin"] if i not in jm]
         rows = [r for r in rows if r["jeton"] in names]
     tx, diag = amf.load_transactions(rows, os.path.join(CACHE_DIR, "amf"), progress=lambda k, n: bar.progress(
-        0.1 + 0.9 * k / max(n, 1), text=f"Déclarations AMF {k}/{n} (lues une seule fois, puis gardées sur disque)"))
+        0.1 + 0.8 * k / max(n, 1), text=f"Déclarations AMF {k}/{n} (lues une seule fois, puis gardées sur disque)"))
+    if universe == "sbf120":
+        # sociétés de droit néerlandais : déclarations à l'AFM (registre « Transacties leidinggevenden MAR 19 »)
+        nl = [(n_, i_) for n_, i_ in zip(lst["nom"], lst["isin"]) if i_.startswith("NL") and n_ in missing]
+        if nl:
+            import afm_nl
+            try:
+                tx2, diag2, names2, errs2 = afm_nl.load_companies(
+                    nl, TODAY.date() - timedelta(days=366), os.path.join(CACHE_DIR, "afm_nl"),
+                    progress=lambda m: bar.progress(0.95, text=m))
+            except Exception as e:  # noqa: BLE001
+                tx2, diag2, names2, errs2 = pd.DataFrame(), pd.DataFrame(), {}, [f"registre AFM indisponible ({e})"]
+            if not tx2.empty:
+                tx = pd.concat([tx, tx2], ignore_index=True) if not tx.empty else tx2
+            if not diag2.empty:
+                diag = pd.concat([diag, diag2], ignore_index=True) if not diag.empty else diag2
+            names.update(names2)
+            missing = [m_ for m_ in missing if m_ not in names2.values()] + [f"({e_})" for e_ in errs2]
     bar.empty()
     return len(rows), tx, diag, names, missing
 
@@ -3990,12 +4164,12 @@ def render_amf_screener():
     import signaux as sg
     try:
         import amf  # noqa: F401
-        import pypdf  # noqa: F401
+        import pypdf  # noqa: F401 — vérifie seulement que la bibliothèque est installée
     except ImportError as e:
         st.error(f"Module manquant ({e}) : placez amf.py et signaux.py dans le dossier du dashboard et installez "
                  "pypdf (pip install -r requirements.txt).")
         return
-    st.caption("Déclarations des dirigeants et personnes liées (article 19 du règlement MAR) publiées par l'AMF : "
+    st.caption("Déclarations des dirigeants et personnes liées (article 19 du règlement MAR) publiées par l'AMF (et par l'AFM pour les sociétés néerlandaises du SBF 120) : "
                "achats et ventes d'actions sur 12 mois. Actions gratuites ou de performance, options, conversions, "
                "nantissements, donations, parts de FCPE et droits de souscription sont exclus.")
     with st.expander("⚙️ Réglages", expanded="amf_data" not in st.session_state):
@@ -4057,12 +4231,13 @@ def render_amf_screener():
         st.dataframe(show, width="stretch", hide_index=True, height=min(600, 38 + 35 * max(len(show), 1)),
                      column_config=_sig_columns("€") | {
             "Signal": st.column_config.TextColumn(width="medium"),
-            "Dernière déclaration": st.column_config.LinkColumn(display_text="PDF AMF")})
+            "Dernière déclaration": st.column_config.LinkColumn(display_text="Déclaration")})
         st.caption(sg.LEGEND + " Ventes « (mandat) » : faites par un gérant sous mandat de gestion, moins "
                    "parlantes qu'une vente décidée par le dirigeant lui-même.")
         if missing:
-            st.caption("Sans déclaration trouvée sur la base AMF (sociétés étrangères qui déclarent à leur propre "
-                       "régulateur, ou aucune déclaration récente) : " + ", ".join(missing))
+            st.caption("Sans déclaration trouvée sur la base AMF ni le registre AFM (sociétés luxembourgeoises ou "
+                       "belges, qui déclarent à la CSSF ou à la FSMA, ou aucune déclaration récente) : "
+                       + ", ".join(missing))
     with t2:
         if tx.empty:
             st.caption("Aucune transaction retenue.")
@@ -4082,7 +4257,7 @@ def render_amf_screener():
                     "Prix": st.column_config.NumberColumn(format="%.4f"),
                     "Volume": st.column_config.NumberColumn(format="%,.0f"),
                     "Montant": st.column_config.NumberColumn(format="%,.0f"),
-                    "PDF": st.column_config.LinkColumn(display_text="PDF AMF")})
+                    "PDF": st.column_config.LinkColumn(display_text="Déclaration")})
     with t3:
         ok = int((diag["motif"].fillna("") == "").sum()) if not diag.empty else 0
         st.write(f"{n_decl} déclarations sur 12 mois · {len(diag)} opérations lues · {ok} achats/ventes d'actions "
@@ -4330,7 +4505,7 @@ FMT = {
     "Prix d'entrée": st.column_config.NumberColumn(format="%.2f", help="prix d'entrée du fichier de positions"),
     "JV / prix d'entrée (%)": st.column_config.NumberColumn(format="%+.0f %%", help="(JV centrale / prix d'entrée − 1) : positif = acheté sous la juste valeur"),
     "Écart JV (%)": st.column_config.NumberColumn(format="%+.0f %%", help="(JV centrale / cours − 1) : positif = cours sous la juste valeur"),
-    "JV si bénéfices actuels durent": st.column_config.TextColumn(help="Valeurs cycliques (⟳) : la juste valeur centrale est calculée en milieu de cycle (DCF sur la trésorerie moyenne du cycle, multiples sur le BNA moyen publié et prévu). Ici, la même juste valeur si les bénéfices actuels durent (multiples sur le BNA N+1) — l'écart entre les deux mesure le pari sur la durée du cycle. « — » : valeur non cyclique."),
+    "JV si bénéfices actuels durent": st.column_config.TextColumn(help="Valeurs cycliques (case « Cyclique » cochée) : la juste valeur centrale est calculée en milieu de cycle (DCF sur la trésorerie moyenne du cycle, multiples sur le BNA moyen publié et prévu). Ici, la même juste valeur si les bénéfices actuels durent (multiples sur le BNA N+1) — l'écart entre les deux mesure le pari sur la durée du cycle. « — » : valeur non cyclique."),
     "Lecture de l'écart": st.column_config.TextColumn(width="large",
         help="⚠️ / ℹ️ en tête : ajustement important du calcul (scission, flux de trésorerie non représentatifs, DCF non "
              "retenu, redressement durable) — détail dans « 🔍 Détail ». Puis, pour une précision 🟠 / 🔴 : pourquoi le "
@@ -4374,7 +4549,7 @@ def portfolio_facts(raws, zb_store):
 
 
 def label(t, f):
-    return t + (" ⟳" if f["cyclical"] else "")
+    return t
 
 
 def company_name(f, n=32):
@@ -4422,7 +4597,7 @@ def evaluate(facts, p, ov, pf=None):
             jvc = d["fv"].get("JV centrale")
             row = {"Cours": row.pop("Cours"), "Prix d'entrée": entry,
                    "JV / prix d'entrée (%)": (jvc / entry - 1) * 100 if jvc and entry else None, **row}
-        rows.append({"Ticker": label(t, f), "Société": company_name(f), **row})
+        rows.append({"Ticker": label(t, f), "Cyclique": bool(f["cyclical"]), "Société": company_name(f), **row})
         det[t] = (f, d)
     df = pd.DataFrame(rows).sort_values("Écart JV (%)", ascending=False, na_position="last")
     if (df["Devise"] == "USD").all():
@@ -4463,7 +4638,7 @@ def render_dcfx(f, res):
     st.dataframe(scen.round(1), hide_index=True, width="stretch")
     x = res["x"]
     st.caption(f"Hypothèses ({res['src']}) : CA de départ {x['rev0'] / 1e3:.1f} Md, croissance an 1 "
-               f"{res['g_rev'] * 100:.1f} % décroissant jusqu'à {res['tg'] * 100:.1f} % en année 10"
+               f"{res.get('g1', res['g_rev']) * 100:.1f} % décroissant jusqu'à {res['tg'] * 100:.1f} % en année 10"
                + (" (consensus Zonebourse pour les premières années)" if x.get("fc") else "")
                + f" ; marge EBITDA {x['m0'] * 100:.1f} % (médiane historique "
                f"{(_med(x['m_hist']) or x['m0']) * 100:.1f} %) ; capex {x['capex0'] * 100:.1f} % du CA → niveau "
@@ -4646,7 +4821,8 @@ def risk_points(f, d):
         bad.append("super investors : " + si["Résumé"])
     if fv.get("Écart (%)") is not None and fv["Écart (%)"] > 15 and precision_txt(fv).startswith("🟢"):
         good.append(f"juste valeur supérieure au cours de {fv['Écart (%)']:.0f} % avec des méthodes concordantes")
-    if fv.get("Probabilité JV DCF > cours (%)") is not None and fv["Probabilité JV DCF > cours (%)"] >= 75:
+    if (fv.get("Probabilité JV DCF > cours (%)") is not None and fv["Probabilité JV DCF > cours (%)"] >= 75
+            and fv.get("_low_conf") is None):
         good.append(f"{fv['Probabilité JV DCF > cours (%)']:.0f} % des simulations du DCF dépassent le cours")
     return bad[:5], good[:4]
 
@@ -4769,7 +4945,7 @@ def report_model(f, d, t):
                   [[s["Scénario"], _fmt(s["Poids"], 2), _fmt(s["Croissance CA an 1 (%)"]), _fmt(s["Écart de marge (pts)"]),
                     _fmt(s["Valeur / action"]), _fmt(s["Valeur terminale (% VE)"], 0)] for s in res["scen"]]))
         B.append(("p", f"Hypothèses ({res['src']}) : CA de départ {x['rev0'] / 1e3:.1f} Md, croissance an 1 "
-                       f"{res['g_rev'] * 100:.1f} % décroissant jusqu'à {res['tg'] * 100:.1f} % en année 10 ; marge EBITDA "
+                       f"{res.get('g1', res['g_rev']) * 100:.1f} % décroissant jusqu'à {res['tg'] * 100:.1f} % en année 10 ; marge EBITDA "
                        f"{x['m0'] * 100:.1f} % ; impôt {x['tax'] * 100:.0f} % ; valeur terminale : moyenne croissance "
                        f"perpétuelle et multiple de sortie {res['exit_mult']:.1f}x EBITDA ; dette nette "
                        f"{x['net_debt'] / 1e3:.1f} Md déduite."))
@@ -4790,6 +4966,9 @@ def report_model(f, d, t):
         B.append(("table", ["Méthode", "Hypothèse", f"Valeur ({cur})", "Retenue"], rows))
     if fv.get("_peers_txt"):
         B.append(("p", "Par rapport aux pairs : " + fv["_peers_txt"] + "."))
+    pr_ = peers_rows(fv, f)
+    if pr_:
+        B.append(("table", pr_[0], pr_[1]))
     m = [s for s in (f"PER actuel sur N+1 {f['fwd_pe']:.1f}x" if f.get("fwd_pe") else "",
                      f"PER historique médian {f['pe_hist']:.1f}x" if f.get("pe_hist") else "") if s]
     if m:
@@ -5207,6 +5386,187 @@ def news_for(f):
     return [], "", False
 
 
+# ============================================================
+#  GRAPHIQUE DES COURS (Yahoo Finance, script yfinance/data_yfinance.py)
+# ============================================================
+YF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yfinance")
+
+
+def _yf_module():
+    """Charge yfinance/data_yfinance.py (dossier séparé, sans être un paquet : n'interfère pas avec la
+    bibliothèque yfinance installée)."""
+    import importlib.util
+    path = os.path.join(YF_DIR, "data_yfinance.py")
+    if not os.path.exists(path):
+        raise FileNotFoundError("yfinance/data_yfinance.py introuvable à côté du dashboard")
+    spec = importlib.util.spec_from_file_location("data_yfinance", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def yahoo_symbol(f):
+    """Symbole Yahoo : ticker Finviz pour une valeur US (BRK.B -> BRK-B) ; sinon recherche Yahoo par l'ISIN
+    (valeur européenne lue sur Zonebourse : RI.PA, SIE.DE…)."""
+    tk = (f.get("ticker") or "").strip().upper()
+    if f.get("currency", "USD") == "USD" and tk and not f.get("isin", "").startswith(("FR", "NL", "DE", "BE", "IT",
+                                                                                      "ES", "LU", "CH", "GB", "IE")):
+        return tk.replace(".", "-")
+    isin = f.get("isin") or ""
+    if not isin:
+        return tk.replace(".", "-") or None
+    import requests
+
+    def look():
+        for host in ("query1", "query2"):
+            try:
+                r = requests.get(f"https://{host}.finance.yahoo.com/v1/finance/search", timeout=15,
+                                 params={"q": isin, "newsCount": 0, "quotesCount": 10},
+                                 headers={"User-Agent": YAHOO_UA})
+                r.raise_for_status()
+                return pick_yahoo_symbol(r.json().get("quotes") or [], tk, isin)
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+    return _guarded(f"ysym_{isin}_{tk}", look, ttl=86400)
+
+
+# place de cotation préférée selon le pays de l'ISIN (codes « exchange » de Yahoo)
+YAHOO_EXCH = {"FR": ["PAR"], "NL": ["PAR", "AMS"], "LU": ["PAR", "AMS"], "BE": ["BRU", "PAR"], "DE": ["GER", "FRA"],
+              "IT": ["MIL"], "ES": ["MCE"], "PT": ["LIS"], "IE": ["ISE", "PAR"], "CH": ["EBS"], "GB": ["LSE"],
+              "DK": ["CPH"], "SE": ["STO"], "FI": ["HEL"], "NO": ["OSL"], "AT": ["VIE"]}
+
+
+def pick_yahoo_symbol(quotes, tk, isin):
+    """Choix du symbole Yahoo parmi les cotations d'un même ISIN (Paris, Milan, New York…) :
+    1) celui dont la racine est le ticker Zonebourse (STMPA -> STMPA.PA, ENR -> ENR.DE) ;
+    2) sinon la place préférée du pays de l'ISIN (Paris pour une société française ou néerlandaise cotée à Paris…) ;
+    3) sinon la première action proposée."""
+    eq = [q for q in quotes if q.get("quoteType") == "EQUITY" and q.get("symbol")]
+    if not eq:
+        return None
+    base = lambda sy: sy.split(".")[0].upper()
+    tk = (tk or "").upper()
+    for q in eq:
+        if tk and base(q["symbol"]) == tk:
+            return q["symbol"]
+    for ex in YAHOO_EXCH.get(isin[:2], []):
+        for q in eq:
+            if q.get("exchange") == ex:
+                return q["symbol"]
+    return eq[0]["symbol"]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _yf_history_cached(sym, period):
+    """Seuls les succès sont gardés en mémoire (une erreur lève une exception : nouvel essai au prochain affichage)."""
+    mod = _yf_module()
+    try:
+        got, _ = mod.download([sym], period, "1d")
+    except SystemExit as e:                      # yfinance absent (le script s'arrête avec un message)
+        raise RuntimeError(str(e)) from None
+    df = got.get(sym)
+    if df is None or df.empty:
+        raise RuntimeError(f"aucune donnée Yahoo pour {sym}")
+    try:
+        mod.save({sym: df}, mod.OUT_DIR)
+    except Exception:  # noqa: BLE001
+        pass
+    return df
+
+
+def yf_history(sym, period="2y"):
+    """Cours quotidiens ajustés (open, high, low, close, volume) via data_yfinance.download ; copie CSV dans
+    yfinance/data/. -> (DataFrame | None, message d'erreur). Après un échec, pas de nouvel essai pendant 2 minutes."""
+    k = f"_fail_yf_{sym}"
+    if time.time() - st.session_state.get(k, (0, ""))[0] < 120:
+        return None, st.session_state[k][1]
+    try:
+        return _yf_history_cached(sym, period), ""
+    except Exception as e:  # noqa: BLE001
+        msg = str(e) if isinstance(e, (RuntimeError, FileNotFoundError)) else f"{type(e).__name__} : {e}"
+        st.session_state[k] = (time.time(), msg)
+        return None, msg
+
+
+def money_flow_index(df, n=14):
+    """MFI (n jours) : prix typique × volume, flux positifs / négatifs selon la variation du prix typique."""
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    mf = tp * df["volume"]
+    d = tp.diff()
+    pos = mf.where(d > 0, 0.0).rolling(n).sum()
+    neg = mf.where(d < 0, 0.0).rolling(n).sum()
+    return 100 - 100 / (1 + pos / neg.replace(0, np.nan))
+
+
+def price_chart(df, sym, cur=""):
+    """Figure Plotly 3 panneaux : chandeliers + MM20, volumes, MFI 14 (zones 80 / 20)."""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    up = df["close"] >= df["open"]
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6, 0.18, 0.22])
+    fig.add_trace(go.Candlestick(x=df.index, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+                                 name=sym, increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+                                 increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["sma20"], name="MM 20 j", line=dict(color="#f5a623", width=1.6)),
+                  row=1, col=1)
+    fig.add_trace(go.Bar(x=df.index, y=df["volume"], name="Volume", showlegend=False,
+                         marker_color=np.where(up, "rgba(38,166,154,0.6)", "rgba(239,83,80,0.6)")), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["mfi"], name="MFI 14", line=dict(color="#7e57c2", width=1.6)),
+                  row=3, col=1)
+    for lvl, col in ((80, "#ef5350"), (20, "#26a69a")):
+        fig.add_hline(y=lvl, line_dash="dash", line_color=col, line_width=1, row=3, col=1)
+    fig.add_hrect(y0=80, y1=100, fillcolor="#ef5350", opacity=0.07, line_width=0, row=3, col=1)
+    fig.add_hrect(y0=0, y1=20, fillcolor="#26a69a", opacity=0.07, line_width=0, row=3, col=1)
+    fig.update_layout(height=640, margin=dict(t=30, b=10, l=70, r=10), xaxis_rangeslider_visible=False,
+                      legend=dict(orientation="h", y=1.02, x=0), hovermode="x unified")
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    fig.update_yaxes(title_text=f"Cours {cur}".strip(), row=1, col=1)
+    fig.update_yaxes(title_text="Volume", row=2, col=1)
+    fig.update_yaxes(title_text="MFI", range=[0, 100], row=3, col=1)
+    return fig
+
+
+def render_price_chart(f, ns=""):
+    @st.fragment
+    def _inner():
+        auto = yahoo_symbol(f) or ""
+        key = f"ysym_fix_{f.get('isin') or f.get('ticker')}"
+        c1, c2 = st.columns([1, 3])
+        sym = c1.text_input("Symbole Yahoo", value=st.session_state.get(key, auto), key=f"{key}_{ns}",
+                            help="Trouvé automatiquement (ticker US, ou ISIN + place de cotation) ; corrigez-le si "
+                                 "besoin, par exemple STMPA.PA pour STMicroelectronics à Paris.").strip().upper()
+        if sym and sym != auto:
+            st.session_state[key] = sym              # correction gardée pour la session
+        if not sym:
+            st.caption("Graphique indisponible : symbole Yahoo Finance introuvable (ni ticker US ni ISIN).")
+            return
+        per = c2.radio("Période", ["3 mois", "6 mois", "1 an", "2 ans"], index=1, horizontal=True,
+                       key=f"chart_per_{ns}_{sym}")
+        with st.spinner(f"Cours Yahoo Finance ({sym})…"):
+            df, err = yf_history(sym, "2y")
+        if df is None:
+            st.caption(f"Graphique indisponible ({err}).")
+            return
+        df = df.copy()
+        df["sma20"] = df["close"].rolling(20).mean()          # indicateurs calculés sur 2 ans, puis période affichée
+        df["mfi"] = money_flow_index(df)
+        days = {"3 mois": 92, "6 mois": 183, "1 an": 366, "2 ans": 731}[per]
+        view = df[df.index >= df.index.max() - pd.Timedelta(days=days)]
+        cur = {"USD": "$", "EUR": "€"}.get(f.get("currency"), f.get("currency") or "")
+        st.plotly_chart(price_chart(view, sym, cur), width="stretch", config={"displayModeBar": False})
+        last = df.iloc[-1]
+        mfi = last["mfi"]
+        mfi_txt = ("n.d." if pd.isna(mfi) else f"{mfi:.0f}" + (" : zone de surachat (> 80)" if mfi > 80 else
+                                                              " : zone de survente (< 20)" if mfi < 20 else ""))
+        pos = ("au-dessus" if last["close"] > last["sma20"] else "en dessous") if not pd.isna(last["sma20"]) else "n.d."
+        st.caption(f"{sym} · Yahoo Finance, cours ajustés (dividendes, divisions) au {df.index.max():%d/%m/%Y} · "
+                   f"clôture {last['close']:.2f} {cur}, {pos} de la moyenne mobile 20 jours ({last['sma20']:.2f}) · "
+                   f"Money Flow Index 14 j : {mfi_txt}. Le MFI combine prix et volumes : au-delà de 80 les achats "
+                   "sont jugés excessifs, en dessous de 20 les ventes. Copie CSV dans yfinance/data/.")
+    _inner()
+
+
 def news_recent(f, days=7):
     """Titres des `days` derniers jours, avec le ton et la catégorie d'événement ; résumé 7 j / 30 j."""
     news, src, filt = news_for(f)
@@ -5412,6 +5772,14 @@ def render_detail(f, d, t=None, ns=""):
         st.dataframe(pd.DataFrame(rows).round(1), hide_index=True, width="stretch")
     if fv.get("_peers_txt"):
         st.caption("Par rapport aux pairs : " + fv["_peers_txt"] + ".")
+    pr_ = peers_rows(fv, f)
+    if pr_:
+        n_ok = sum(1 for r in pr_[1][:-2] if r[-1] == "✓")
+        with st.expander(f"Sociétés comparables ({n_ok} retenues sur {len(pr_[1]) - 2})", expanded=False):
+            st.dataframe(pd.DataFrame(pr_[1], columns=pr_[0]), hide_index=True, width="stretch")
+            st.caption("Multiples de l'exercice en cours (pages Zonebourse) ou prévisionnels (Finviz). Pairs Zonebourse : "
+                       "pour une société européenne, seuls les pairs européens sont retenus quand il y en a au moins 3 ; "
+                       "PER > 80x et VE/EBITDA > 40x ignorés dans les médianes.")
     m = []
     if f.get("fwd_pe"):
         m.append(f"PER actuel sur N+1 {f['fwd_pe']:.1f}x")
@@ -5564,6 +5932,9 @@ def render_detail(f, d, t=None, ns=""):
     # ---------- 11. Actualités et sentiment
     st.markdown("##### 11. Actualités et sentiment (7 derniers jours)")
     render_news(dict(f, ticker=f.get("ticker") or tk), ns)
+    # ---------- 12. Graphique (Yahoo Finance)
+    st.markdown("##### 12. Graphique : chandeliers, moyenne mobile 20 jours, volumes et Money Flow Index")
+    render_price_chart(dict(f, ticker=f.get("ticker") or tk), ns)
 
 
 def scenario_values(f, d):
@@ -5626,6 +5997,33 @@ def render_scenarios(f, d):
         st.caption(f"Départ : EBITDA 12 mois {f['ebitda'] / 1e3:.1f} {unit}, capex {cap}, "
                    f"dette nette actuelle {(f['net_debt'] or 0) / 1e3:.1f} {unit} (négatif = trésorerie nette), "
                    f"rachats + dividendes maintenus au rythme actuel.")
+
+
+def cyc_table(df, det, keys, key):
+    """Tableau des résultats ; seule la case « Cyclique » est modifiable : cocher / décocher reclasse la valeur
+    (juste valeur recalculée), revenir au classement automatique supprime la correction."""
+    out = st.data_editor(df, hide_index=True, width="stretch", key=f"cyc_ed_{key}",
+                         column_config=FMT | {"Cyclique": st.column_config.CheckboxColumn(
+                             "Cyclique", help="Coché : valeur cyclique — juste valeur de milieu de cycle (BNA et "
+                                              "trésorerie moyens du cycle, PER normalisé, croissance plafonnée). "
+                                              "Classement automatique, modifiable : cochez ou décochez pour le corriger.")},
+                         disabled=[c for c in df.columns if c != "Cyclique"])
+    ch = out["Cyclique"] != df["Cyclique"]
+    if ch.any():
+        ovs = dict(st.session_state.get("cyc_ov") or {})
+        for _, r in out[ch].iterrows():
+            t = keys.get(r["Ticker"], r["Ticker"])
+            auto = bool(det[t][0].get("cyclical_auto")) if t in det else None
+            if auto is not None and bool(r["Cyclique"]) == auto:
+                ovs.pop(t, None)                     # retour au classement automatique
+            else:
+                ovs[t] = "oui" if r["Cyclique"] else "non"
+        st.session_state["cyc_ov"] = ovs
+        st.rerun()
+    forced = [t for t in (st.session_state.get("cyc_ov") or {}) if t in det]
+    if forced:
+        st.caption("Classement cyclique corrigé à la main : " + ", ".join(
+            f"{t} ({'cyclique' if st.session_state['cyc_ov'][t] == 'oui' else 'non cyclique'})" for t in forced))
 
 
 def detail_and_scenarios(df, det, keys, key):
@@ -5723,47 +6121,7 @@ def main():
         if run and not ups:
             st.warning("Aucune page déposée.")
         st.divider()
-        with st.expander("Réglages de la juste valeur"):
-            n_reset = st.session_state.get("jv_reset", 0)
-
-            def K(name):                          # nouvelle clé après « réinitialiser » -> valeurs par défaut
-                return f"jv_{name}_{n_reset}"
-
-            if st.button("↺ Réinitialiser les réglages", help="Revenir aux valeurs par défaut (et vider le classement cyclique forcé)"):
-                st.session_state["jv_reset"] = n_reset + 1
-                st.session_state["cyc_force"] = ""
-                st.rerun()
-            cyc_txt = st.text_input("Forcer le classement cyclique", key="cyc_force", placeholder="ex. VST:non, MU:oui",
-                                    help="Le classement cyclique (⟳) est automatique. Saisissez TICKER:oui ou TICKER:non "
-                                         "pour le corriger (PER cible 8x et croissance plafonnée si cyclique).")
-            capm = st.checkbox("Taux propre à chaque valeur (CAPM, bêta Finviz)", value=DEFAULT_P["capm"], key=K("capm"),
-                               help="Coût des fonds propres = taux sans risque + bêta × prime de risque du marché")
-            rf = st.slider("Taux sans risque (emprunt d'État 10 ans)", 0.02, 0.06, DEFAULT_P["rf"], 0.0025, key=K("rf"))
-            erp = st.slider("Prime de risque du marché actions", 0.03, 0.08, DEFAULT_P["erp"], 0.0025, key=K("erp"))
-            p = {"capm": capm, "rf": rf, "erp": erp,
-                 "cyc_prem": st.slider("Prime de risque des valeurs cycliques sans bêta", 0.0, 0.06, DEFAULT_P["cyc_prem"], 0.005, key=K("cyc_prem"),
-                                       help="Ajoutée au taux unique pour les valeurs cycliques sans bêta (pages Zonebourse : "
-                                            "automobile, semi-conducteurs…). Les valeurs avec bêta Finviz ne sont pas concernées."),
-                 "wacc": st.slider("Coût des fonds propres (taux unique, valeurs sans bêta)", 0.06, 0.13,
-                                   DEFAULT_P["wacc"], 0.0025, key=K("wacc")),
-                 "w_dcf": st.slider("Poids du DCF dans la juste valeur", 0.0, 1.0, DEFAULT_P["w_dcf"], 0.1, key=K("w_dcf"),
-                                    help="Avec états financiers : JV = poids × DCF d'entreprise + (1 − poids) × multiples"),
-                 "tg": st.slider("Croissance terminale", 0.01, 0.04, DEFAULT_P["tg"], 0.0025, key=K("tg")),
-                 "gcap": st.slider("Plafond de croissance initiale", 0.05, 0.35, DEFAULT_P["gcap"], 0.01, key=K("gcap")),
-                 "pe_base": st.slider("PER de base (croissance 10 %)", 10.0, 30.0, DEFAULT_P["pe_base"], 0.5, key=K("pe_base")),
-                 "pe_min": st.slider("PER minimum", 5.0, 20.0, DEFAULT_P["pe_min"], 0.5, key=K("pe_min")),
-                 "pe_max": st.slider("PER maximum", 15.0, 40.0, DEFAULT_P["pe_max"], 0.5, key=K("pe_max")),
-                 "pe_cyc_mid": st.slider("PER des cycliques sur BNA de milieu de cycle", 6.0, 16.0,
-                                         DEFAULT_P["pe_cyc_mid"], 0.5, key=K("pe_cyc_mid"),
-                                         help="BNA déjà normalisé (moyenne du cycle) : multiple normalisé 10–12x."),
-                 "pe_cyc": st.slider("PER des cycliques sur BNA N+1 (pic possible)", 4.0, 15.0, DEFAULT_P["pe_cyc"], 0.5,
-                                     key=K("pe_cyc"), help="Utilisé quand l'historique ne permet pas de calculer un BNA "
-                                                           "de milieu de cycle."),
-                 "sbc": st.checkbox("Déduire la rémunération en actions du flux libre", value=DEFAULT_P["sbc"], key=K("sbc")),
-                 "coe_bank": st.slider("Banques : coût des fonds propres", 0.08, 0.15, DEFAULT_P["coe_bank"], 0.0025, key=K("coe_bank")),
-                 "pe_bank": st.slider("Banques européennes : PER cible", 5.0, 14.0, DEFAULT_P["pe_bank"], 0.5, key=K("pe_bank")),
-                 "pe_bank_us": st.slider("Banques et courtiers US : PER cible", 8.0, 18.0, DEFAULT_P["pe_bank_us"], 0.5,
-                                         key=K("pe_bank_us"))}
+        p = dict(DEFAULT_P)                       # réglages de la juste valeur : hypothèses par défaut
         with st.expander("🏛️ SEC EDGAR (valeurs US)"):
             use_edgar = st.checkbox("Compléter avec les dépôts SEC (10-K, Form 4)", value=False, key="edgar_on",
                                     help="Historique de 10 exercices pour les valeurs cycliques, nombre d'actions et "
@@ -5777,13 +6135,8 @@ def main():
                          os.path.join(CACHE_DIR, "edgar"))
             if use_edgar and not ES.enabled():
                 st.caption("⚠️ saisissez un nom et une adresse e-mail valides")
-        ov = {}
-        for item in re.split(r"[,;\s]+", cyc_txt or ""):
-            if ":" in item:
-                tk, v = item.split(":", 1)
-                v = v.strip().lower()
-                if v in ("oui", "non", "o", "n", "yes", "no"):
-                    ov[tk.strip().upper()] = {"Cyclique": "oui" if v[0] in "oy" else "non"}
+        # classement cyclique corrigé à la main (case « Cyclique » des tableaux) : {ticker: "oui" / "non"}
+        ov = {t_: {"Cyclique": v_} for t_, v_ in (st.session_state.get("cyc_ov") or {}).items()}
 
     if go:
         raws, errs = {}, []
@@ -5914,8 +6267,8 @@ def main():
             st.info("👈 Chargez votre fichier de positions puis cliquez sur « Récupérer les données ».")
         else:
             df, det, keys = pf_res
-            st.dataframe(df, hide_index=True, width="stretch", column_config=FMT)
-            st.caption("⟳ = valeur cyclique (bénéfices proches d'un pic). 📄 = combinée avec les pages Zonebourse déposées "
+            cyc_table(df, det, keys, "pf")
+            st.caption("Cyclique (case cochée) = juste valeur de milieu de cycle ; cochez ou décochez pour corriger le classement. 📄 = combinée avec les pages Zonebourse déposées "
                        "dans « Valeurs à étudier » (date des pages). Survolez les en-têtes pour la définition des colonnes.")
             memo = st.session_state.setdefault("_eval_memo", {})
             if "pf_xlsx" not in memo:                       # fichier reconstruit seulement si les résultats changent
@@ -5955,7 +6308,7 @@ def main():
                     "puis cliquez sur « Analyser ». « 🗑️ Vider » retire toutes les pages déposées.")
         else:
             df2, det2, keys2 = wl_res
-            st.dataframe(df2, hide_index=True, width="stretch", column_config=FMT)
+            cyc_table(df2, det2, keys2, "wl")
             st.caption("Valeurs Zonebourse : pas d'initiés, de super investors ni de Put/Call (n.d.) ; montants dans la devise de la valeur.")
             st.divider()
             detail_and_scenarios(df2, det2, keys2, "wl")
