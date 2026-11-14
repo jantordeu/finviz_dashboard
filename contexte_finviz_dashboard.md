@@ -187,3 +187,13 @@ NVIDIA 346 -> 302 $, S&P Global (ZB seul) 403 -> 318 $ (PER hist. écarté par l
 - Cyclique avec moins de 4 exercices publiés : `fv["_low_conf"]`, alerte « ⚠️ juste valeur peu fiable », précision « 🔴 peu fiable (cycle : n exercice(s) publié(s)) », plus de point fort « x % des simulations dépassent le cours ».
 - Effets (pages Zonebourse) : SanDisk 1 633 → 1 507 $ (peu fiable ; 580 $ par le chemin Finviz, inchangé), Seagate 288 → 256 $, First Solar 165 → 157 $, BESI 80 → 79 €, Renault inchangé.
 - Non fait : M4 (chocs de marge relatifs), M5 (date de valeur — voir discussion : capitaliser au coût des fonds propres moins le rendement du dividende depuis la clôture, mois de clôture à lire sur Zonebourse).
+
+## CVS Health : faux cyclique sur le chemin Zonebourse (14/11/2026)
+- Bond du BNA > 150 % = cyclique seulement si secteur CYCLICAL_ZB ou EBITDA N ≥ 1,4 × EBITDA L (sinon `steady_note` : dépréciations / charges exceptionnelles). CVS : BNA 1,39 → 7,00, EBITDA 17,1 → 20,7 Md$ → non cyclique ; JV pages Zonebourse 135 $ (82–200), objectif 110, cours 89. Aucune autre des 31 valeurs ne change.
+- Fiche Finviz seule de CVS : JV 205 $ (DCF 245, fourchette 74–419). Causes identifiées, NON corrigées : croissance du CA an 1 de 10,1 % (formule = CA historique + 2,5 pts quand la croissance du BNA est plafonnée ; consensus +2 à +5 %), CMPC 6,8 % (bêta 0,58), choc de marge ±2 pts sur une marge de 4,7 % (scénarios 57 / 231 / 463 $ ; M4), PER cible 19,2x (croissance du BNA depuis une base déprimée) contre 10x pour le marché.
+
+## Trois corrections après le cas CVS (14/11/2026)
+- Rebond ≠ croissance : `rebound_growth(f)` — dernier BNA publié < 60 % du BNA N prévu et un exercice antérieur ≥ 1,5× plus haut → croissance du BNA = N → N+2 par an (Zonebourse) ou N → N+1 (Finviz) ; utilisée par `growth_expected` (PER cible, croissance du CA du DCF Finviz) ; note dans fair_value. Déclenché : CVS (82 → 10 %), Constellation (31 → 15 %), Aptiv, Clariane, Palo Alto, BESI, Renault (les trois derniers sans effet : plafond CA + 10 ou cyclique).
+- Plancher du CMPC : `DEFAULT_P["wacc_min"] = 0.075` dans `wacc_calc` (mention dans « how » quand il joue ; surtout chemin Finviz, bêta bas : CVS 6,8 → 7,5 %).
+- Chocs de marge proportionnels : SCEN = ±10 % de la marge de référence (`margin_ref` : 1re année du consensus, sinon marge actuelle, sinon médiane historique, min 2 %) ; Monte Carlo écart-type 7,5 % de la marge (`MC_MARGIN_SD`). Avant : ±2 pts et 1,5 pt pour tous. Fourchettes : Bouygues 39–79 → 44–74, Boeing 76–140 → 86–130 ; valeurs centrales quasi inchangées.
+- CVS par les pages Zonebourse : JV 128 $ (101–181), objectif 110 $, cours 89 $. Constellation 246 → 223 $.

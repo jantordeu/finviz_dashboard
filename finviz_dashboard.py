@@ -976,7 +976,18 @@ def parse_zonebourse(htmls, name=""):
                           f"bond du BNA {L}→{N} non pris comme signal cyclique")
         f["spin_short"] = f"scission/cession détectée : DCF sur la base pro forma {N}"
         f["eps_this_y_pct"] = None                   # BNA publié et BNA pro forma non comparables
-    f["cyclical"] = bool((f["eps_this_y_pct"] or 0) > 150 or relapse) and not f["bank"]
+    # bond du BNA > 150 % : signal de cycle seulement si l'activité bondit aussi (EBITDA N ≥ 1,4 × le dernier publié) ou
+    # si le secteur est cyclique ; un BNA comptable déprimé par des dépréciations ou des charges exceptionnelles avec un
+    # EBITDA à peu près stable n'est pas un cycle (ex. CVS Health 2025 : BNA 1,39 → 7,00, EBITDA 17,1 → 20,7 Md$)
+    _sec = re.search(r"/secteurs/([a-z0-9\-]+/[a-z0-9\-]+)/", "".join(htmls))
+    _eL, _eN = g(eb, L), g(eb, N)
+    jump_ = (f["eps_this_y_pct"] or 0) > 150 and (
+        bool(_sec and CYCLICAL_ZB.search(_sec.group(1))) or _eL is None or _eN is None or _eL <= 0 or _eN >= 1.4 * _eL)
+    if (f["eps_this_y_pct"] or 0) > 150 and not jump_ and not relapse:
+        f["steady_note"] = (f"bond du BNA comptable ({g(bna, L):.2f} → {g(bna, N):.2f}) sans bond de l'activité (EBITDA "
+                            f"{_eL / 1e3:.1f} → {_eN / 1e3:.1f} Md) : dépréciations ou charges exceptionnelles, non "
+                            "classée cyclique").replace(".", ",")
+    f["cyclical"] = bool(jump_ or relapse) and not f["bank"]
     # exception : redressement / croissance durable — le consensus prévoit encore un BNA en hausse ≥ 10 % par an en
     # N+1 et N+2, une marge d'EBITDA qui progresse jusqu'en N+2 et un CA en croissance ≥ 5 % par an (un pic de cycle
     # se lit au contraire par un BNA qui plafonne ou recule après N)
@@ -1477,7 +1488,19 @@ def wacc_info(f, ke, p):
 #  de sortie, CMPC (WACC), valeur d'entreprise -> valeur des fonds propres, Monte Carlo, sensibilité
 # ============================================================
 DCF_YEARS = 10
-SCEN = (("Pessimiste", 0.25, -0.04, -0.02), ("Central", 0.50, 0.0, 0.0), ("Optimiste", 0.25, 0.04, 0.02))
+# (nom, poids, écart de croissance du CA en points, écart de marge EN PROPORTION de la marge : −10 % / +10 %)
+SCEN = (("Pessimiste", 0.25, -0.04, -0.10), ("Central", 0.50, 0.0, 0.0), ("Optimiste", 0.25, 0.04, 0.10))
+MC_MARGIN_SD = 0.075                    # Monte Carlo : écart-type de la marge = 7,5 % de la marge
+
+
+def margin_ref(x):
+    """Marge d'EBITDA de référence pour les chocs des scénarios : 1re année du consensus, sinon marge actuelle, sinon
+    médiane historique (valeur positive) ; au moins 2 %."""
+    fm = (x.get("fc") or {}).get("m") or []
+    for v in ([fm[0]] if fm and fm[0] is not None else []) + [x.get("m0"), _med(x.get("m_hist") or [])]:
+        if v is not None and v > 0:
+            return max(v, 0.02)
+    return 0.10
 
 
 def _med(xs):
@@ -1651,7 +1674,10 @@ def wacc_calc(f, x, p):
         how += f" + prime d'endettement {add * 100:.1f} pt (dette = {d / e:.1f}× la capitalisation)"
     kd = (p["rf"] + spread) * (1 - x["tax"])
     w = (e * ke + d * kd) / (e + d) if e + d > 0 else ke
-    return {"ke": ke, "kd": kd, "spread": spread, "E": e, "D": d, "wacc": max(w, p["tg"] + 0.03), "how": how}
+    w_min = max(p["tg"] + 0.03, p.get("wacc_min", 0.075))
+    if w < w_min:                                 # bêta très bas ou dette lourde et bon marché : taux plancher
+        how += f" ; CMPC calculé {w * 100:.1f} % relevé au plancher de {w_min * 100:.1f} %"
+    return {"ke": ke, "kd": kd, "spread": spread, "E": e, "D": d, "wacc": max(w, w_min), "how": how}
 
 
 def dcfx_project(x, g0, dm, wacc, tg, exit_mult, cyclical, g_shift=0.0, years=DCF_YEARS, fc_shift=0.5):
@@ -1783,8 +1809,9 @@ def dcf_entreprise(f, p, x, g_rev, mc_n=2000):
     if cyc:
         exit_mult = min(exit_mult, 9.0)   # EBITDA déjà normalisé sur le cycle : 9x (et non 7x, double pénalisation)
     scen, central = [], 0.0
+    m_ref = margin_ref(x)
     for name, wgt, dg, dm in SCEN:
-        dm_ = dm
+        dm_ = dm * m_ref                          # choc proportionnel à la marge (±10 % de la marge)
         if cyc and name == "Pessimiste" and x["m_hist"]:
             dm_ = min(x["m_hist"]) - (_med(x["m_hist"]) or x["m0"])          # creux de cycle
         r = dcfx_project(x, g_rev + dg, dm_, w, tg, exit_mult, cyc, g_shift=dg)
@@ -1802,7 +1829,7 @@ def dcf_entreprise(f, p, x, g_rev, mc_n=2000):
     for _ in range(mc_n):
         dg_ = rng.normal(0, 0.03)
         gg = g_rev + dg_
-        mm = rng.normal(0, 0.015)
+        mm = rng.normal(0, MC_MARGIN_SD * m_ref)
         ww = max(w + rng.normal(0, 0.0075), tg + 0.02)
         tt = rng.uniform(0.015, 0.035)
         tt = min(tt, ww - 0.015)
@@ -1900,10 +1927,33 @@ def industry_multiples(use_cache=True):
     return data
 
 
+def rebound_growth(f):
+    """Rebond du BNA après une année déprimée (charges exceptionnelles, dépréciations) : le dernier BNA publié est
+    inférieur à 60 % du BNA prévu pour l'exercice en cours, alors qu'un exercice antérieur était nettement plus haut
+    (≥ 1,5 fois). Ce rattrapage n'est pas de la croissance : on mesure la croissance APRÈS le rebond — BNA N → N+2
+    par an (pages Zonebourse) ou N → N+1 (Finviz). -> croissance en % ou None (pas de rebond)."""
+    try:
+        pub = [v for _, v, k in _eps_series(f) if k == "publié" and v is not None]
+    except Exception:  # noqa: BLE001
+        return None
+    e0, e1 = f.get("eps_this_y"), f.get("eps_next_y")
+    if len(pub) < 2 or not (e0 and e0 > 0 and e1 and e1 > 0):
+        return None
+    eL, prev = pub[-1], max(pub[:-1])
+    if eL >= 0.6 * e0 or prev <= 0 or prev < 1.5 * max(eL, 0.0):
+        return None
+    z = f.get("zb") or {}
+    e2 = (z.get("bna") or {}).get(z["N"] + 2) if z.get("N") else None
+    return ((e2 / e0) ** 0.5 - 1) * 100 if e2 and e2 > 0 else (e1 / e0 - 1) * 100
+
+
 def growth_expected(f):
     """Croissance du BNA retenue (%) : BNA à 5 ans du consensus, plafonnée à la croissance du CA + 10 points
     (une croissance du BNA calculée depuis une base déprimée ne dure pas)."""
     g5 = f["eps_5y"] if f.get("eps_5y") is not None else 8.0
+    rb = rebound_growth(f)
+    if rb is not None and rb < g5:                    # rebond après une année déprimée : croissance d'après le rebond
+        g5 = rb
     gs = f.get("sales_g")
     if gs is None and f.get("sales_cagr") is not None:
         gs = f["sales_cagr"]
@@ -2109,6 +2159,11 @@ def fair_value(f, p):
                             + ("non significatif : BNA de départ quasi nul)" if near_zero_base(f) else
                                f"{f['eps_5y']:.0f} %)" if f.get("eps_5y") is not None else "absent, 8 % par défaut)"))
     out["_alerts"] = []
+    rb_ = rebound_growth(f)
+    if rb_ is not None and (f.get("eps_5y") is None or rb_ < f["eps_5y"]) and not f.get("cyclical"):
+        out["notes"].append(f"rebond du BNA après un exercice déprimé (charges exceptionnelles) : ce rattrapage n'est pas "
+                            f"compté comme de la croissance — croissance retenue {rb_:.0f} %/an, celle prévue après le "
+                            "rebond")
     if f.get("cyclical") and f.get("dcfx_long") and not f.get("zb"):
         f = dict(f, dcfx=f["dcfx_long"], eps_hist_long=f["eps_hist_long_all"])
         out["notes"].append(f["long_note"])
@@ -2120,7 +2175,7 @@ def fair_value(f, p):
                               f"{f['dcfx']['acq_adj'] / 1e3:.1f} Md".replace(".", ","))
     if f.get("steady_note") and not f.get("cyclical"):
         out["notes"].append(f["steady_note"])
-        out["_alerts"].append("ℹ️ BNA comptable heurté mais EBIT en hausse régulière : non classée cyclique")
+        out["_alerts"].append("ℹ️ BNA comptable heurté sans cycle d'activité : non classée cyclique")
     if f.get("spin_note"):
         out["notes"].append(f["spin_note"])
     if f.get("spin_short"):
@@ -4494,7 +4549,7 @@ def analyze(f, p, ov=None):
 
 DEFAULT_P = {"wacc": 0.09, "tg": 0.025, "gcap": 0.15, "pe_base": 18.0, "pe_min": 10.0, "pe_max": 28.0,
              "pe_cyc": 8.0, "pe_cyc_mid": 11.0, "sbc": True, "coe_bank": 0.11, "pe_bank": 8.5, "pe_bank_us": 12.0,
-             "capm": True, "rf": 0.043, "erp": 0.05, "cyc_prem": 0.03, "w_dcf": 0.5}
+             "capm": True, "rf": 0.043, "erp": 0.05, "cyc_prem": 0.03, "w_dcf": 0.5, "wacc_min": 0.075}
 
 
 # ============================================================
@@ -4645,7 +4700,7 @@ def render_dcfx(f, res):
                f"d'entretien ; impôt {x['tax'] * 100:.0f} % ; rémunération en actions déduite. Valeur terminale : "
                f"moyenne croissance perpétuelle et multiple de sortie {res['exit_mult']:.1f}x EBITDA. "
                f"Valeur des fonds propres = valeur d'entreprise − dette nette ({x['net_debt'] / 1e3:.1f} Md) "
-               f"− minoritaires. Pessimiste / optimiste : croissance ± 4 pts, marge ± 2 pts (creux de cycle si "
+               f"− minoritaires. Pessimiste / optimiste : croissance ± 4 pts, marge ± 10 % de la marge (creux de cycle si "
                f"cyclique) ; pondération 25 / 50 / 25 ; P10–P90 : 2 000 tirages (croissance, marge, CMPC, "
                f"croissance perpétuelle, multiple).")
     with st.expander("Projection du scénario central (10 ans)"):
@@ -6377,7 +6432,7 @@ une société qui convertit peu d'EBITDA en trésorerie ne vaut pas un multiple 
 pour les premières années, puis transition vers le flux « économique » NOPAT × (1 − g / RONIC) — résultat d'exploitation après
 impôt moins l'investissement nécessaire à la croissance (RONIC = CMPC + 2 pts, 10 % au moins) — qui intègre loyers et
 amortissements ; même formule pour la valeur perpétuelle. Valeur d'entreprise − dette nette − minoritaires = valeur des fonds propres.
-Trois scénarios (pessimiste / central / optimiste, croissance ± 4 pts, marge ± 2 pts, creux de cycle si cyclique) pondérés
+Trois scénarios (pessimiste / central / optimiste, croissance ± 4 pts, marge ± 10 % de la marge, creux de cycle si cyclique) pondérés
 25 / 50 / 25 ; fourchette P10–P90 d'une simulation de Monte Carlo (2 000 tirages). JV = 50 % DCF + 50 % médiane des multiples
 (réglable) ; précision = écart DCF / multiples. Sans états financiers (fiche seule) : ancien DCF simplifié et médiane des méthodes.
 
