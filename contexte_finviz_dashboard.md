@@ -197,3 +197,14 @@ NVIDIA 346 -> 302 $, S&P Global (ZB seul) 403 -> 318 $ (PER hist. écarté par l
 - Plancher du CMPC : `DEFAULT_P["wacc_min"] = 0.075` dans `wacc_calc` (mention dans « how » quand il joue ; surtout chemin Finviz, bêta bas : CVS 6,8 → 7,5 %).
 - Chocs de marge proportionnels : SCEN = ±10 % de la marge de référence (`margin_ref` : 1re année du consensus, sinon marge actuelle, sinon médiane historique, min 2 %) ; Monte Carlo écart-type 7,5 % de la marge (`MC_MARGIN_SD`). Avant : ±2 pts et 1,5 pt pour tous. Fourchettes : Bouygues 39–79 → 44–74, Boeing 76–140 → 86–130 ; valeurs centrales quasi inchangées.
 - CVS par les pages Zonebourse : JV 128 $ (101–181), objectif 110 $, cours 89 $. Constellation 246 → 223 $.
+
+## Profil de volume dans le graphique (15/11/2026)
+- `volume_profile(df, bins=40)` : volume de chaque séance réparti uniformément entre plus bas et plus haut, part acheteuse = (clôture − bas) / (haut − bas) (Yahoo quotidien : pas de volumes bid/ask réels) ; renvoie niveaux, volumes acheteur/vendeur, prix le plus traité.
+- `price_chart` : grille 3 × 2, profil en barres horizontales empilées à gauche des chandeliers (même axe de prix), ligne pointillée du prix le plus traité ; recalculé pour la période choisie (3 mois … 2 ans), pas lors d'un zoom à la souris.
+- Profil de volume, version 2 (15/11) : couleur selon le sens de la séance (clôture ≥ ouverture = volume à la hausse, vert ; sinon à la baisse, rouge) ; zone de valeur = niveaux contigus autour du prix le plus traité concentrant 70 % du volume (couleurs vives dedans, atténuées dehors ; bande grise sur les chandeliers) ; la légende indique les bornes de la zone et la position du cours. `volume_profile` renvoie 7 valeurs.
+- Graphique : période « 3 ans » ajoutée (téléchargement 3y) ; testé sur 767 séances réelles de Sanofi fournies par l'utilisateur (prix le plus traité 85,69 € ; zone de valeur 74,89–93,40 € = 70 % du volume).
+
+## Symbole Yahoo des valeurs européennes (16/11/2026)
+- Problème signalé sur Sanofi (cause exacte inconnue : la fiche PDF ne contient pas le message). Nouvelle résolution `yahoo_candidates(f)`, sans dépendre de la recherche Yahoo : valeur en USD → ticker ; sinon 1) table `yfinance/tickers_sbf120.csv` (fichier de l'utilisateur, colonnes Ticker,Entreprise, BOM géré ; correspondance par code Zonebourse + nom, sinon nom), 2) recherche Yahoo par ISIN seulement si la table ne donne rien, 3) code Zonebourse + suffixes du pays de l'ISIN (`YF_SUFFIX` : FR .PA ; NL .AS/.PA/.BR ; DE .DE…).
+- `render_price_chart` essaie les candidats dans l'ordre jusqu'à obtenir des cours, retient celui qui marche (session), et affiche chaque essai et son erreur en cas d'échec.
+- Ne pas confondre avec `sbf120.csv` à la racine (nom;isin, screener AMF).

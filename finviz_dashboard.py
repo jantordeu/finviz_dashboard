@@ -5460,30 +5460,92 @@ def _yf_module():
     return mod
 
 
-def yahoo_symbol(f):
-    """Symbole Yahoo : ticker Finviz pour une valeur US (BRK.B -> BRK-B) ; sinon recherche Yahoo par l'ISIN
-    (valeur européenne lue sur Zonebourse : RI.PA, SIE.DE…)."""
-    tk = (f.get("ticker") or "").strip().upper()
-    if f.get("currency", "USD") == "USD" and tk and not f.get("isin", "").startswith(("FR", "NL", "DE", "BE", "IT",
-                                                                                      "ES", "LU", "CH", "GB", "IE")):
-        return tk.replace(".", "-")
-    isin = f.get("isin") or ""
-    if not isin:
-        return tk.replace(".", "-") or None
-    import requests
+_YF_STOP = {"sa", "se", "nv", "plc", "ag", "spa", "groupe", "group", "compagnie", "de", "du", "la", "le", "les", "et",
+            "societe", "holding", "holdings", "inc", "corp", "corporation", "co", "ltd", "the", "and"}
+YF_SUFFIX = {"FR": [".PA"], "NL": [".AS", ".PA", ".BR"], "BE": [".BR", ".PA"], "DE": [".DE"], "IT": [".MI"],
+             "ES": [".MC"], "PT": [".LS"], "CH": [".SW"], "GB": [".L"], "IE": [".IR", ".L"], "DK": [".CO"],
+             "SE": [".ST"], "FI": [".HE"], "NO": [".OL"], "AT": [".VI"], "LU": [".PA", ".AS"]}
 
-    def look():
-        for host in ("query1", "query2"):
-            try:
-                r = requests.get(f"https://{host}.finance.yahoo.com/v1/finance/search", timeout=15,
-                                 params={"q": isin, "newsCount": 0, "quotesCount": 10},
-                                 headers={"User-Agent": YAHOO_UA})
-                r.raise_for_status()
-                return pick_yahoo_symbol(r.json().get("quotes") or [], tk, isin)
-            except Exception:  # noqa: BLE001
-                continue
+
+def _name_tokens(name):
+    import unicodedata
+    t = unicodedata.normalize("NFKD", str(name or "")).encode("ascii", "ignore").decode().lower()
+    return {w for w in re.findall(r"[a-z0-9]+", t) if w not in _YF_STOP and len(w) > 1}
+
+
+@st.cache_data(show_spinner=False)
+def yahoo_ticker_table(mtime=0.0):
+    """Table des symboles Yahoo fournie par l'utilisateur : yfinance/tickers_sbf120.csv (colonnes Ticker,Entreprise ;
+    modifiable, d'autres valeurs peuvent y être ajoutées). -> [(symbole, mots du nom)]."""
+    path = os.path.join(YF_DIR, "tickers_sbf120.csv")
+    try:
+        df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
+    except Exception:  # noqa: BLE001
+        return []
+    cols = {c.lower().strip(): c for c in df.columns}
+    ct, cn = cols.get("ticker"), cols.get("entreprise") or cols.get("nom") or cols.get("name")
+    if not ct or not cn:
+        return []
+    return [(str(r[ct]).strip().upper(), _name_tokens(r[cn])) for _, r in df.iterrows() if str(r[ct]).strip()]
+
+
+def _table_symbol(tk, name):
+    """Symbole Yahoo d'après la table : même code que Zonebourse (SAN -> SAN.PA) et nom compatible, sinon nom seul."""
+    path = os.path.join(YF_DIR, "tickers_sbf120.csv")
+    rows = yahoo_ticker_table(os.path.getmtime(path) if os.path.exists(path) else 0.0)
+    nt = _name_tokens(name)
+    if not rows:
         return None
-    return _guarded(f"ysym_{isin}_{tk}", look, ttl=86400)
+    sim = lambda a: bool(a and nt and (a <= nt or nt <= a or len(a & nt) / len(a | nt) >= 0.5))
+    for sym, toks in rows:                             # 1) code identique et nom compatible
+        if tk and sym.split(".")[0] == tk and (sim(toks) or toks & nt):
+            return sym
+    for sym, toks in rows:                             # 2) nom identique ou inclus
+        if sim(toks):
+            return sym
+    return None
+
+
+def yahoo_candidates(f):
+    """Symboles Yahoo à essayer, du plus sûr au moins sûr :
+    valeur US -> ticker Finviz (BRK.B -> BRK-B) ; sinon 1) table yfinance/tickers_sbf120.csv, 2) recherche Yahoo par
+    ISIN (place de cotation du pays), 3) code Zonebourse + suffixe du pays de l'ISIN (SAN + FR -> SAN.PA)."""
+    tk = (f.get("ticker") or "").strip().upper()
+    isin = (f.get("isin") or "").upper()
+    if f.get("currency", "USD") == "USD" and tk:      # cotée en dollars (même avec un ISIN européen : Seagate…)
+        return [tk.replace(".", "-")]
+    out = []
+    t_ = _table_symbol(tk, f.get("name") or f.get("company") or "")
+    if t_:
+        out.append(t_)
+    if isin:
+        import requests
+
+        def look():
+            for host in ("query1", "query2"):
+                try:
+                    r = requests.get(f"https://{host}.finance.yahoo.com/v1/finance/search", timeout=15,
+                                     params={"q": isin, "newsCount": 0, "quotesCount": 10},
+                                     headers={"User-Agent": YAHOO_UA})
+                    r.raise_for_status()
+                    return pick_yahoo_symbol(r.json().get("quotes") or [], tk, isin)
+                except Exception:  # noqa: BLE001
+                    continue
+            raise RuntimeError("recherche Yahoo indisponible")
+        if not out:                                    # la table suffit : pas de requête de recherche
+            y_ = _guarded(f"ysym_{isin}_{tk}", look, ttl=600)
+            if y_:
+                out.append(y_)
+    if tk and isin[:2] in YF_SUFFIX:
+        out += [tk.replace(".", "-") + sfx for sfx in YF_SUFFIX[isin[:2]]]
+    elif tk and not out:
+        out.append(tk.replace(".", "-"))
+    return list(dict.fromkeys(out))
+
+
+def yahoo_symbol(f):
+    c = yahoo_candidates(f)
+    return c[0] if c else None
 
 
 # place de cotation préférée selon le pays de l'ISIN (codes « exchange » de Yahoo)
@@ -5554,39 +5616,114 @@ def money_flow_index(df, n=14):
     return 100 - 100 / (1 + pos / neg.replace(0, np.nan))
 
 
+def volume_profile(df, bins=40):
+    """Profil de volume de la période : volume échangé par niveau de prix, séparé en volume des séances de hausse
+    et des séances de baisse (convention des profils de volume sur données quotidiennes, Yahoo ne donnant pas les
+    transactions au prix offert / demandé) : le volume de chaque séance est réparti uniformément entre son plus bas
+    et son plus haut ; il compte « à la hausse » si la clôture est au moins égale à l'ouverture, « à la baisse » sinon.
+    Zone de valeur : niveaux de prix contigus autour du prix le plus traité qui concentrent 70 % du volume.
+    -> (centres des niveaux, volume à la hausse, volume à la baisse, prix le plus traité, masque de la zone de
+    valeur, bas et haut de la zone de valeur)."""
+    lo, hi = float(df["low"].min()), float(df["high"].max())
+    if not (hi > lo) or df["volume"].sum() <= 0:
+        return None
+    edges = np.linspace(lo, hi, bins + 1)
+    buy, sell = np.zeros(bins), np.zeros(bins)
+    for l_, h_, c_, o_, v_ in zip(df["low"].to_numpy(), df["high"].to_numpy(), df["close"].to_numpy(),
+                                  df["open"].to_numpy(), df["volume"].to_numpy(dtype=float)):
+        if not v_ or np.isnan(v_):
+            continue
+        share = 1.0 if c_ >= o_ else 0.0             # séance de hausse / de baisse
+        if h_ > l_:
+            w = np.clip(np.minimum(edges[1:], h_) - np.maximum(edges[:-1], l_), 0, None) / (h_ - l_)
+        else:
+            w = np.zeros(bins)
+            w[min(int((c_ - lo) / (hi - lo) * bins), bins - 1)] = 1.0
+        buy += v_ * share * w
+        sell += v_ * (1 - share) * w
+    mid = (edges[:-1] + edges[1:]) / 2
+    tot = buy + sell
+    i0 = int(np.argmax(tot))
+    lo_i = hi_i = i0                                  # zone de valeur : on étend du côté le plus chargé jusqu'à 70 %
+    acc, goal = tot[i0], 0.70 * tot.sum()
+    while acc < goal and (lo_i > 0 or hi_i < bins - 1):
+        dn = tot[lo_i - 1] if lo_i > 0 else -1.0
+        up_ = tot[hi_i + 1] if hi_i < bins - 1 else -1.0
+        if up_ >= dn:
+            hi_i += 1
+            acc += up_
+        else:
+            lo_i -= 1
+            acc += dn
+    va = np.zeros(bins, dtype=bool)
+    va[lo_i:hi_i + 1] = True
+    return mid, buy, sell, float(mid[i0]), va, float(edges[lo_i]), float(edges[hi_i + 1])
+
+
 def price_chart(df, sym, cur=""):
-    """Figure Plotly 3 panneaux : chandeliers + MM20, volumes, MFI 14 (zones 80 / 20)."""
+    """Figure Plotly : profil de volume (à gauche, sur la période affichée), chandeliers + MM20, volumes, MFI 14."""
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
     up = df["close"] >= df["open"]
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6, 0.18, 0.22])
+    fig = make_subplots(rows=3, cols=2, shared_xaxes="columns", vertical_spacing=0.03, horizontal_spacing=0.01,
+                        row_heights=[0.6, 0.18, 0.22], column_widths=[0.14, 0.86],
+                        specs=[[{}, {}], [None, {}], [None, {}]])
+    vp = volume_profile(df)
+    if vp:
+        mid, buy, sell, poc, va, val_, vah_ = vp
+        h_ = (mid[1] - mid[0]) * 0.9
+        # couleurs vives dans la zone de valeur (70 % du volume), atténuées en dehors
+        c_up = np.where(va, "rgba(38,166,154,0.90)", "rgba(38,166,154,0.30)")
+        c_dn = np.where(va, "rgba(239,83,80,0.90)", "rgba(239,83,80,0.30)")
+        fig.add_trace(go.Bar(y=mid, x=buy, orientation="h", width=h_, name="Volume à la hausse",
+                             marker_color=c_up, hovertemplate="%{y:.2f} : %{x:,.0f}<extra>séances de hausse</extra>"),
+                      row=1, col=1)
+        fig.add_trace(go.Bar(y=mid, x=sell, orientation="h", width=h_, name="Volume à la baisse",
+                             marker_color=c_dn, hovertemplate="%{y:.2f} : %{x:,.0f}<extra>séances de baisse</extra>"),
+                      row=1, col=1)
     fig.add_trace(go.Candlestick(x=df.index, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
                                  name=sym, increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
-                                 increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350"), row=1, col=1)
+                                 increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350"), row=1, col=2)
     fig.add_trace(go.Scatter(x=df.index, y=df["sma20"], name="MM 20 j", line=dict(color="#f5a623", width=1.6)),
-                  row=1, col=1)
+                  row=1, col=2)
     fig.add_trace(go.Bar(x=df.index, y=df["volume"], name="Volume", showlegend=False,
-                         marker_color=np.where(up, "rgba(38,166,154,0.6)", "rgba(239,83,80,0.6)")), row=2, col=1)
+                         marker_color=np.where(up, "rgba(38,166,154,0.6)", "rgba(239,83,80,0.6)")), row=2, col=2)
     fig.add_trace(go.Scatter(x=df.index, y=df["mfi"], name="MFI 14", line=dict(color="#7e57c2", width=1.6)),
-                  row=3, col=1)
+                  row=3, col=2)
+    if vp:                                           # prix le plus traité de la période (après l'ajout des courbes)
+        fig.add_hline(y=vp[3], line_dash="dot", line_color="#8a8f98", line_width=1, row=1, col=1)
+        fig.add_hline(y=vp[3], line_dash="dot", line_color="#8a8f98", line_width=1, row=1, col=2,
+                      annotation_text=f"prix le plus traité {vp[3]:.2f}", annotation_position="top left",
+                      annotation_font_size=10, annotation_font_color="#555b66",
+                      annotation_bgcolor="rgba(255,255,255,0.85)")
+        fig.add_hrect(y0=vp[5], y1=vp[6], fillcolor="#8a8f98", opacity=0.07, line_width=0, row=1, col=2)
     for lvl, col in ((80, "#ef5350"), (20, "#26a69a")):
-        fig.add_hline(y=lvl, line_dash="dash", line_color=col, line_width=1, row=3, col=1)
-    fig.add_hrect(y0=80, y1=100, fillcolor="#ef5350", opacity=0.07, line_width=0, row=3, col=1)
-    fig.add_hrect(y0=0, y1=20, fillcolor="#26a69a", opacity=0.07, line_width=0, row=3, col=1)
-    fig.update_layout(height=640, margin=dict(t=30, b=10, l=70, r=10), xaxis_rangeslider_visible=False,
-                      legend=dict(orientation="h", y=1.02, x=0), hovermode="x unified")
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-    fig.update_yaxes(title_text=f"Cours {cur}".strip(), row=1, col=1)
-    fig.update_yaxes(title_text="Volume", row=2, col=1)
-    fig.update_yaxes(title_text="MFI", range=[0, 100], row=3, col=1)
+        fig.add_hline(y=lvl, line_dash="dash", line_color=col, line_width=1, row=3, col=2)
+    fig.add_hrect(y0=80, y1=100, fillcolor="#ef5350", opacity=0.07, line_width=0, row=3, col=2)
+    fig.add_hrect(y0=0, y1=20, fillcolor="#26a69a", opacity=0.07, line_width=0, row=3, col=2)
+    fig.update_layout(height=640, margin=dict(t=30, b=10, l=70, r=10), barmode="stack",
+                      legend=dict(orientation="h", y=1.02, x=0), hovermode="closest")
+    fig.update_xaxes(rangeslider_visible=False)
+    for r_ in (1, 2, 3):
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], row=r_, col=2)
+    y_rng = [float(df["low"].min()) * 0.995, float(df["high"].max()) * 1.005]
+    fig.update_yaxes(title_text=f"Cours {cur}".strip(), range=y_rng, row=1, col=1)
+    fig.update_yaxes(range=y_rng, showticklabels=False, matches="y", row=1, col=2)
+    fig.update_xaxes(showticklabels=False, title_text="Profil de volume", title_font_size=11, row=1, col=1)
+    fig.update_yaxes(title_text="Volume", row=2, col=2)
+    fig.update_yaxes(title_text="MFI", range=[0, 100], row=3, col=2)
     return fig
 
 
 def render_price_chart(f, ns=""):
     @st.fragment
     def _inner():
-        auto = yahoo_symbol(f) or ""
+        cands = yahoo_candidates(f)
         key = f"ysym_fix_{f.get('isin') or f.get('ticker')}"
+        ok_key = key + "_ok"                         # symbole qui a déjà fonctionné pour cette valeur
+        if st.session_state.get(ok_key) in cands:
+            cands = [st.session_state[ok_key]] + [c for c in cands if c != st.session_state[ok_key]]
+        auto = cands[0] if cands else ""
         c1, c2 = st.columns([1, 3])
         sym = c1.text_input("Symbole Yahoo", value=st.session_state.get(key, auto), key=f"{key}_{ns}",
                             help="Trouvé automatiquement (ticker US, ou ISIN + place de cotation) ; corrigez-le si "
@@ -5596,17 +5733,29 @@ def render_price_chart(f, ns=""):
         if not sym:
             st.caption("Graphique indisponible : symbole Yahoo Finance introuvable (ni ticker US ni ISIN).")
             return
-        per = c2.radio("Période", ["3 mois", "6 mois", "1 an", "2 ans"], index=1, horizontal=True,
+        per = c2.radio("Période", ["3 mois", "6 mois", "1 an", "2 ans", "3 ans"], index=1, horizontal=True,
                        key=f"chart_per_{ns}_{sym}")
+        tried = []
         with st.spinner(f"Cours Yahoo Finance ({sym})…"):
-            df, err = yf_history(sym, "2y")
+            df, err = yf_history(sym, "3y")
+            if df is None and sym == auto:           # symbole automatique sans données : essais suivants
+                tried.append(f"{sym} : {err}")
+                for alt in cands[1:]:
+                    df, err = yf_history(alt, "3y")
+                    if df is not None:
+                        sym = alt
+                        st.session_state[ok_key] = alt
+                        break
+                    tried.append(f"{alt} : {err}")
         if df is None:
-            st.caption(f"Graphique indisponible ({err}).")
+            st.caption("Graphique indisponible — " + (" ; ".join(tried) if tried else f"{sym} : {err}")
+                       + ". Saisissez le symbole Yahoo ci-dessus (ex. SAN.PA), ou ajoutez la valeur dans "
+                         "yfinance/tickers_sbf120.csv.")
             return
         df = df.copy()
-        df["sma20"] = df["close"].rolling(20).mean()          # indicateurs calculés sur 2 ans, puis période affichée
+        df["sma20"] = df["close"].rolling(20).mean()          # indicateurs calculés sur 3 ans, puis période affichée
         df["mfi"] = money_flow_index(df)
-        days = {"3 mois": 92, "6 mois": 183, "1 an": 366, "2 ans": 731}[per]
+        days = {"3 mois": 92, "6 mois": 183, "1 an": 366, "2 ans": 731, "3 ans": 1097}[per]
         view = df[df.index >= df.index.max() - pd.Timedelta(days=days)]
         cur = {"USD": "$", "EUR": "€"}.get(f.get("currency"), f.get("currency") or "")
         st.plotly_chart(price_chart(view, sym, cur), width="stretch", config={"displayModeBar": False})
@@ -5615,10 +5764,19 @@ def render_price_chart(f, ns=""):
         mfi_txt = ("n.d." if pd.isna(mfi) else f"{mfi:.0f}" + (" : zone de surachat (> 80)" if mfi > 80 else
                                                               " : zone de survente (< 20)" if mfi < 20 else ""))
         pos = ("au-dessus" if last["close"] > last["sma20"] else "en dessous") if not pd.isna(last["sma20"]) else "n.d."
+        vp_ = volume_profile(view)
+        vp_txt = ""
+        if vp_:
+            where = ("au-dessus de" if last["close"] > vp_[6] else "en dessous de" if last["close"] < vp_[5] else "dans")
+            vp_txt = (f", ici de {vp_[5]:.2f} à {vp_[6]:.2f} {cur} : le cours est {where} cette zone "
+                      f"(prix le plus traité {vp_[3]:.2f})")
         st.caption(f"{sym} · Yahoo Finance, cours ajustés (dividendes, divisions) au {df.index.max():%d/%m/%Y} · "
                    f"clôture {last['close']:.2f} {cur}, {pos} de la moyenne mobile 20 jours ({last['sma20']:.2f}) · "
                    f"Money Flow Index 14 j : {mfi_txt}. Le MFI combine prix et volumes : au-delà de 80 les achats "
-                   "sont jugés excessifs, en dessous de 20 les ventes. Copie CSV dans yfinance/data/.")
+                   "sont jugés excessifs, en dessous de 20 les ventes. Profil de volume (à gauche) : volume échangé à "
+                   "chaque niveau de prix sur la période choisie — vert = séances de hausse, rouge = séances de "
+                   "baisse ; couleurs vives = zone de valeur (70 % du volume autour du prix le plus traité)"
+                   + vp_txt + ". Copie CSV dans yfinance/data/.")
     _inner()
 
 
