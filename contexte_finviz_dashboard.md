@@ -231,3 +231,14 @@ Effet sur les 32 fiches : seule Stellantis bouge (JV 12,9 → 6,2 €).
 - Pages Zonebourse du portefeuille : `zb_pages/<slug>/` (lues par `zb_disk_facts`, relues si les fichiers changent), sinon pages déposées (`zb_store`). « Récupérer les données » (automatique à chaque nouveau fichier) lance Finviz puis `zb_start` en arrière-plan ; fin du téléchargement -> relance du dashboard (`zbf_seen`).
 - Rapprochement position ↔ adresse : `zb_fetch.match_position` (colonne ticker, nom identique, préfixe, similarité ≥ 0,88). Adresses manquantes : formulaire dans la barre latérale -> `zb_fetch.add_url` écrit `zonebourse_urls_perso.csv` (nom;url;ticker), jamais dans le zip ; correction d'un rapprochement par le même moyen. `fetch --slugs a,b`.
 - Barre latérale : 1 Portefeuille, 2 Zonebourse (`zb_section`), 3 Valeurs à étudier (pages + « Tickers USA sans page Zonebourse »), 4 Options (OpenInsider et compléments en ligne cochés par défaut, échéances, NYSE, cache), SEC EDGAR. Liste « Tickers » du portefeuille supprimée.
+
+## 18/11 : initiés AFM dans les fiches, état du téléchargement
+- `amf_insiders(isin, name)` : société absente de la base AMF et ISIN « NL » -> registre AFM (`afm_company_tx`, cache 6 h, même calcul de signal) ; source « registre AFM (Pays-Bas) ». Vaut pour le portefeuille et les valeurs à étudier (Adyen, STMicroelectronics…).
+- `zb_status_badge` (fragment 3 s) sous « Récupérer les données » : téléchargement Zonebourse en cours (i/n), terminé à hh:mm, ou interrompu.
+- Encadré des adresses manquantes : Entrée ne valide plus (`enter_to_submit=False`), téléchargement lancé à l'ajout (`zb_new`). Échec Yahoo : pas de nouvel essai pendant 30 min.
+
+## Sociétés sans bénéfice : juste valeur spéculative (18/11)
+- `speculative_value(f, out)` appelé par `fair_value` quand aucune méthode classique ne donne de JV, BNA N+1 ≤ 0, pages Zonebourse avec comparables. Trois méthodes (`SPEC_METHODS`) : « VE/CA » (médiane des comparables × CA N+1), « EBITDA futur » (VE/EBITDA médian × EBITDA de la dernière année prévue, actualisé 11 %), « Marge norm. » (CA prolongé de 2 ans à la croissance du consensus bornée 5–15 %, marge 15 % [12–18], multiple 15, actualisé 11 %) ; dette nette Zonebourse déduite ; réglages dans `SPEC`. JV = médiane (`synthese`), `_spec=True`, alerte « valeur spéculative », précision « 🔴 spéculative ».
+- `_spec_tgt` : multiples que suppose l'objectif des analystes (VE/CA N, N+1, VE/EBITDA dernière année), affiché en section 7 et dans la fiche PDF.
+- `zb["ca"]` (chiffre d'affaires par exercice) ajouté ; PAGE_PARSE_VERSION = 6.
+- Tests : Intuitive Machines 13,9 $ (Zonebourse seul, 177 M d'actions) ou 10,8 $ (combiné Finviz, 228 M d'actions) vs objectif 25,2 ; Redwire 6,2 $ vs 12,3. Les 32 autres fiches inchangées.

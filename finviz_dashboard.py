@@ -441,7 +441,7 @@ def clear_caches():
                     pass
     # toutes les lectures gardées en mémoire (pages, Reddit, grilles Dataroma, AMF, Yahoo…)
     for name_ in ("parse_zonebourse_cached", "raws_from_finviz_pages_cached", "fetch_apewisdom", "fund_grid",
-                  "amf_company_tx", "fetch_yahoo_news", "_yf_history_cached", "_inv_load", "_inv_conviction",
+                  "amf_company_tx", "afm_company_tx", "fetch_yahoo_news", "_yf_history_cached", "_inv_load", "_inv_conviction",
                   "_amf_load", "fetch_fear_greed"):
         try:
             globals()[name_].clear()
@@ -475,12 +475,12 @@ def complete_online_cached(raw, t, max_days=200, use_cache=True, log=print, open
 
 
 @st.cache_data(show_spinner=False, max_entries=300)
-def parse_zonebourse_cached(htmls, name="", version=5):      # version : à augmenter avec PAGE_PARSE_VERSION
+def parse_zonebourse_cached(htmls, name="", version=6):      # version : à augmenter avec PAGE_PARSE_VERSION
     """Lecture des pages Zonebourse, gardée en mémoire : une page déjà lue (même contenu) n'est pas relue."""
     return parse_zonebourse(list(htmls), name)
 
 
-PAGE_PARSE_VERSION = 5          # à augmenter quand la lecture des pages change (invalide la mémoire)
+PAGE_PARSE_VERSION = 6          # à augmenter quand la lecture des pages change (invalide la mémoire)
 
 
 @st.cache_data(show_spinner=False, max_entries=1000)
@@ -922,7 +922,7 @@ def parse_zonebourse(htmls, name=""):
          "buyback": 0.0, "net_debt": g(net_debt, L) if g(net_debt, L) is not None else g(net_debt, N),
          "insiders": None,
          "dataroma": {"n": None, "rows": []}, "ratings": [], "options": [],
-         "zb": {"N": N, "L": L, "bna": bna, "ebitda": eb, "capex": capex, "fcf": fcf, "nd": net_debt,
+         "zb": {"N": N, "L": L, "bna": bna, "ca": ca, "ebitda": eb, "capex": capex, "fcf": fcf, "nd": net_debt,
                 "div": div, "titres": titres, "bvps": bvps, "roe": roe, "rn": rn}}
     f["fx_note"] = fx_note
     st_ = zb_stamp(htmls[0])                       # date de la page la plus récente (en-tête Zonebourse)
@@ -2397,6 +2397,10 @@ def fair_value(f, p):
             out["Écart (%)"] = (out["JV centrale"] / f["price"] - 1) * 100
         return out
     synthese(out, ("DCF", "PER", "PER hist.", "Comparables"))
+    if not out.get("JV centrale"):                   # société sans bénéfice : méthodes sur le CA et l'EBITDA prévus
+        speculative_value(f, out)
+        if out.get("_spec"):
+            return out
     if sum(1 for m in ("DCF", "PER", "PER hist.", "Comparables") if out.get(m)) == 1:
         out["notes"].append("⚠️ une seule méthode disponible : juste valeur fragile " + (
             "(DCF écarté : dette trop élevée)" if out.get("_no_dcf_debt") else
@@ -2434,6 +2438,35 @@ def zb_fetch_progress(log_path):
             st.warning("Connexion abonné non confirmée : utilisez « 🔑 Connexion » puis relancez.")
         elif lines:
             st.caption("Téléchargement terminé.")
+
+
+@st.fragment(run_every=3)
+def zb_status_badge():
+    """Sous « Récupérer les données » : état du téléchargement Zonebourse (en cours i/n, terminé à hh:mm, bloqué)."""
+    proc = st.session_state.get("zbf_proc")
+    ZF = zb_module()
+    if proc is None or ZF is None:
+        return
+    log_path = Path(ZF.PAGES_DIR) / "_run.log"
+    try:
+        lines = [l.strip() for l in open(log_path, encoding="utf-8", errors="ignore") if l.strip()]
+    except OSError:
+        lines = []
+    prog = next((m.group(1) for l in reversed(lines) for m in [re.match(r"(?:OK|ERR)\s+(\d+/\d+)", l)] if m), "")
+    if proc.poll() is None:
+        st.info("⏳ Téléchargement Zonebourse en cours" + (f" ({prog} pages)" if prog else "…")
+                + " — l'analyse affichée utilise les pages déjà enregistrées.")
+        return
+    err = next((l for l in lines if l.startswith("ERREUR")), None)
+    try:
+        hh = datetime.fromtimestamp(log_path.stat().st_mtime).strftime("%H:%M")
+    except OSError:
+        hh = ""
+    if err or any(l.startswith("BLOCK") for l in lines):
+        st.error("⛔ Téléchargement Zonebourse interrompu" + (f" à {hh}" if hh else "") + " — voir la section Zonebourse.")
+    else:
+        done = next((l[5:] for l in reversed(lines) if l.startswith("DONE")), "")
+        st.success("✅ Téléchargement Zonebourse terminé" + (f" à {hh}" if hh else "") + (f" — {done}" if done else ""))
 
 
 def zb_module():
@@ -2676,6 +2709,86 @@ def synthese_dcf(out, w_dcf=0.5):
     out["_w_dcf"] = w_dcf
     out["notes"].append(f"JV = {w_dcf * 100:.0f} % DCF ({dcf:.0f}) + {(1 - w_dcf) * 100:.0f} % multiples ({mc:.0f}, "
                         f"médiane de {', '.join(m for _, m in mult)})")
+
+
+SPEC_METHODS = ("VE/CA", "EBITDA futur", "Marge norm.")
+SPEC = {"disc": 0.11, "margin": (0.12, 0.15, 0.18), "mult": 15.0, "g": (0.05, 0.15), "extra": 2}
+
+
+def speculative_value(f, out):
+    """Société sans bénéfice (aucune méthode classique applicable) : juste valeur indicative par trois méthodes
+    fondées sur le chiffre d'affaires et l'EBITDA prévus (pages Zonebourse avec comparables) —
+    1) VE/CA médian des comparables × CA N+1 ; 2) VE/EBITDA médian × EBITDA de la dernière année prévue, actualisé ;
+    3) marge d'EBITDA normalisée sur un CA prolongé de 2 ans, multiple fixe, actualisé. Dette nette déduite."""
+    z = f.get("zb") or {}
+    N, ca, eb, nd, sh = z.get("N"), z.get("ca") or {}, z.get("ebitda") or {}, z.get("nd") or {}, f.get("shares")
+    peers = f.get("zb_peers") or []
+    if out.get("JV centrale") or not N or not sh or not peers or (f.get("eps_next_y") or 0) > 0:
+        return
+    es = sorted(x["ev_sales"] for x in peers if x.get("ev_sales") and 0 < x["ev_sales"] < 40)
+    ee = sorted(x["ev_ebitda"] for x in peers if x.get("ev_ebitda") and 0 < x["ev_ebitda"] < 60)
+
+    def q(v, k):                                    # quartile (interpolation linéaire)
+        i = (len(v) - 1) * k
+        lo = int(i)
+        return v[lo] + (v[min(lo + 1, len(v) - 1)] - v[lo]) * (i - lo)
+
+    def debt(y):                                    # dette nette de l'année, sinon la dernière connue avant
+        for yy in range(y, N - 2, -1):
+            if nd.get(yy) is not None:
+                return nd[yy]
+        return f.get("net_debt") or 0.0
+
+    r, mult = SPEC["disc"], out.setdefault("_mult", {})
+    nb = lambda x: f"{x:,.0f}".replace(",", " ")
+    yL = max((y for y, v in ca.items() if v and y >= N), default=None)      # dernière année prévue
+    if len(es) >= 3 and ca.get(N + 1):
+        v = lambda m: (m * ca[N + 1] - debt(N + 1)) / sh
+        out.update({"VE/CA bas": v(q(es, 0.25)), "VE/CA": v(q(es, 0.5)), "VE/CA haut": v(q(es, 0.75))})
+        mult["VE/CA"] = f"VE/CA médian des comparables {q(es, 0.5):.1f}x × CA {N + 1} ({nb(ca[N + 1])} M)"
+    if len(ee) >= 3 and yL and eb.get(yL) and eb[yL] > 0:
+        d = (1 + r) ** (yL - N)
+        v = lambda m: (m * eb[yL] / d - debt(yL)) / sh
+        out.update({"EBITDA futur bas": v(q(ee, 0.25)), "EBITDA futur": v(q(ee, 0.5)), "EBITDA futur haut": v(q(ee, 0.75))})
+        mult["EBITDA futur"] = (f"VE/EBITDA médian {q(ee, 0.5):.1f}x × EBITDA {yL} ({nb(eb[yL])} M), actualisé à "
+                                f"{r * 100:.0f} %")
+    if yL and ca.get(yL) and ca.get(yL - 1):
+        g = clamp(ca[yL] / ca[yL - 1] - 1, *SPEC["g"])
+        n = SPEC["extra"]
+        ca_n, d = ca[yL] * (1 + g) ** n, (1 + r) ** (yL + n - N)
+        v = lambda m: (ca_n * m * SPEC["mult"] / d - debt(yL)) / sh
+        lo_, mid_, hi_ = SPEC["margin"]
+        out.update({"Marge norm. bas": v(lo_), "Marge norm.": v(mid_), "Marge norm. haut": v(hi_)})
+        mult["Marge norm."] = (f"CA {yL + n} ({nb(ca_n)} M, +{g * 100:.0f} %/an) × marge d'EBITDA {mid_ * 100:.0f} % × "
+                               f"{SPEC['mult']:.0f}, actualisé à {r * 100:.0f} %")
+    for m in SPEC_METHODS:                          # valeur négative ou nulle : méthode sans objet
+        if out.get(m) is not None and out[m] <= 0:
+            for sfx in ("", " bas", " haut"):
+                out.pop(m + sfx, None)
+            mult.pop(m, None)
+        elif out.get(m) is not None:
+            out[m + " bas"] = max(out[m + " bas"], 0.0)
+    if not any(out.get(m) for m in SPEC_METHODS):
+        return
+    synthese(out, SPEC_METHODS)
+    precision(out, SPEC_METHODS)
+    out["_spec"] = True
+    out["_alerts"].append("⚠️ valeur spéculative : société sans bénéfice, juste valeur indicative fondée sur le chiffre "
+                          "d'affaires et l'EBITDA prévus (peu fiable)")
+    out["notes"].append("société sans bénéfice : PER et DCF inapplicables — juste valeur indicative = médiane de trois "
+                        "méthodes (multiple du chiffre d'affaires des comparables, EBITDA futur actualisé, marge "
+                        f"normalisée {SPEC['margin'][1] * 100:.0f} % × {SPEC['mult']:.0f}, actualisation {r * 100:.0f} %)")
+    if f.get("target") and ca.get(N):               # ce que suppose l'objectif des analystes
+        ev_t = f["target"] * sh + debt(N)
+        parts = [f"{ev_t / ca[N]:.1f}x le CA {N}"] + ([f"{ev_t / ca[N + 1]:.1f}x le CA {N + 1}"] if ca.get(N + 1) else [])
+        if yL and eb.get(yL) and eb[yL] > 0:
+            parts.append(f"{ev_t / eb[yL]:.0f}x l'EBITDA {yL}")
+        cur_ = (f["mcap"] + debt(N)) / ca[N] if f.get("mcap") else None
+        out["_spec_tgt"] = ("L'objectif des analystes suppose " + ", ".join(parts)
+                            + (f" (cours actuel : {cur_:.1f}x le CA {N})" if cur_ else "") + ".")
+        out["notes"].append(out["_spec_tgt"])
+    if out.get("JV centrale") and f.get("price"):
+        out["Écart (%)"] = (out["JV centrale"] / f["price"] - 1) * 100
 
 
 def precision(out, methods):
@@ -3268,6 +3381,8 @@ def precision_txt(fv):
     d = fv.get("Dispersion (%)")
     excl = fv.get("_excl") or []
     tail = (" · " + ", ".join(excl) + (" écarté" if len(excl) == 1 else " écartés")) if excl else ""
+    if fv.get("_spec"):
+        return "🔴 spéculative (sans bénéfice)" + (f" ±{d:.0f} %" if d is not None else "") + tail
     if fv.get("_peak_only"):
         return "🔴 multiples du seul BNA de pic" + tail
     if fv.get("_low_conf") is not None:
@@ -4665,7 +4780,20 @@ def amf_company_tx(isin):
     return jeton, name, tx
 
 
-def amf_insiders(isin):
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def afm_company_tx(isin, name):
+    """Transactions des dirigeants d'une société néerlandaise (12 mois), lues dans le registre de l'AFM comme dans
+    le screener AMF. -> (jeton, nom, tx) ; une erreur du registre lève une exception (nouvel essai plus tard)."""
+    import afm_nl
+    from datetime import timedelta
+    tx, _, names, errs = afm_nl.load_companies([(name, isin)], TODAY.date() - timedelta(days=366),
+                                               os.path.join(CACHE_DIR, "afm_nl"))
+    if errs and not names:
+        raise RuntimeError(errs[0])
+    return "AFM:" + isin, name, tx
+
+
+def amf_insiders(isin, name=""):
     """Signal AMF des dirigeants (valeur française lue sur Zonebourse), même calcul et même seuil que le screener
     AMF ; reprend directement les transactions du screener si la société y figure déjà."""
     import signaux as sg
@@ -4676,23 +4804,33 @@ def amf_insiders(isin):
     res = _guarded(f"amf_{isin}", lambda: amf_company_tx(isin))
     if res is None:
         return None
-    jeton, name, tx = res
+    jeton, _nm, tx = res
+    src, reg = "déclarations AMF", "à l'AMF"
+    if not jeton and str(isin).upper().startswith("NL") and name:
+        # société de droit néerlandais absente de la base AMF : registre de l'AFM (Adyen, STMicroelectronics…)
+        res2 = _guarded(f"afm_{isin}", lambda: afm_company_tx(isin, name))
+        if res2 is None:
+            return {"Signal": "⚪", "Résumé": "⚪ registre AFM (Pays-Bas) indisponible pour l'instant — nouvel essai "
+                                             "dans quelques minutes", "Source": "registre AFM (Pays-Bas)",
+                    "Achats notables": []}
+        jeton, _nm, tx = res2
+        src, reg = "registre AFM (Pays-Bas)", "à l'AFM"
     if not jeton:
         return {"Signal": "⚪", "Résumé": "⚪ société introuvable dans la base AMF (les sociétés étrangères déclarent "
                                          "souvent à leur propre régulateur)", "Source": "déclarations AMF",
                 "Achats notables": []}
-    out = {"Source": "déclarations AMF", "Achats notables": [], "Achats 365j": 0.0, "Ventes 365j": 0.0, "Acheteurs": 0,
+    out = {"Source": src, "Achats notables": [], "Achats 365j": 0.0, "Ventes 365j": 0.0, "Acheteurs": 0,
            "Achats groupés (max en 30 j)": 0, "Achats PDG / DAF (M$)": None, "Hausse médiane de détention (%)": None,
            "Ventes avec levée d'options (M$)": None, "Devise": "€"}
     if tx is None or tx.empty:
-        out.update({"Signal": "⚪", "Résumé": "⚪ aucun achat ni vente d'actions déclaré à l'AMF sur 12 mois"})
+        out.update({"Signal": "⚪", "Résumé": f"⚪ aucun achat ni vente d'actions déclaré {reg} sur 12 mois"})
         return out
     df = pd.DataFrame({"key": jeton, "date": tx["date"], "person": tx["person"], "side": tx["side"],
-                       "value": tx["value"], "mandate": tx["mandate"],
+                       "value": tx["value"], "mandate": tx["mandate"].fillna(False).astype(bool),
                        "name": tx["declarant"] + tx["fonction"].map(lambda x: f" ({x})" if x else "")})
     sm = sg.summarize(df, today=TODAY.date(), min_sig=min_sig, cur="€")
     if sm.empty:
-        out.update({"Signal": "⚪", "Résumé": "⚪ aucun achat ni vente d'actions déclaré à l'AMF sur 12 mois"})
+        out.update({"Signal": "⚪", "Résumé": f"⚪ aucun achat ni vente d'actions déclaré {reg} sur 12 mois"})
         return out
     r = sm.iloc[0]
     b, v = tx[tx["side"] == "A"], tx[tx["side"] == "V"]
@@ -4740,7 +4878,7 @@ def analyze(f, p, ov=None):
     si, pc, ins = superinvestor_stats(f["dataroma"], f["price"]), put_call_stats(f["options"]), f["insiders"]
     ins = concord_insiders(ins, f.get("ticker") or "")
     if not ins and f.get("isin") and not str(f["isin"]).startswith("US"):    # valeur européenne (Zonebourse)
-        ins = amf_insiders(f["isin"])
+        ins = amf_insiders(f["isin"], f.get("company") or f.get("name") or "")
     si = concord_funds(si, f.get("ticker") or "")
     sc = scenarios(f, ov)
     jv = (f"{fv['JV centrale']:.0f} ({fv['JV basse']:.0f}–{fv['JV haute']:.0f})"
@@ -4975,7 +5113,8 @@ def render_dcfx(f, res):
 
 
 METHODS = [("DCF", "DCF"), ("PER", "PER"), ("Comparables", "Comparables"), ("PER hist.", "PER historique"),
-           ("P/B", "Actif net (P/B)")]
+           ("P/B", "Actif net (P/B)"), ("VE/CA", "Multiple du chiffre d'affaires"),
+           ("EBITDA futur", "EBITDA futur actualisé"), ("Marge norm.", "Marge normalisée")]
 
 
 def render_fv_tables(fv, cur):
@@ -5315,6 +5454,8 @@ def report_model(f, d, t):
         br_ = target_bridge_txt(target_bridge(f, fv), f, cur, fv.get("JV si pic"))
         if br_:
             B.append(("p", br_))
+        if fv.get("_spec_tgt"):
+            B.append(("p", fv["_spec_tgt"]))
         vm_ = value_markers(f, fv, cur)
         if vm_:
             B.append(("table", ["Repère", "Valeur", "Lecture"], vm_))
@@ -6282,6 +6423,8 @@ def render_detail(f, d, t=None, ns=""):
         br_ = target_bridge_txt(target_bridge(f, fv), f, cur.strip(), fv.get("JV si pic"))
         if br_:
             st.caption(br_)
+        if fv.get("_spec_tgt"):
+            st.caption(fv["_spec_tgt"])
         vm_ = value_markers(f, fv, cur.strip())
         if vm_:
             st.dataframe(pd.DataFrame(vm_, columns=["Repère", "Valeur", "Lecture"]), hide_index=True,
@@ -6336,7 +6479,7 @@ def render_detail(f, d, t=None, ns=""):
             st.markdown(ins["Résumé"])
             if ins.get("Frise"):
                 st.markdown(f"12 derniers mois : {ins['Frise']} · dernière opération : {ins['Dernière opération']}")
-                st.caption(("Même calcul que le screener AMF (même seuil). " if ins.get("Source") == "déclarations AMF"
+                st.caption(("Même calcul que le screener AMF (même seuil). " if ins.get("Source") in ("déclarations AMF", "registre AFM (Pays-Bas)")
                             else "Même calcul que le screener investors (mêmes seuils). ") + "🟢 achats sur 6 mois sans vente "
                            "significative sur 3 mois · 🟠 achats et ventes récentes · 🔴 ventes récentes supérieures aux "
                            "achats · ⚪ non significatif. Frise : 🟩 achats nets, 🟥 ventes nettes, ⬜ rien.")
@@ -6553,7 +6696,9 @@ def main():
                 x for x in (f"ajoutées : {', '.join(add)}" if add else "", f"retirées : {', '.join(rem)}" if rem else "") if x))
         go = st.button("📡 Récupérer les données", type="primary", disabled=pf_all.empty,
                        help="Valeurs USA : Finviz, OpenInsider, Dataroma + pages Zonebourse. Valeurs Europe : pages "
-                            "Zonebourse + déclarations AMF. Les pages Zonebourse se téléchargent en arrière-plan.") or auto
+                            "Zonebourse + déclarations AMF (AFM pour les sociétés néerlandaises). Les pages Zonebourse se "
+                            "téléchargent en arrière-plan.") or auto
+        zb_status_badge()
 
         # ===== 2. Zonebourse
         st.divider()
