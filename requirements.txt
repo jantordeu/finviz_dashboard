@@ -32,3 +32,4 @@ yfinance>=0.2.40
 # Indice Fear & Greed (onglet « Fear & Greed »)
 plotly>=5.20
 # anthropic  # facultatif : commentaire automatique de l'onglet Fear & Greed
+playwright>=1.45

@@ -52,8 +52,10 @@ import json
 import os
 import random
 import re
+import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -473,12 +475,12 @@ def complete_online_cached(raw, t, max_days=200, use_cache=True, log=print, open
 
 
 @st.cache_data(show_spinner=False, max_entries=300)
-def parse_zonebourse_cached(htmls, name="", version=4):      # version : à augmenter avec PAGE_PARSE_VERSION
+def parse_zonebourse_cached(htmls, name="", version=5):      # version : à augmenter avec PAGE_PARSE_VERSION
     """Lecture des pages Zonebourse, gardée en mémoire : une page déjà lue (même contenu) n'est pas relue."""
     return parse_zonebourse(list(htmls), name)
 
 
-PAGE_PARSE_VERSION = 4          # à augmenter quand la lecture des pages change (invalide la mémoire)
+PAGE_PARSE_VERSION = 5          # à augmenter quand la lecture des pages change (invalide la mémoire)
 
 
 @st.cache_data(show_spinner=False, max_entries=1000)
@@ -727,6 +729,13 @@ def _isin_ok(code):
 def zb_isin(html):
     """Code ISIN de la société (le plus fréquent des codes valides de la page Zonebourse), ou "" ."""
     from collections import Counter
+    # 1) pastille de l'en-tête (à côté du code de la valeur), 2) mots-clés de la page, 3) code le plus fréquent
+    # (une page rendue par le navigateur contient aussi les ISIN d'autres valeurs : listes, palmarès…)
+    for pat in (r'<h2[^>]*badge[^>]*>\s*([A-Z]{2}[A-Z0-9]{9}[0-9])\s*</h2>',
+                r'<meta[^>]+name="keywords"[^>]+content="[^"]*?\b([A-Z]{2}[A-Z0-9]{9}[0-9])"'):
+        c = Counter(m for m in re.findall(pat, html) if _isin_ok(m))
+        if c:
+            return c.most_common(1)[0][0]
     c = Counter(m for m in re.findall(r"\b([A-Z]{2}[A-Z0-9]{9}[0-9])\b", html) if _isin_ok(m))
     return c.most_common(1)[0][0] if c else ""
 
@@ -2037,6 +2046,8 @@ def comparables(f, p, eps_mid=None):
         # des pairs n'est pas transposable -> PER seul
         if self_ev and ebitda_c and f.get("mcap") and abs((f["mcap"] + nd) / ebitda_c / self_ev - 1) > 0.3:
             ev_l = []
+        elif self_ev is not None and self_ev < 1 and ev_l:
+            ev_l = []                                  # VE/EBITDA < 1x : trésorerie nette non libre, multiples non transposables
         lbl_pe = "PER"
     else:
         im = industry_multiples().get(f.get("industry")) if f.get("industry") else None
@@ -2306,6 +2317,9 @@ def fair_value(f, p):
             eps = eps_mid
             out["notes"].append(f"cyclique : multiples appliqués au BNA de milieu de cycle {eps_mid:.2f} (moyenne de "
                                 f"{n_mid} exercices) au lieu du BNA N+1 {out['_eps_peak']:.2f}")
+            if f.get("_cyc_excl"):
+                out["notes"].append("exercice(s) de pic exclu(s) du milieu de cycle (BNA > 3 × la médiane) : "
+                                    + ", ".join(f"{v:.2f}" for v in f["_cyc_excl"]))
             if n_pub < 4:
                 out["_low_conf"] = n_pub
                 out["_alerts"].append(f"⚠️ juste valeur peu fiable : {n_pub} exercice(s) publié(s) seulement, le milieu "
@@ -2330,7 +2344,7 @@ def fair_value(f, p):
             pe = p.get("pe_cyc_mid", 11.0) if eps_mid else p["pe_cyc"]
         else:
             pe = clamp(p["pe_base"] + 0.4 * (min(g5, 25) - 10), p["pe_min"], p["pe_max"])
-        if f.get("pe_hist") and not f["cyclical"] and pe > 1.25 * f["pe_hist"]:
+        if f.get("pe_hist") and pe > 1.25 * f["pe_hist"]:
             pe = 1.25 * f["pe_hist"]
             out["notes"].append(f"PER cible plafonné à 1,25 × le PER historique ({f['pe_hist']:.1f}x)")
         lev_ = (f["net_debt"] / f["ebitda"] if f.get("net_debt") is not None and f.get("ebitda") and f["ebitda"] > 0
@@ -2395,15 +2409,225 @@ def fair_value(f, p):
     return out
 
 
+@st.fragment(run_every=3)
+def zb_fetch_progress(log_path):
+    """Avancement du téléchargement Zonebourse (journal relu toutes les 3 s, sans relancer le dashboard)."""
+    proc = st.session_state.get("zbf_proc")
+    try:
+        lines = [l.strip() for l in open(log_path, encoding="utf-8", errors="ignore") if l.strip()]
+    except OSError:
+        lines = []
+    if proc is not None and proc.poll() is None:
+        st.caption("⏳ téléchargement en cours…")
+    if lines:
+        st.code("\n".join(lines[-6:]))
+    if proc is not None and proc.poll() is not None and st.session_state.get("zbf_seen") != proc.pid:
+        st.session_state["zbf_seen"] = proc.pid            # téléchargement terminé : portefeuille recalculé une fois
+        st.rerun()
+    if proc is None or proc.poll() is not None:
+        err = next((l for l in lines if l.startswith("ERREUR")), None)
+        if err:
+            st.error(err[7:])
+        elif any(l.startswith("BLOCK") for l in lines):
+            st.error("Accès refusé par Zonebourse (403/429) : cliquez sur « 🔑 Connexion » ou patientez.")
+        elif any("non confirmee" in l for l in lines):
+            st.warning("Connexion abonné non confirmée : utilisez « 🔑 Connexion » puis relancez.")
+        elif lines:
+            st.caption("Téléchargement terminé.")
+
+
+def zb_module():
+    """Module zb_fetch (téléchargement Zonebourse par navigateur) ou None s'il est absent."""
+    try:
+        import zb_fetch as ZF
+        return ZF
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def zb_start(ZF, slugs, max_age=12):
+    """Lance le téléchargement Zonebourse en arrière-plan (jamais bloquant). -> message d'état ou ""."""
+    import subprocess
+    proc = st.session_state.get("zbf_proc")
+    if proc is not None and proc.poll() is None:
+        return "téléchargement Zonebourse déjà en cours"
+    slugs = list(dict.fromkeys(slugs))
+    if not slugs:
+        return ""
+    prof = Path(ZF.PROFILE_DIR)
+    if not prof.exists() or not any(prof.iterdir()):
+        return "Zonebourse : cliquez d'abord sur « 🔑 Connexion » (aucune session enregistrée)"
+    log_path = Path(ZF.PAGES_DIR) / "_run.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, "-u", str(Path(ZF.__file__)), "fetch", "--max-age", str(max_age), "--slugs", ",".join(slugs)]
+    with open(log_path, "w", encoding="utf-8") as lf:
+        st.session_state["zbf_proc"] = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
+                                                        cwd=str(Path(ZF.__file__).parent))
+    return ""
+
+
+def zb_disk_facts(ZF, slug, nom=""):
+    """Faits lus dans les pages Zonebourse téléchargées d'une valeur (relus seulement si les fichiers changent).
+    -> dict, ou None si les deux pages ne sont pas encore là."""
+    pv, pf_ = ZF.page_path(slug, "valorisation"), ZF.page_path(slug, "finances")
+    if not (pv.exists() and pf_.exists()):
+        return None
+    key = (pv.stat().st_mtime, pf_.stat().st_mtime, PAGE_PARSE_VERSION)
+    memo = st.session_state.setdefault("_zb_disk", {})
+    if memo.get(slug, (None,))[0] != key:
+        try:
+            hs = [pv.read_text(encoding="utf-8", errors="ignore"), pf_.read_text(encoding="utf-8", errors="ignore")]
+            f = parse_zonebourse(hs, nom or slug)
+            f["source"] = "pages Zonebourse téléchargées" + (f" du {f['zb_date']}" if f.get("zb_date") else "")
+        except Exception as e:  # noqa: BLE001
+            f = {"_err": f"{type(e).__name__} — {e}"}
+        memo[slug] = (key, f)
+    return copy.deepcopy(memo[slug][1])
+
+
+def zb_section(pf_all):
+    """Section « Zonebourse » de la barre latérale : connexion, rapprochement des positions avec le fichier
+    d'adresses (zonebourse_urls.csv), adresses manquantes, téléchargement en arrière-plan.
+    -> (pages [(nom, html)] des autres valeurs choisies, {ticker de la position: identifiant Zonebourse})."""
+    import subprocess
+    ZF = zb_module()
+    if ZF is None:
+        st.caption("Téléchargement automatique indisponible (zb_fetch.py absent ou Playwright non installé).")
+        return [], {}
+    try:
+        rows = ZF.load_rows()
+    except Exception as e:  # noqa: BLE001
+        st.caption(f"zonebourse_urls.csv illisible : {e}")
+        return [], {}
+    st.caption("Chrome s'ouvre sur votre Mac avec votre session d'abonné (aucun mot de passe enregistré ici). "
+               "Usage personnel, rythme humain.")
+    c1, c2 = st.columns(2)
+    if c1.button("🔑 Connexion", help="Ouvre Chrome : connectez-vous à Zonebourse puis quittez Chrome avec Cmd+Q. À faire une "
+                                       "fois, et si le téléchargement signale « non connecté ».", key="zbf_login"):
+        subprocess.Popen([sys.executable, str(Path(ZF.__file__)), "login"], cwd=str(Path(ZF.__file__).parent))
+        st.info("Fenêtre Chrome ouverte : connectez-vous, puis fermez-la avec Cmd+Q.")
+    if c2.button("✅ Vérifier", key="zbf_status", help="Teste si la session est reconnue comme abonnée"):
+        try:
+            r = subprocess.run([sys.executable, str(Path(ZF.__file__)), "status"], capture_output=True, text=True,
+                               cwd=str(Path(ZF.__file__).parent), timeout=60)
+            (st.success if r.returncode == 0 else st.error)((r.stdout or r.stderr or "pas de réponse").strip()[-300:])
+        except subprocess.TimeoutExpired:
+            st.error("Pas de réponse en 60 s : quittez le Chrome de connexion (Cmd+Q) puis réessayez.")
+
+    # ----- rapprochement positions <-> adresses
+    pos = [] if pf_all.empty else list(zip(pf_all["Ticker"], pf_all["Nom"] if "Nom" in pf_all.columns else pf_all["Ticker"]))
+    zmap, hit, missing = {}, {}, []
+    for t, nom in pos:
+        r = ZF.match_position(t, str(nom), rows)
+        if r:
+            zmap[t], hit[t] = r["slug"], r
+        else:
+            missing.append((t, str(nom)))
+    if pos:
+        st.caption(f"{len(zmap)}/{len(pos)} position(s) avec une adresse Zonebourse.")
+    if missing:
+        # Entrée ne valide pas le formulaire : toutes les adresses sont collées, puis envoyées ensemble par le bouton
+        with st.form("zb_missing", border=True, enter_to_submit=False):
+            st.markdown(f"**⚠️ Adresse Zonebourse manquante ({len(missing)})**")
+            st.caption("Collez l'adresse de la fiche, par ex. https://www.zonebourse.com/cours/action/VUSIONGROUP-5151/ — "
+                       "elle est gardée dans zonebourse_urls_perso.csv. Collez toutes les adresses, puis cliquez sur le bouton : "
+                       "le téléchargement de ces valeurs démarre aussitôt.")
+            vals = {t: st.text_input(f"{t} — {nom[:30]}", key=f"zb_url_{t}", placeholder="https://www.zonebourse.com/cours/action/…")
+                    for t, nom in missing}
+            if st.form_submit_button("➕ Ajouter les adresses"):
+                bad = []
+                for (t, nom) in missing:
+                    u = (vals.get(t) or "").strip()
+                    if not u:
+                        continue
+                    try:
+                        new_ = ZF.add_url(nom, u, t)
+                        st.session_state.setdefault("zb_new", []).append(new_["slug"])
+                    except ValueError as e:
+                        bad.append(f"{t} : {e}")
+                if bad:
+                    st.session_state["zb_add_err"] = bad
+                st.rerun()
+        for e in st.session_state.pop("zb_add_err", []):
+            st.error(e)
+    # adresses qui viennent d'être ajoutées : téléchargement lancé aussitôt (ou dès la fin de celui en cours)
+    if st.session_state.get("zb_new"):
+        proc_ = st.session_state.get("zbf_proc")
+        if proc_ is None or proc_.poll() is not None:
+            msg_ = zb_start(ZF, st.session_state.pop("zb_new"), st.session_state.get("zbf_age", 12))
+            if msg_:
+                st.warning(msg_)
+        else:
+            st.caption(f"{len(st.session_state['zb_new'])} nouvelle(s) adresse(s) : téléchargement à la fin de celui en cours.")
+    if pos:
+        with st.expander("Rapprochement des positions"):
+            tab = []
+            for t, nom in pos:
+                r = hit.get(t)
+                ages = [ZF.age_hours(ZF.page_path(r["slug"], x)) for x in ZF.TABS] if r else []
+                tab.append({"Ticker": t, "Fiche Zonebourse": r["nom"] if r else "— manquante",
+                            "Pages": ("—" if not r else "à télécharger" if any(a is None for a in ages)
+                                      else f"{max(ages):.0f} h")})
+            st.dataframe(pd.DataFrame(tab), hide_index=True, width="stretch")
+            st.caption("Rapprochement erroné ? Choisissez la position et collez la bonne adresse.")
+            tk_fix = st.selectbox("Position", [t for t, _ in pos], key="zb_fix_t")
+            url_fix = st.text_input("Adresse Zonebourse", key="zb_fix_u", placeholder="https://www.zonebourse.com/cours/action/…")
+            if st.button("Corriger", key="zb_fix_go") and url_fix.strip():
+                try:
+                    ZF.add_url(dict(pos).get(tk_fix, tk_fix), url_fix, tk_fix)
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+
+    # ----- autres valeurs du fichier d'adresses (hors portefeuille)
+    others = {r["nom"]: r["slug"] for r in rows if r["slug"] not in set(zmap.values())}
+    sel = st.multiselect("Autres valeurs à télécharger (→ « Valeurs à étudier »)", list(others), key="zbf_sel")
+    age = st.number_input("Ne pas retélécharger les pages de moins de (heures)", 0, 240, 12, key="zbf_age")
+    proc = st.session_state.get("zbf_proc")
+    running = proc is not None and proc.poll() is None
+    todo = list(zmap.values()) + [others[n] for n in sel]
+    if st.button("⬇️ Télécharger les pages", disabled=not todo or running, key="zbf_go",
+                 help="Pages des positions du portefeuille et des autres valeurs choisies. Le téléchargement tourne en "
+                      "arrière-plan : le dashboard reste utilisable."):
+        msg = zb_start(ZF, todo, age)
+        if msg:
+            st.warning(msg)
+    if st.session_state.get("zb_msg"):
+        st.warning(st.session_state.pop("zb_msg"))
+    if st.session_state.get("zbf_proc") is not None:
+        zb_fetch_progress(str(Path(ZF.PAGES_DIR) / "_run.log"))
+    out, have = [], []
+    for nom in sel:
+        slug = others[nom]
+        pv, pf_ = ZF.page_path(slug, "valorisation"), ZF.page_path(slug, "finances")
+        if pv.exists() and pf_.exists():
+            have.append(nom)
+            out += [(f"{slug}-valorisation.html", pv.read_text(encoding="utf-8", errors="ignore")),
+                    (f"{slug}-finances.html", pf_.read_text(encoding="utf-8", errors="ignore"))]
+    if sel:
+        st.caption(f"{len(have)}/{len(sel)} autre(s) valeur(s) prête(s) : cliquez sur « 🔎 Analyser » ci-dessous.")
+    return out, zmap
+
+
 def cycle_eps(f):
     """BNA de milieu de cycle (valeur cyclique) : moyenne des BNA publiés (jusqu'à 5 exercices) et prévus (N, N+1).
     -> (BNA, nb d'exercices) ou (None, n) si moins de 4 valeurs."""
     ser = [(v, kind) for lbl, v, kind in _eps_series(f)
            if v is not None and (kind == "publié" or lbl in ("N (en cours)", "N+1")
                                  or (f.get("zb") and f["zb"].get("N") and int(lbl) <= f["zb"]["N"] + 1))]
+    f["_cyc_excl"] = []
+    if len(ser) >= 4:                                  # exercices de pic exclus : BNA > 3 × la médiane
+        med = sorted(v for v, _ in ser)[len(ser) // 2]
+        if med > 0:
+            keep = [(v, k) for v, k in ser if v <= 3 * med or k != "publié"]   # seuls les exercices publiés sont écartés
+            f["_cyc_excl"] = [v for v, k in ser if v > 3 * med and k == "publié"]
+            if len(keep) >= 3:
+                ser = keep
+            else:
+                f["_cyc_excl"] = []
     vals = [v for v, _ in ser]
     n_pub = sum(1 for _, k in ser if k == "publié")
-    if len(vals) < 4:
+    if len(vals) < 3 or (len(vals) < 4 and not f["_cyc_excl"]):
         return None, len(vals), n_pub
     return sum(vals) / len(vals), len(vals), n_pub
 
@@ -4589,18 +4813,44 @@ def _base(t):
     return t.split(" ")[0].upper()
 
 
-def portfolio_facts(raws, zb_store):
-    """Valeurs du portefeuille : fiche Finviz, combinée avec les pages Zonebourse déposées pour la même valeur
-    (même ticker, même devise) — prévisions sur 3 ans, PER historique, consensus."""
-    out = {}
-    for t, r in raws.items():
-        f = build_facts(r)
-        zf = zb_store.get(t.upper())
-        if zf and zf.get("zb") and zf.get("currency", "USD") == f.get("currency", "USD"):
-            f = merge_facts(f, zf)
-            f["source"] = (r.get("source") or "Finviz en ligne") + " + pages Zonebourse du " + (zf.get("zb_date") or "?")
-        out[t] = f
-    return out
+def portfolio_facts(raws, zb_store, pf_all=None, zmap=None):
+    """Valeurs du portefeuille, USA et Europe, regroupées :
+    - valeur USA : fiche Finviz, combinée avec ses pages Zonebourse (prévisions sur 3 ans, PER historique, consensus) ;
+    - valeur Europe (ou valeur USA sans fiche Finviz) : pages Zonebourse seules.
+    Pages Zonebourse = pages téléchargées (zb_pages/) sinon pages déposées dans « Valeurs à étudier ».
+    -> ({ticker: faits}, [messages])."""
+    out, notes = {}, []
+    ZF = zb_module() if zmap else None
+    if pf_all is None or pf_all.empty:
+        rows_ = [(t, "USD", t) for t in raws]
+    else:
+        rows_ = list(zip(pf_all["Ticker"], pf_all["Devise"], pf_all["Nom"] if "Nom" in pf_all.columns else pf_all["Ticker"]))
+    waiting = []
+    for t, dev, nom in rows_:
+        zf = zb_disk_facts(ZF, zmap[t], str(nom)) if ZF and zmap.get(t) else None
+        if zf and zf.get("_err"):
+            notes.append(f"{t} : pages Zonebourse illisibles ({zf['_err']})")
+            zf = None
+        zf = zf or zb_store.get(str(t).upper())
+        if zf and zf.get("currency", "USD") != dev:
+            notes.append(f"{t} : pages Zonebourse en {zf.get('currency')} alors que la position est en {dev} — pages "
+                         "d'une autre cotation, non utilisées (corrigez l'adresse dans « Rapprochement des positions »).")
+            zf = None
+        r = raws.get(t)
+        if r:
+            f = build_facts(r)
+            if zf and zf.get("zb") and zf.get("currency", "USD") == f.get("currency", "USD"):
+                f = merge_facts(f, zf)
+                f["source"] = (r.get("source") or "Finviz en ligne") + " + pages Zonebourse du " + (zf.get("zb_date") or "?")
+            out[t] = f
+        elif zf and zf.get("zb"):
+            out[t] = zf
+        else:
+            waiting.append(str(t))
+    if waiting:
+        notes.append("En attente des pages Zonebourse (téléchargement en cours, adresse manquante, ou pages à déposer "
+                     "dans « Valeurs à étudier ») : " + ", ".join(waiting))
+    return out, notes
 
 
 def label(t, f):
@@ -5574,7 +5824,7 @@ def pick_yahoo_symbol(quotes, tk, isin):
     return eq[0]["symbol"]
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=40)
 def _yf_history_cached(sym, period):
     """Seuls les succès sont gardés en mémoire (une erreur lève une exception : nouvel essai au prochain affichage)."""
     mod = _yf_module()
@@ -5594,9 +5844,10 @@ def _yf_history_cached(sym, period):
 
 def yf_history(sym, period="2y"):
     """Cours quotidiens ajustés (open, high, low, close, volume) via data_yfinance.download ; copie CSV dans
-    yfinance/data/. -> (DataFrame | None, message d'erreur). Après un échec, pas de nouvel essai pendant 2 minutes."""
+    yfinance/data/. -> (DataFrame | None, message d'erreur). Après un échec, pas de nouvel essai pendant 30 minutes
+    pour ce symbole (« Vider le cache » ou un autre symbole relance aussitôt)."""
     k = f"_fail_yf_{sym}"
-    if time.time() - st.session_state.get(k, (0, ""))[0] < 120:
+    if time.time() - st.session_state.get(k, (0, ""))[0] < 1800:
         return None, st.session_state[k][1]
     try:
         return _yf_history_cached(sym, period), ""
@@ -5719,7 +5970,7 @@ def render_price_chart(f, ns=""):
     @st.fragment
     def _inner():
         cands = yahoo_candidates(f)
-        key = f"ysym_fix_{f.get('isin') or f.get('ticker')}"
+        key = f"ysym_fix_{f.get('ticker') or ''}_{f.get('isin') or ''}"   # une saisie par valeur, jamais partagée
         ok_key = key + "_ok"                         # symbole qui a déjà fonctionné pour cette valeur
         if st.session_state.get(ok_key) in cands:
             cands = [st.session_state[ok_key]] + [c for c in cands if c != st.session_state[ok_key]]
@@ -5758,7 +6009,8 @@ def render_price_chart(f, ns=""):
         days = {"3 mois": 92, "6 mois": 183, "1 an": 366, "2 ans": 731, "3 ans": 1097}[per]
         view = df[df.index >= df.index.max() - pd.Timedelta(days=days)]
         cur = {"USD": "$", "EUR": "€"}.get(f.get("currency"), f.get("currency") or "")
-        st.plotly_chart(price_chart(view, sym, cur), width="stretch", config={"displayModeBar": False})
+        st.plotly_chart(price_chart(view, sym, cur), width="stretch", config={"displayModeBar": False},
+                        key=f"chart_fig_{ns}_{f.get('ticker')}_{f.get('isin')}")
         last = df.iloc[-1]
         mfi = last["mfi"]
         mfi_txt = ("n.d." if pd.isna(mfi) else f"{mfi:.0f}" + (" : zone de surachat (> 80)" if mfi > 80 else
@@ -6267,61 +6519,59 @@ def main():
     st.caption("Juste valeur · initiés & super investors · analystes · Put/Call · scénarios BNA / EBITDA / capex / dette")
 
     with st.sidebar:
+        # ===== 1. Portefeuille
         st.header("📁 Portefeuille")
         pf_file = st.file_uploader("Fichier de positions (xlsx)", type=["xlsx"])
-        only_nyse = st.checkbox("NYSE uniquement (sinon toutes les actions en USD)", value=False)
-        pf, pf_all = pd.DataFrame(), pd.DataFrame()
+        only_nyse = bool(st.session_state.get("opt_nyse", False))
+        pf_all = pd.DataFrame()
         if pf_file is not None:
             try:
-                pf = load_portfolio(io.BytesIO(pf_file.getvalue()), only_nyse)
                 pf_all = load_portfolio(io.BytesIO(pf_file.getvalue()), all_ccy=True)
-                st.caption(f"{len(pf)} valeur(s) US : {', '.join(pf['Ticker'])}")
             except Exception as e:
                 st.warning(f"Fichier illisible : {e}")
-        default = ", ".join(pf["Ticker"]) if not pf.empty else ", ".join(DEFAULT_TICKERS)
-        # le fichier a-t-il changé (nouveau fichier ou contenu différent) ? -> liste de tickers et données mises à jour
-        sig = hashlib.md5(pf_file.getvalue()).hexdigest() if pf_file is not None and not pf.empty else None
+        if not pf_all.empty:
+            us_ = pf_all[pf_all["Devise"] == "USD"]
+            if only_nyse:
+                us_ = us_[us_["Bourse"] == "NYSE"]
+            pf_all = pd.concat([us_, pf_all[pf_all["Devise"] != "USD"]]).sort_index()
+            tickers = list(us_["Ticker"])                       # valeurs USA : Finviz, OpenInsider, Dataroma
+            st.caption(f"{len(us_)} valeur(s) USA · {len(pf_all) - len(us_)} valeur(s) Europe / autres devises")
+        else:
+            tickers = []
+        # le fichier a-t-il changé (nouveau fichier ou contenu différent) ? -> données mises à jour aussitôt
+        sig = hashlib.md5(pf_file.getvalue()).hexdigest() if pf_file is not None and not pf_all.empty else None
         auto = False
-        if "tickers_txt" not in st.session_state:
-            st.session_state["tickers_txt"] = default
         if sig and sig != st.session_state.get("pf_sig"):
-            old = {t.strip().upper() for t in st.session_state["tickers_txt"].split(",") if t.strip()}
-            new = set(pf["Ticker"])
+            old, new = set(st.session_state.get("pf_tickers") or []), set(pf_all["Ticker"])
             if st.session_state.get("pf_sig"):                 # fichier remplacé ou modifié
                 st.session_state["pf_change"] = (sorted(new - old), sorted(old - new))
-            st.session_state["tickers_txt"], st.session_state["pf_sig"] = default, sig
-            auto = True                                        # récupère aussitôt les données de la nouvelle liste
-        tickers = [t.strip().upper() for t in st.text_area("Tickers", key="tickers_txt").split(",") if t.strip()]
+            st.session_state["pf_sig"], st.session_state["pf_tickers"] = sig, sorted(new)
+            auto = True
         add, rem = st.session_state.pop("pf_change", ([], []))
         if add or rem:
             st.success("Fichier de positions modifié — " + " ; ".join(
                 x for x in (f"ajoutées : {', '.join(add)}" if add else "", f"retirées : {', '.join(rem)}" if rem else "") if x))
-        max_days = st.slider("Options : échéances jusqu'à (jours)", 30, 400, 200, 10)
-        use_cache = st.checkbox(f"Utiliser le cache ({CACHE_HOURS} h)", value=True,
-                                help="Décoché : tout est relu et retéléchargé — données Finviz en ligne, compléments "
-                                     "des fiches déposées, et pages HTML (Finviz et Zonebourse).")
-        if st.button("🧹 Vider le cache", help="Efface les données téléchargées (dossier cache_finviz) et les pages HTML "
-                                              "gardées en mémoire. Les résultats affichés restent jusqu'à la prochaine "
-                                              "récupération ou analyse."):
-            n = clear_caches()
-            st.success(f"Cache vidé ({n} fichier(s) supprimé(s)).")
-        use_oi = st.checkbox("Initiés via OpenInsider (12 mois complets)", value=True,
-                             help="Sinon : les ~20 dernières transactions de la fiche Finviz")
-        go = st.button("📡 Récupérer les données", type="primary") or auto
+        go = st.button("📡 Récupérer les données", type="primary", disabled=pf_all.empty,
+                       help="Valeurs USA : Finviz, OpenInsider, Dataroma + pages Zonebourse. Valeurs Europe : pages "
+                            "Zonebourse + déclarations AMF. Les pages Zonebourse se téléchargent en arrière-plan.") or auto
 
+        # ===== 2. Zonebourse
+        st.divider()
+        st.header("🌐 Zonebourse")
+        zb_extra, zmap = zb_section(pf_all)
+
+        # ===== 3. Valeurs à étudier (hors portefeuille)
         st.divider()
         st.header("🛒 Valeurs à étudier")
-        st.caption("Pages enregistrées (Cmd+S) : fiche Finviz (+ pages Options), Zonebourse Finances (+ Valorisation). "
-                   "Les fiches d'une même action sont combinées.")
-        # formulaire : ajouter / retirer des pages ne relance pas le script (pas d'interruption d'une
-        # récupération Finviz en cours) ; l'analyse ne part qu'au clic sur « Analyser »
+        st.caption("Valeurs hors portefeuille : pages Zonebourse enregistrées (Cmd+S), onglets Finances et Valorisation ; "
+                   "ou tickers USA sans page Zonebourse (fiche Finviz en ligne).")
+        # formulaire : ajouter / retirer des pages ne relance pas le script ; l'analyse ne part qu'au clic sur « Analyser »
         n_wl = st.session_state.get("wl_n", 0)
         with st.form("wl_form", border=False):
             ups = st.file_uploader("Pages HTML", type=["html", "htm"], accept_multiple_files=True, key=f"wl_up_{n_wl}")
-            online = st.checkbox("Compléter en ligne (Finviz, OpenInsider, Dataroma)", value=True,
-                                 help="Fiche Finviz déposée : ajoute états financiers, options, initiés et super investors. "
-                                      "Action US déposée seulement en pages Zonebourse : va chercher la fiche Finviz en ligne "
-                                      "et combine les deux. Valeurs européennes : sans effet.")
+            wl_tk = [t.strip().upper() for t in re.split(r"[,;\s]+", st.text_input(
+                "Tickers USA (sans page Zonebourse)", key=f"wl_tk_{n_wl}", placeholder="MU, AMD",
+                help="Valeurs cotées aux États-Unis : fiche Finviz, OpenInsider et Dataroma récupérés en ligne.")) if t.strip()]
             c1, c2 = st.columns(2)
             run = c1.form_submit_button("🔎 Analyser", type="primary")
             clear = c2.form_submit_button("🗑️ Vider", help="Retire les pages déposées et leurs résultats (avant de redéposer des pages à jour) ; "
@@ -6331,10 +6581,29 @@ def main():
             for k in ("wl_pages", "wl_errs_pages", "zb_store"):   # pages HTML seulement (valeurs du screener gardées)
                 st.session_state.pop(k, None)
             st.rerun()
-        if run and not ups:
-            st.warning("Aucune page déposée.")
+        if run and not ups and not zb_extra and not wl_tk:
+            st.warning("Aucune page déposée ni ticker saisi.")
+
+        # ===== 4. Options
         st.divider()
         p = dict(DEFAULT_P)                       # réglages de la juste valeur : hypothèses par défaut
+        with st.expander("⚙️ Options"):
+            use_oi = st.checkbox("Initiés via OpenInsider (12 mois complets)", value=True,
+                                 help="Portefeuille et valeurs à étudier. Décoché : les ~20 dernières transactions de la fiche Finviz")
+            online = st.checkbox("Compléter en ligne (Finviz, OpenInsider, Dataroma)", value=True,
+                                 help="Action US déposée seulement en pages Zonebourse : va chercher la fiche Finviz en ligne "
+                                      "et combine les deux. Valeurs européennes : sans effet.")
+            max_days = st.slider("Options : échéances jusqu'à (jours)", 30, 400, 200, 10)
+            st.checkbox("NYSE uniquement (valeurs USA du portefeuille)", value=False, key="opt_nyse")
+            use_cache = st.checkbox(f"Utiliser le cache ({CACHE_HOURS} h)", value=True,
+                                    help="Décoché : tout est relu et retéléchargé — données Finviz en ligne, compléments "
+                                         "des fiches déposées, et pages HTML (Finviz et Zonebourse).")
+            if st.button("🧹 Vider le cache", help="Efface les données téléchargées (dossier cache_finviz) et les pages HTML "
+                                                  "gardées en mémoire. Les résultats affichés restent jusqu'à la prochaine "
+                                                  "récupération ou analyse."):
+                n = clear_caches()
+                st.session_state.pop("_zb_disk", None)
+                st.success(f"Cache vidé ({n} fichier(s) supprimé(s)).")
         with st.expander("🏛️ SEC EDGAR (valeurs US)"):
             use_edgar = st.checkbox("Compléter avec les dépôts SEC (10-K, Form 4)", value=False, key="edgar_on",
                                     help="Historique de 10 exercices pour les valeurs cycliques, nombre d'actions et "
@@ -6365,12 +6634,18 @@ def main():
             bar.progress((i + 1) / len(tickers), text=t)
         bar.empty()
         st.session_state["raws"], st.session_state["errs"] = raws, errs
+        if zmap:                                   # pages Zonebourse des positions : téléchargement en arrière-plan
+            ZF_ = zb_module()
+            msg = zb_start(ZF_, list(zmap.values()), 12) if ZF_ else ""
+            if msg:
+                st.session_state["zb_msg"] = msg
+            st.rerun()                             # la barre latérale affiche aussitôt l'avancement
     raws = {t: r for t, r in st.session_state.get("raws", {}).items() if t in tickers}   # liste à jour uniquement
 
-    if run and ups:
+    if run and (ups or zb_extra or wl_tk):
         facts, errs = {}, []
         # même fichier déposé plusieurs fois : seule la dernière version est gardée
-        pages = [(u.name, u.getvalue().decode("utf-8", errors="ignore")) for u in ups]
+        pages = [(u.name, u.getvalue().decode("utf-8", errors="ignore")) for u in ups] + zb_extra
         pages, dups = dedupe_pages(pages)
         if dups:
             errs.append(f"{len(dups)} page(s) en double ignorée(s) (la plus récente est gardée) : " + ", ".join(dups)
@@ -6434,6 +6709,21 @@ def main():
                             errs.append(f"{t} : fiche Finviz introuvable — analyse Zonebourse seule.")
                     except Exception as e:
                         errs.append(f"{t} : Finviz en ligne indisponible ({e}) — analyse Zonebourse seule.")
+        for t in wl_tk:                             # tickers USA saisis, sans page Zonebourse : fiche Finviz en ligne
+            if t in facts:
+                continue
+            with st.spinner(f"{t} : fiche Finviz en ligne…"):
+                try:
+                    fvf = build_facts(fetch_ticker(t, max_days, use_cache, log=errs.append, openinsider=use_oi))
+                    if fvf.get("price"):
+                        facts[t] = fvf
+                    else:
+                        errs.append(f"{t} : fiche Finviz introuvable (valeur non cotée aux États-Unis ?).")
+                except FinvizBlocked as e:
+                    errs.append(f"⛔ {e}")
+                    break
+                except Exception as e:
+                    errs.append(f"{t} : {type(e).__name__} — {e}")
         st.session_state["wl_pages"], st.session_state["wl_errs_pages"] = facts, errs
         st.session_state["zb_store"] = zb_store
 
@@ -6447,10 +6737,12 @@ def main():
          "🇺🇸 Screener investors", "🇫🇷 Screener AMF", "ℹ️ Méthode"])
 
     # ---------- calculs (avant les onglets : une erreur n'empêche pas l'affichage des autres onglets)
-    pf_res, pf_err = None, None
-    if raws:
+    pf_res, pf_err, pf_notes = None, None, []
+    if not pf_all.empty:
         try:
-            pf_res = evaluate_memo("pf", portfolio_facts(raws, st.session_state.get("zb_store") or {}), p, ov, pf)
+            pf_facts, pf_notes = portfolio_facts(raws, st.session_state.get("zb_store") or {}, pf_all, zmap)
+            if pf_facts:
+                pf_res = evaluate_memo("pf", pf_facts, p, ov, pf_all)
         except Exception as e:
             pf_err = e
     wl_res, wl_err, wl_notes = None, None, []
@@ -6474,15 +6766,17 @@ def main():
     with tab1:
         for e in st.session_state.get("errs", []):
             st.warning(e)
+        for e in pf_notes:
+            st.info(e)
         if pf_err:
             st.error(f"Erreur pendant l'analyse du portefeuille : {pf_err}")
         elif not pf_res:
-            st.info("👈 Chargez votre fichier de positions puis cliquez sur « Récupérer les données ».")
+            st.info("👈 Chargez votre fichier de positions : les données se récupèrent aussitôt (valeurs USA et Europe).")
         else:
             df, det, keys = pf_res
             cyc_table(df, det, keys, "pf")
-            st.caption("Cyclique (case cochée) = juste valeur de milieu de cycle ; cochez ou décochez pour corriger le classement. 📄 = combinée avec les pages Zonebourse déposées "
-                       "dans « Valeurs à étudier » (date des pages). Survolez les en-têtes pour la définition des colonnes.")
+            st.caption("Cyclique (case cochée) = juste valeur de milieu de cycle ; cochez ou décochez pour corriger le classement. 📄 = combinée avec les pages Zonebourse "
+                       "(téléchargées, ou déposées dans « Valeurs à étudier »). Valeurs Europe : pages Zonebourse + AMF. Survolez les en-têtes pour la définition des colonnes.")
             memo = st.session_state.setdefault("_eval_memo", {})
             if "pf_xlsx" not in memo:                       # fichier reconstruit seulement si les résultats changent
                 buf = io.BytesIO()
@@ -6517,8 +6811,9 @@ def main():
         if wl_err:
             st.error(f"Erreur pendant l'analyse des pages : {wl_err}")
         elif not wl_res:
-            st.info("👈 Déposez vos pages Finviz / Zonebourse dans la barre latérale (section « 🛒 Valeurs à étudier »), "
-                    "puis cliquez sur « Analyser ». « 🗑️ Vider » retire toutes les pages déposées.")
+            st.info("👈 Valeurs hors portefeuille : déposez les pages Zonebourse (Finances et Valorisation) dans la barre "
+                    "latérale, section « 🛒 Valeurs à étudier », ou saisissez des tickers USA, puis cliquez sur "
+                    "« Analyser ». « 🗑️ Vider » retire toutes les pages déposées.")
         else:
             df2, det2, keys2 = wl_res
             cyc_table(df2, det2, keys2, "wl")

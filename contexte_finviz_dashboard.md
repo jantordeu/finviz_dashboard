@@ -208,3 +208,26 @@ NVIDIA 346 -> 302 $, S&P Global (ZB seul) 403 -> 318 $ (PER hist. écarté par l
 - Problème signalé sur Sanofi (cause exacte inconnue : la fiche PDF ne contient pas le message). Nouvelle résolution `yahoo_candidates(f)`, sans dépendre de la recherche Yahoo : valeur en USD → ticker ; sinon 1) table `yfinance/tickers_sbf120.csv` (fichier de l'utilisateur, colonnes Ticker,Entreprise, BOM géré ; correspondance par code Zonebourse + nom, sinon nom), 2) recherche Yahoo par ISIN seulement si la table ne donne rien, 3) code Zonebourse + suffixes du pays de l'ISIN (`YF_SUFFIX` : FR .PA ; NL .AS/.PA/.BR ; DE .DE…).
 - `render_price_chart` essaie les candidats dans l'ordre jusqu'à obtenir des cours, retient celui qui marche (session), et affiche chaque essai et son erreur en cas d'échec.
 - Ne pas confondre avec `sbf120.csv` à la racine (nom;isin, screener AMF).
+
+## Corrections cycliques en sortie de crise (Stellantis)
+1. `cycle_eps` : les exercices **publiés** dont le BNA dépasse 3 × la médiane sont exclus du milieu de cycle (les prévisions restent, pour ne pas pénaliser une croissance structurelle type Seagate). Note affichée.
+2. Le plafond « PER cible ≤ 1,25 × PER historique » s'applique désormais aussi aux cycliques.
+3. Comparables Zonebourse : VE/EBITDA des pairs écarté si le VE/EBITDA de la société < 1x (trésorerie nette non libre) → PER seul.
+Effet sur les 32 fiches : seule Stellantis bouge (JV 12,9 → 6,2 €).
+
+## Téléchargement Zonebourse par navigateur réel (zb_fetch.py)
+- `zb_fetch.py` (Playwright, Chrome réel, profil persistant `zb_profile/`) : commandes `login` (connexion manuelle, mot de passe jamais lu), `status`, `list`, `fetch [noms] --max-age H`. Pages enregistrées dans `zb_pages/<valeur>/valorisation.html` et `finances.html`, journal `_journal.csv`. Pauses 5–11 s, arrêt sur 401/403/429/captcha, validation du titre/horodatage/taille.
+- `zonebourse_urls.csv` (nom;url) : CAC 40 + Aptiv, Vertiv, Nvidia, Meta, Boston Scientific, Constellation, CVS, Technip Energies, Clariane, Nexans, Adyen.
+- Dashboard : panneau « 🌐 Zonebourse (abonné) » (`zb_fetch_panel`) dans « Valeurs à étudier » : Connexion, Vérifier, choix des valeurs, Télécharger ; les pages prêtes s'ajoutent aux pages déposées au clic sur « Analyser ». Pas de champ identifiant/mot de passe (choix volontaire).
+- Testé en local sur un serveur factice (téléchargement, validation, AppTest) ; non testé sur le vrai site (connexion, anti-robot, indicateur « connecté »).
+
+## Correctifs du 16/11 (soir)
+- `zb_isin` : ISIN lu d'abord dans la pastille de l'en-tête, puis les mots-clés, puis le plus fréquent (les pages rendues par Playwright contiennent les ISIN d'autres valeurs). PAGE_PARSE_VERSION = 5.
+- Graphique section 12 : clés de saisie et de figure par ticker + ISIN (plus de symbole partagé entre valeurs, plus d'identifiant en double).
+- Téléchargement Zonebourse en arrière-plan (`zb_fetch_progress`, fragment 3 s) ; Chrome avec bac à sable, sans `--enable-automation`.
+
+## Portefeuille USA + Europe automatisé (17/11)
+- Fichier de positions : toutes les actions (toutes devises). Valeurs USA : Finviz + OpenInsider + Dataroma, combinées aux pages Zonebourse ; valeurs Europe (ou USA sans fiche Finviz) : pages Zonebourse seules (+ AMF via l'ISIN). `portfolio_facts(raws, zb_store, pf_all, zmap)` -> (faits, messages) ; clés = ticker de la position ; pages d'une autre devise que la position refusées.
+- Pages Zonebourse du portefeuille : `zb_pages/<slug>/` (lues par `zb_disk_facts`, relues si les fichiers changent), sinon pages déposées (`zb_store`). « Récupérer les données » (automatique à chaque nouveau fichier) lance Finviz puis `zb_start` en arrière-plan ; fin du téléchargement -> relance du dashboard (`zbf_seen`).
+- Rapprochement position ↔ adresse : `zb_fetch.match_position` (colonne ticker, nom identique, préfixe, similarité ≥ 0,88). Adresses manquantes : formulaire dans la barre latérale -> `zb_fetch.add_url` écrit `zonebourse_urls_perso.csv` (nom;url;ticker), jamais dans le zip ; correction d'un rapprochement par le même moyen. `fetch --slugs a,b`.
+- Barre latérale : 1 Portefeuille, 2 Zonebourse (`zb_section`), 3 Valeurs à étudier (pages + « Tickers USA sans page Zonebourse »), 4 Options (OpenInsider et compléments en ligne cochés par défaut, échéances, NYSE, cache), SEC EDGAR. Liste « Tickers » du portefeuille supprimée.
