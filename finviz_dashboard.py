@@ -4281,7 +4281,7 @@ def _sig_columns(cur):
         "Alerte 7 j": st.column_config.TextColumn(help="transaction d'un dirigeant dans les 7 derniers jours (date de "
                                                       "l'opération) : 🚨 vente · ✅ achat"),
         "Achats 6 mois": st.column_config.TextColumn(help="montant · dirigeants distincts (nb de mois avec au moins un achat)"),
-        "Ventes 3 mois": st.column_config.TextColumn(help="montant · dirigeants distincts ; (mandat) = ventes faites "
+        "Ventes 6 mois": st.column_config.TextColumn(help="montant · dirigeants distincts ; (mandat) = ventes faites "
                                                           "surtout par un gérant sous mandat"),
         "Net 12 mois": st.column_config.NumberColumn(format=f"%,.0f {cur}", help="achats − ventes sur 12 mois"),
         "12 derniers mois": st.column_config.TextColumn(help="un carré par mois, du plus ancien au plus récent : "
@@ -4307,19 +4307,22 @@ def _inv_conviction(tickers):
     bar = st.progress(0.0, text="Fiches Dataroma (conviction des fonds)…")
 
     def one(t):
-        return t, parse_dataroma(_get(_session(), f"https://www.dataroma.com/m/stock.php?sym={t}", (0.2, 0.5)))["rows"]
-    out = {}
+        p_ = parse_dataroma(_get(_session(), f"https://www.dataroma.com/m/stock.php?sym={t}", (0.2, 0.5)))
+        return t, p_["rows"], p_.get("hold")
+    out, hold = {}, {}
     with ThreadPoolExecutor(4) as ex:
         futs = [ex.submit(one, t) for t in tickers]
         for i, fu in enumerate(as_completed(futs), 1):
             try:
-                t, rows = fu.result()
+                t, rows, h_ = fu.result()
                 out[t] = rows
+                if h_:
+                    hold[t] = h_                          # prix de détention moyen des fonds (« Hold Price » Dataroma)
             except Exception:  # noqa: BLE001 — fiche illisible : signal par le nombre de fonds
                 pass
             bar.progress(i / len(futs), text=f"Fiches Dataroma {i}/{len(futs)}")
     bar.empty()
-    return out
+    return out, hold
 
 
 @st.fragment      # un clic dans cet onglet ne relance que l'onglet, pas le portefeuille
@@ -4342,7 +4345,7 @@ def render_investors_screener(max_days, use_cache, use_oi):
         min_sig = c[1].select_slider("Montant significatif", [25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000],
                                      100_000, key="inv_min_sig",
                                      format_func=lambda v: f"{v:,.0f} $".replace(",", " "),
-                                     help="Sous ce montant, achats (6 mois) ou ventes (3 mois) ne comptent pas "
+                                     help="Sous ce montant, achats (6 mois) ou ventes (6 mois) ne comptent pas "
                                           "dans le signal.")
         min_value = c[1].select_slider("Montant minimum par achat", [0, 25_000, 50_000, 90_000, 250_000],
                                        an.DEFAULT_MIN_BUY, key="inv_min_value",
@@ -4360,8 +4363,14 @@ def render_investors_screener(max_days, use_cache, use_oi):
             if not use_cache:
                 _inv_load.clear()
             st.session_state["inv_data"] = _inv_load(int(min_si))
-            st.session_state["inv_conv_rows"] = (_inv_conviction(tuple(st.session_state["inv_data"][0]["ticker"]))
-                                                 if use_conv else None)
+            conv_ = (_inv_conviction(tuple(st.session_state["inv_data"][0]["ticker"])) if use_conv else (None, None))
+            st.session_state["inv_conv_rows"], st.session_state["inv_hold"] = conv_
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Erreur : {e}")
+    if use_conv and "inv_data" in st.session_state and st.session_state.get("inv_hold") is None:
+        try:      # analyse faite avant l'ajout du prix moyen (ou sans conviction) : fiches relues, gardées 6 h
+            conv_ = _inv_conviction(tuple(st.session_state["inv_data"][0]["ticker"]))
+            st.session_state["inv_conv_rows"], st.session_state["inv_hold"] = conv_
         except Exception as e:  # noqa: BLE001
             st.error(f"Erreur : {e}")
     if "inv_data" not in st.session_state:
@@ -4380,6 +4389,7 @@ def render_investors_screener(max_days, use_cache, use_oi):
     if conv_rows:                          # conviction (poids des lignes) : même calcul que l'analyse des valeurs
         cv = {t: sg.conviction_signal(r)["txt"] for t, r in conv_rows.items() if r}
         final["fonds"] = final["ticker"].map(cv).fillna(final["fonds"])
+    final["hold"] = final["ticker"].map(st.session_state.get("inv_hold") or {})   # prix moyen des fonds (fiches lues)
     final["fonds_dot"] = final["fonds"].str[:1]
     qs = [sg.fund_quarters(*r) for r in final[["add_q", "red_q", "add_6m", "red_6m"]].itertuples(index=False)]
     final["fonds_q"] = [f"▲ {a}  ▼ {r}" for a, r, _, _ in qs]
@@ -4430,11 +4440,11 @@ def render_investors_screener(max_days, use_cache, use_oi):
         "Alerte 7 j": view["alerte"], "Ticker": view["ticker"], "Société": view["name"], "Secteur": view["sector"],
         "Sortie PDG / DAF": view["sortie"],
         "Dirigeants · signal": view["signal"], "Dirigeants · achats 6 mois": view["achats_txt"],
-        "Dirigeants · ventes 3 mois": view["ventes_txt"], "Dirigeants · net 12 mois": view["net12"],
+        "Dirigeants · ventes 6 mois": view["ventes_txt"], "Dirigeants · net 12 mois": view["net12"],
         "Dirigeants · 12 derniers mois": view["frise"], "Dirigeants · dernière opération": view["derniere_txt"],
         "Fonds · signal": view["fonds"], "Fonds · dernier trimestre": view["fonds_q"],
         "Fonds · trimestre précédent": view["fonds_p"],
-        "Fonds · détenteurs": view["owners"],
+        "Fonds · détenteurs": view["owners"], "Fonds · prix moyen ($)": view["hold"],
         "Dataroma": dr_link(view["ticker"]), "OpenInsider": "http://openinsider.com/" + view["ticker"]})
     t1, t2, t3 = st.tabs(["Tableau", "Transactions", "Diagnostic"])
     with t1:
@@ -4461,6 +4471,9 @@ def render_investors_screener(max_days, use_cache, use_oi):
             "Fonds · trimestre précédent": st.column_config.TextColumn(help="même lecture, trimestre d'avant (grille "
                                                                             "« 6 mois » moins le dernier trimestre)"),
             "Fonds · détenteurs": st.column_config.NumberColumn(help="nb de superinvestors qui détiennent la valeur"),
+            "Fonds · prix moyen ($)": st.column_config.NumberColumn(format="%.2f", help=(
+                "prix de détention moyen des superinvestors (« Hold Price » de la fiche Dataroma) ; lu avec la fiche de "
+                "chaque valeur : case « Fonds : pondérer par la conviction » cochée")),
             "Dataroma": st.column_config.LinkColumn(display_text="fiche"),
             "OpenInsider": st.column_config.LinkColumn(display_text="fiche")})
         st.caption("Colonnes « Dirigeants » : transactions des dirigeants et administrateurs (OpenInsider). " + sg.LEGEND
@@ -4577,7 +4590,7 @@ def render_amf_screener():
         min_sig = c[1].select_slider("Montant significatif", [10_000, 25_000, 50_000, 100_000, 250_000, 500_000],
                                      50_000, key="amf_min_sig",
                                      format_func=lambda v: f"{v:,.0f} €".replace(",", " "),
-                                     help="Sous ce montant, achats (6 mois) ou ventes (3 mois) ne comptent pas dans "
+                                     help="Sous ce montant, achats (6 mois) ou ventes (6 mois) ne comptent pas dans "
                                           "le signal.")
         go = c[2].button("Lancer l'analyse", type="primary", key="amf_go")
     if universe == "sbf120" and _sbf120() is None:
@@ -4617,7 +4630,7 @@ def render_amf_screener():
     show = pd.DataFrame({
         "Alerte 7 j": view["alerte"], "Signal": view["signal"], "Société": view["societe"],
         "Achats 6 mois": view["achats_txt"],
-        "Ventes 3 mois": view["ventes_txt"], "Net 12 mois": view["net12"], "12 derniers mois": view["frise"],
+        "Ventes 6 mois": view["ventes_txt"], "Net 12 mois": view["net12"], "12 derniers mois": view["frise"],
         "Dernière opération": view["derniere_txt"], "Opérations (12 mois)": view["n_tx"].astype(int),
         "Dernière déclaration": view["key"].map(last_pdf)})
     t1, t2, t3 = st.tabs(["Tableau", "Transactions", "Diagnostic"])
@@ -4764,7 +4777,7 @@ def concord_insiders(ins, tk):
     out.update({"Signal": r["signal"], "Frise": r["frise"], "Dernière opération": r["derniere_txt"],
                 "Alerte": r["alerte"],
                 "Résumé": (f"{r['alerte']} · " if r["alerte"] else "") + (f"{warn} · " if warn else "")
-                          + f"{r['signal']} · achats 6 m {_inner(r['achats_txt'])} · ventes 3 m {_inner(r['ventes_txt'])} · "
+                          + f"{r['signal']} · achats 6 m {_inner(r['achats_txt'])} · ventes 6 m {_inner(r['ventes_txt'])} · "
                           f"net 12 m {net}"})
     return out
 
@@ -4839,7 +4852,7 @@ def amf_insiders(isin, name=""):
         "Signal": r["signal"], "Frise": r["frise"], "Dernière opération": r["derniere_txt"],
         "Alerte": r["alerte"],
         "Résumé": (f"{r['alerte']} · " if r["alerte"] else "")
-                  + f"{r['signal']} · achats 6 m {_inner(r['achats_txt'])} · ventes 3 m {_inner(r['ventes_txt'])} · net 12 m {net}",
+                  + f"{r['signal']} · achats 6 m {_inner(r['achats_txt'])} · ventes 6 m {_inner(r['ventes_txt'])} · net 12 m {net}",
         "Achats 365j": round(b["value"].sum() / 1e6, 2), "Ventes 365j": round(v["value"].sum() / 1e6, 2),
         "Acheteurs": int(b["person"].nunique()), "Achats groupés (max en 30 j)": int(r["group_buy"]),
         "Achats notables": [f"{x.declarant} ({x.fonction}) {x.date:%d/%m/%y} : {sg.money(x.value, '€')}"
@@ -4937,7 +4950,7 @@ FMT = {
              "celle du scénario central (consensus Zonebourse compris). Fiche seule : croissance du flux libre / du BNA "
              "plafonnée. 🟢 attendue ≥ implicite + 5 pts : le marché est pessimiste ; 🔴 le cours suppose plus que "
              "prévu ; ⚪ cohérent."),
-    "Initiés (12 m)": st.column_config.TextColumn(width="large", help="Même calcul et mêmes seuils que le screener investors : 🟢 achats des dirigeants sur 6 mois sans vente significative sur 3 mois · 🟠 achats et ventes récentes · 🔴 ventes récentes (3 mois) supérieures aux achats · ⚪ non significatif ; « achats groupés » = ≥ 3 dirigeants en 30 j. Ventes avec levée d'options exclues."),
+    "Initiés (12 m)": st.column_config.TextColumn(width="large", help="Même calcul et mêmes seuils que le screener investors : 🟢 achats des dirigeants sur 6 mois sans vente significative sur 6 mois · 🟠 achats et ventes récentes · 🔴 ventes récentes (6 mois) supérieures aux achats · ⚪ non significatif ; « achats groupés » = ≥ 3 dirigeants en 30 j. Ventes avec levée d'options exclues."),
     "Super investors (6 m)": st.column_config.TextColumn(width="large", help="Rond pondéré par la conviction (fiche Dataroma lue) : chaque mouvement compte pour le poids qu'il représente dans le portefeuille du gérant, en points (5 au plus par fonds) — 🟢 ≥ +0,5 pt · 🔴 ≤ −0,5 pt · 🟠 achats et ventes qui se compensent · ⚪ symbolique ; puis le nombre de fonds : trim. / préc. = ▲ renforcements ▼ allègements sur 6 mois (dernier trimestre et trimestre précédent). Sans fiche lue : même calcul que le screener investors (grilles Dataroma, S&P 500) : rond d'après le dernier trimestre (🟢 plus de fonds qui renforcent, 🔴 plus qui allègent, 🟠 autant), ↗ / ↘ tendance par rapport au trimestre précédent ; trim. / préc. = ▲ renforcements ▼ allègements. Hors S&P 500 : résumé de la fiche Dataroma (dernier mouvement de chaque détenteur). % = poids de la ligne dans le portefeuille du gérant."),
     "Put/Call (total / ±10 %)": st.column_config.TextColumn(help="encours puts / calls ; >1 prudence, <0,7 optimisme"),
     "BNA N": st.column_config.NumberColumn(format="%.2f", help="BNA de l'exercice en cours (consensus)"),
@@ -6481,7 +6494,7 @@ def render_detail(f, d, t=None, ns=""):
                 st.markdown(f"12 derniers mois : {ins['Frise']} · dernière opération : {ins['Dernière opération']}")
                 st.caption(("Même calcul que le screener AMF (même seuil). " if ins.get("Source") in ("déclarations AMF", "registre AFM (Pays-Bas)")
                             else "Même calcul que le screener investors (mêmes seuils). ") + "🟢 achats sur 6 mois sans vente "
-                           "significative sur 3 mois · 🟠 achats et ventes récentes · 🔴 ventes récentes supérieures aux "
+                           "significative sur 6 mois · 🟠 achats et ventes récentes · 🔴 ventes récentes supérieures aux "
                            "achats · ⚪ non significatif. Frise : 🟩 achats nets, 🟥 ventes nettes, ⬜ rien.")
             keep = ("Achats 365j", "Ventes 365j", "Acheteurs", "Achats groupés (max en 30 j)", "Achats PDG / DAF (M$)",
                     "Hausse médiane de détention (%)", "Ventes avec levée d'options (M$)")
@@ -7136,7 +7149,7 @@ la société (prime / dans la norme / décote) affichée en section 5. VE/EBITDA
 Valeur cyclique : BNA et EBITDA de milieu de cycle, multiples des pairs non plafonnés.
 
 **Signal des initiés** (screeners investors et AMF, même règle) : 🟢 achats de dirigeants ≥ seuil sur 6 mois sans
-vente significative sur 3 mois · 🟠 achats sur 6 mois mais aussi des ventes récentes (3 mois) · 🔴 ventes récentes
+vente significative sur 6 mois · 🟠 achats sur 6 mois mais aussi des ventes récentes (6 mois) · 🔴 ventes récentes
 supérieures aux achats des 6 mois · ⚪ montants sous le seuil ou mouvements anciens. « Achats groupés » / « ventes
 groupées » : au moins 3 dirigeants distincts dans la même fenêtre de 30 jours. Frise : solde mensuel achats − ventes
 sur 12 mois (🟩 achats nets, 🟥 ventes nettes, ⬜ rien), pour voir d'un coup d'œil si les achats se répètent et si des

@@ -11,9 +11,9 @@ Entrée : une transaction par ligne, colonnes
     name     (facultatif) nom et fonction affichés pour la dernière opération
 
 Règles (fenêtres glissantes à partir d'aujourd'hui) :
-    🟢 favorable     achats ≥ seuil sur 6 mois, pas de vente significative sur 3 mois
-    🟠 mitigé        achats ≥ seuil sur 6 mois ET ventes ≥ seuil sur 3 mois, ventes ≤ achats
-    🔴 défavorable   ventes ≥ seuil sur 3 mois, supérieures aux achats des 6 mois
+    🟢 favorable     achats ≥ seuil sur 6 mois, pas de vente significative sur 6 mois
+    🟠 mitigé        achats ≥ seuil sur 6 mois ET ventes ≥ seuil sur 6 mois, ventes ≤ achats
+    🔴 défavorable   ventes ≥ seuil sur 6 mois, supérieures aux achats des 6 mois
     ⚪ non significatif (montants sous le seuil, ou mouvements anciens seulement)
     + « achats groupés »  : ≥ 3 acheteurs distincts en 30 jours (6 derniers mois)
     + « ventes groupées » : ≥ 3 vendeurs distincts en 30 jours (3 derniers mois)
@@ -29,7 +29,7 @@ import pandas as pd
 GROUP_N = 3          # dirigeants distincts pour un mouvement « groupé »
 GROUP_DAYS = 30
 BUY_DAYS = 182       # achats : 6 mois
-SELL_DAYS = 91       # ventes récentes : 3 mois
+SELL_DAYS = 182      # ventes récentes : 6 mois (même fenêtre que les achats et que les fonds Dataroma)
 ALERT_DAYS = 7       # alerte : transaction d'un dirigeant dans les 7 derniers jours
 ALERT_SELL, ALERT_BUY = "🚨", "✅"
 EXIT_DAYS = 182      # sortie d'un dirigeant de premier rang après levée d'options : 6 derniers mois
@@ -39,8 +39,8 @@ TOP_ROLE = re.compile(r"\b(?:CEO|Chief Executive|CFO|Chief Financial|President|P
 TREND_MIN = 2        # fonds : écart de solde (renforcements − allègements) entre deux trimestres pour une tendance
 
 RANK = {"🟢": 0, "🟠": 1, "🔴": 2, "⚪": 3}
-LEGEND = ("🟢 achats sur 6 mois, sans vente significative sur 3 mois · 🟠 achats sur 6 mois mais aussi des ventes "
-          "récentes (3 mois) · 🔴 ventes récentes supérieures aux achats · ⚪ mouvements non significatifs ou anciens. "
+LEGEND = ("🟢 achats sur 6 mois, sans vente significative sur 6 mois · 🟠 achats sur 6 mois mais aussi des ventes "
+          "récentes (6 mois) · 🔴 ventes récentes supérieures aux achats · ⚪ mouvements non significatifs ou anciens. "
           "« achats groupés » / « ventes groupées » : au moins 3 dirigeants distincts dans la même fenêtre de 30 jours. "
           "Frise : un carré par mois sur 12 mois, du plus ancien au plus récent — 🟩 achats nets, 🟥 ventes nettes, "
           "⬜ aucune opération. Alerte 7 j : 🚨 vente / ✅ achat d'un dirigeant dans les 7 derniers jours.")
@@ -85,7 +85,7 @@ def _months(today: pd.Timestamp) -> list[pd.Period]:
 
 def summarize(tx: pd.DataFrame, today: Optional[date] = None, min_sig: float = 50_000,
               cur: str = "€") -> pd.DataFrame:
-    """Une ligne par valeur : signal, achats 6 mois, ventes 3 mois, solde 12 mois, barres mensuelles."""
+    """Une ligne par valeur : signal, achats 6 mois, ventes 6 mois, solde 12 mois, barres mensuelles."""
     today = pd.Timestamp(today or date.today()).normalize()
     cols = ["key", "signal", "dot", "rank", "buy6", "buyers6", "months6", "sell3", "sellers3", "sell3_mandate",
             "buy12", "sell12", "net12", "monthly", "frise", "group_buy", "group_sell", "last_date", "last_side",

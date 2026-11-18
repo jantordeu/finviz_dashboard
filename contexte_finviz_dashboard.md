@@ -242,3 +242,7 @@ Effet sur les 32 fiches : seule Stellantis bouge (JV 12,9 → 6,2 €).
 - `_spec_tgt` : multiples que suppose l'objectif des analystes (VE/CA N, N+1, VE/EBITDA dernière année), affiché en section 7 et dans la fiche PDF.
 - `zb["ca"]` (chiffre d'affaires par exercice) ajouté ; PAGE_PARSE_VERSION = 6.
 - Tests : Intuitive Machines 13,9 $ (Zonebourse seul, 177 M d'actions) ou 10,8 $ (combiné Finviz, 228 M d'actions) vs objectif 25,2 ; Redwire 6,2 $ vs 12,3. Les 32 autres fiches inchangées.
+
+## Ventes dirigeants sur 6 mois + prix moyen des fonds (Dataroma)
+- `signaux.SELL_DAYS` = 182 (avant 91) : achats, ventes de dirigeants et mouvements de fonds Dataroma couvrent tous 6 mois. Libellés « ventes 6 mois » partout (tableaux, aides, méthode, fiche). Un 🟢 exige désormais l'absence de vente significative sur 6 mois (certains 🟢 passent 🟠/🔴).
+- Screener investisseurs : colonne « Fonds · prix moyen ($) » = « Hold Price » de la fiche Dataroma (un prix moyen par valeur, pas par fonds). `_inv_conviction` renvoie (rows, hold) ; `st.session_state["inv_hold"]`. Remplie seulement si « Fonds : pondérer par la conviction » est cochée (une fiche lue par ticker).
