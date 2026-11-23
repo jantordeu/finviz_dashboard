@@ -3398,13 +3398,21 @@ def simple_reading(f, fv, cur=""):
         txt += f"Le BNA {lab} est de {q(ref)}. "
     hi_ref = max(x for x in (e12, e1) if (x or 0) > 0)
     lo_ref = min(x for x in (e12, e1) if (x or 0) > 0)
+    src_m = ("PER fixes retenus pour une valeur cyclique" if f.get("cyclical") else
+             f"{c}x = PER historique médian de l'action" if f.get("pe_hist") else
+             f"{c}x = PER actuel sur le BNA de l'an prochain")
+    now_ = " et ".join(x for x in (
+        f"{price / e12:.1f}x le BNA des 12 derniers mois".replace(".", ",") if (e12 or 0) > 0 else "",
+        f"{price / e1:.1f}x celui de l'an prochain".replace(".", ",") if (e1 or 0) > 0 else "") if x)
+    txt += f"({src_m} ; aujourd'hui le cours paie {now_}.) "
     if req > hi_ref * 1.1:
         txt += (f"Autrement dit, à {c}x le cours suppose des bénéfices supérieurs à tout ce qui est publié ou attendu "
                 f"({(req / hi_ref - 1) * 100:+.0f} %) : il se paie plus cher que {c}x, ou parie sur une hausse au-delà "
                 "du consensus.")
     elif req > lo_ref * 1.1:
-        txt += (f"Autrement dit, à {c}x le cours suppose que la hausse des bénéfices attendue se réalise ; il n'est pas "
-                "à l'abri d'un recul si elle n'arrive pas.")
+        txt += (f"Autrement dit, à {c}x il faut un BNA de {q(req)}, entre le niveau actuel ({q(lo_ref)}) et le niveau "
+                f"attendu ({q(hi_ref)}) : le cours suppose qu'une partie de la hausse des bénéfices attendue se "
+                "réalise ; il n'est pas à l'abri d'un recul si elle n'arrive pas.")
     elif req >= lo_ref * 0.9:
         txt += (f"Autrement dit, à {c}x le cours suppose que les bénéfices actuels se maintiennent à peu près ; il "
                 "n'est pas pour autant à l'abri d'un recul s'ils baissent.")
@@ -3433,7 +3441,7 @@ def simple_reading(f, fv, cur=""):
         src = "Zonebourse"
         comps = [{"Société": x["name"], "PER 12 derniers mois": None, "PER sur BNA N+1": x.get("pe")}
                  for x in f["zb_peers"][:8] if x.get("pe")]
-    own = {"Société": f"► {f.get('ticker') or f.get('name')}",
+    own = {"Société": str(company_name(f, 30) or f.get("ticker") or f.get("name") or "Société") + " (la société)",
            "PER 12 derniers mois": (price / e12 if (e12 or 0) > 0 else None),
            "PER sur BNA N+1": (price / e1 if (e1 or 0) > 0 else None)}
     ctxt = ""
