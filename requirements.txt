@@ -1,6 +1,7 @@
 # Finviz Dashboard — bibliothèques Python nécessaires
 # Installation : pip install -r requirements.txt
 # Lancement    : streamlit run finviz_dashboard.py
+# Arrêt        : touche control (⌃) + C dans le Terminal (sur Mac aussi ; Command + C ne fait que copier)
 
 # Interface et calculs
 streamlit>=1.66.0

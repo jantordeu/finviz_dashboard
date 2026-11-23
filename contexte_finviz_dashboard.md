@@ -246,3 +246,59 @@ Effet sur les 32 fiches : seule Stellantis bouge (JV 12,9 → 6,2 €).
 ## Ventes dirigeants sur 6 mois + prix moyen des fonds (Dataroma)
 - `signaux.SELL_DAYS` = 182 (avant 91) : achats, ventes de dirigeants et mouvements de fonds Dataroma couvrent tous 6 mois. Libellés « ventes 6 mois » partout (tableaux, aides, méthode, fiche). Un 🟢 exige désormais l'absence de vente significative sur 6 mois (certains 🟢 passent 🟠/🔴).
 - Screener investisseurs : colonne « Fonds · prix moyen ($) » = « Hold Price » de la fiche Dataroma (un prix moyen par valeur, pas par fonds). `_inv_conviction` renvoie (rows, hold) ; `st.session_state["inv_hold"]`. Remplie seulement si « Fonds : pondérer par la conviction » est cochée (une fiche lue par ticker).
+
+## Compatibilité Streamlit ancien (lancement terminal / anaconda)
+- Erreur « 'stretch' has type str, but expected int » : l'anaconda du Mac a un Streamlit < 1.50, PyCharm un récent. `_compat_streamlit()` (début de finviz_dashboard.py) traduit `width="stretch"` en `use_container_width=True` si version < 1.50. Recommandé quand même : `pip install -U "streamlit>=1.66"` dans l'anaconda (autres fonctions récentes utilisées).
+- À faire au prochain update : expliquer la case « Fonds : pondérer par la conviction » dans la section Méthode.
+
+## « Too many open files » (macOS, 256 fichiers par défaut)
+- Cause : `_session()` créait une session cloudscraper par valeur (ex. `_inv_conviction`, analyse de nombreuses pages) sans la fermer. Maintenant une session par thread, réutilisée (`_TLS`). `_raise_file_limit()` relève la limite à 4096 au démarrage. Lectures `open(...)` sans `with` remplacées par `Path.read_*`.
+
+## Peter Lynch Fair Value (recoupement, hors JV)
+- `peter_lynch(f)` : BNA 12 m × croissance (%), PEG = 1 ; croissance de l'EBITDA PAR ACTION (comme GuruFocus ; repli BNA) = moyenne (prévue Zonebourse 3 ans, passée jusqu'à 5 ans), plafonnée de façon DYNAMIQUE (`pl_cap`) : 20 % + 0,5 pt par point de croissance réelle au-delà de 20 %, jusqu'à 30 % (atteint à 40 %/an) ; BNA 12 m = dernier exercice publié avancé vers l'exercice en cours au prorata de l'année écoulée (⚠️ = plafond atteint). n.d. si BNA ≤ 0 ou prévu > +100 %/an (rebond). Colonne « Peter Lynch » du tableau portefeuille/valeurs à étudier et ligne caption dans « En bref » de la fiche. N'entre pas dans la JV. Hypothèse « moyenne » pour « pondéré à la hausse par la croissance passée » (à confirmer).
+
+## Peter Lynch — contrôle (audit) et corrections
+- BNA 12 mois : prorata par `fiscal_elapsed(f)` = temps écoulé depuis la clôture du dernier exercice publié (mois de « Période Fiscale » + date de publication, stockés dans `zb["pubL"]`, `zb["fy_month"]` ; PAGE_PARSE_VERSION 7), à la date des pages. Avant : jour de l'année civile -> faux en janvier-février (BNA en retard d'un an) et pour les exercices décalés (NVDA, ORCL, ENR…).
+- Non calculée, motif affiché (`{"na": …}`) : cyclique ; rebond (croissance prévue du BNA ou de l'EBITDA/action > 100 %/an) ; bénéfices attendus en baisse ; croissance < `PL_G_MIN` = 10 %.
+- Plafond dynamique `pl_cap` : 20 % + 0,5 pt par point au-delà de 20 %, max 30 % (à 40 %/an).
+- Limite connue : BNA Zonebourse comptable très bas (ex. PANW 0,73) -> valeur sans signification.
+- Peter Lynch aussi dans la fiche PDF/Word : paragraphe en fin de section 6 (`peter_lynch_phrase`, partagé avec l'écran).
+- Peter Lynch, écran = PDF : section 6 « Synthèse » des deux côtés — ligne « Peter Lynch (recoupement) » (Retenue : information) dans le tableau des méthodes quand elle est calculée + phrase de détail sous le tableau ; retirée de « En bref ». `render_fv_tables(fv, cur, f)`.
+- Libellés « Peter Lynch (GuruFocus) » partout (colonne, tableau section 6, phrase, PDF) pour rappeler l'origine de la méthode.
+- 21/11 : Peter Lynch MASQUÉE (`PL_SHOW = False`) à la demande de l'utilisateur : elle perturbait la lecture (ex. GOOGL : 435 $ chez nous, 300 $ sur GuruFocus, JV 317 $). Code conservé ; ne pas la réafficher sans avoir reproduit le calcul exact de GuruFocus.
+
+## Repère « DCF GuruFocus (bénéfices) » (21/11, à la demande de l'utilisateur)
+- `gf_dcf(f)` : formule exacte du calculateur GuruFocus (vérifiée sur Alphabet : BNA 12,02, +20 %, 11 % -> 375,6 $ pour 375,5 $ affichés) : 10 ans de BNA croissant à g1 puis 10 ans à 4 %, actualisés à d ; rien après 20 ans ; dette ignorée. g1 = croissance passée du BNA (plus longue période publiée dans Zonebourse, 3 à 10 ans — souvent 4-5 ans, GuruFocus : 10 ans) bornée 5–20 % (5 % sans historique) ; d = plafond(taux 10 ans `DEFAULT_P["rf"]`) + 6 % = 11 %. BNA de départ = `eps_12m(f)` (partagé avec Peter Lynch), ramené au BNA N+1 si l'exercice en cours le dépasse (exceptionnel).
+- Affichage section 6 (écran, PDF, Word) : ligne « DCF GuruFocus (bénéfices) — repère » (Retenue : information) + phrase de détail. `GF_SHOW`. Hors JV. Écarts possibles avec le site : BNA hors exceptionnels (Zonebourse = BNA publié), durée de l'historique.
+
+## Révisions du consensus (21/11)
+- Les pages Zonebourse téléchargées sont ÉCRASÉES à chaque téléchargement (zb_pages/<valeur>/finances.html) : pas d'historique des pages. D'où un fichier de relevés : `data/consensus_hist.csv` (jamais dans le zip, donc conservé d'une mise à jour à l'autre) — colonnes key (ISIN sinon ticker) ; ticker ; date des pages ; an ; bna ; ca ; titres ; cur. Un relevé par valeur et par date (exercices N à N+2), écrit par `cons_record(f)` appelé dans `analyze`.
+- `cons_revisions(f)` : compare le même exercice (N+1, à défaut N) au plus ancien relevé des 100 derniers jours (≥ 5 jours). 🟢 BNA ≥ +2 %, 🔴 ≤ −2 %, ⚪ sinon ; n.d. au 1er relevé, si le relevé précédent est trop récent/ancien, ou si le nombre d'actions a changé de plus de 20 % (division du titre).
+- Affichage : colonne « Révisions du consensus » (tableau portefeuille / valeurs à étudier, après BNA N+1) ; phrase en fin de section 3 de la fiche (écran, PDF, Word).
+- Testé sur les pages réelles à plusieurs dates (ex. NVDA 05/11 -> 19/11 : BNA 2028 +3,9 %, CA +4,7 % 🟢).
+- Doublon `_cagr` supprimé (une seule définition).
+
+## Gérants de référence (Baggr)
+`REF_FUNDS` (finviz_dashboard.py) : Ackman (Pershing Square), Greenberg (Brave Warrior), Rolfe (Wedgewood), Spier (Aquamarine), Abel/Berkshire.
+Sélection manuelle sur Baggr (≤ 60 lignes ; Spier et Abel battent SPY sur 1 an). Repérés par nom/fonds dans les lignes Dataroma
+(`parse_dataroma` garde maintenant la colonne « Fonds »). Affichage : fiche (« Gérants de référence » : poids + dernier mouvement)
+et colonne « Gérants de référence » du screener investors (nécessite la lecture des fiches Dataroma). N'entre pas dans les signaux.
+
+## Onglet « ⭐ Gérants de référence »
+`REF_MANAGERS` (codes Dataroma : psc, CCM, WP, aq, BRK) ; `parse_dataroma_manager` lit holdings.php?m=CODE (ticker, % portefeuille,
+mouvement du trimestre, cours déclaré / actuel) ; `_ref_load` (cache 6 h) ; `render_ref_managers`. Initiés : `an.fetch_openinsider` sur les
+tickers détenus (12 mois, hors levées d'options) puis `sg.summarize` ; pas de repli Finviz dans cet onglet (« — » si OpenInsider est down).
+Vues : par gérant, achats/renforcements, allègements/sorties, titres communs, tableau complet.
+
+### Rotation des gérants de référence
+Liste éditable dans l'onglet (expander « Gérants suivis ») : retirer, ajouter depuis le catalogue Dataroma (`_ref_catalog`, managers.php) ou
+saisie manuelle (nom · fonds + code Dataroma). Enregistrée dans `data/ref_managers.json` (`ref_managers_get/save`, défaut `REF_DEFAULT`).
+`ref_keys()` déduit les mots de repérage (nom de famille + début du fonds) pour la colonne « Gérants de référence » du screener et des fiches.
+Limite : seuls les gérants présents sur Dataroma (13F US) sont ajoutables.
+
+## Lecture simple de l'écart JV / objectif (section 7)
+`simple_mults(f)` (10/12/15x si cyclique, sinon ~0,8 / 1 / 1,25 × PER historique médian, base bornée 10–32) ; `simple_reading(f, fv, cur)` :
+phrase « pour justifier le cours il faut un BNA normal de … », tableau BNA requis (cours / JV / objectif), scénarios BNA × multiples
+(consensus N+2, N+1, 12 derniers mois, milieu de cycle ou moyenne, point bas ; non cyclique : « déception −20 % » à la place de l'historique lointain),
+valorisation comparée (PER 12 mois et N+1 de la valeur et de ses pairs Finviz / Zonebourse + médiane). Écran, PDF et Word. `SIMPLE_NOTE`.
+L'ancienne analyse (pont, repères, prime, causes) suit sous « Analyse détaillée ».

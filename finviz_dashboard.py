@@ -3,6 +3,7 @@
 #
 #  Installation : pip install -r requirements.txt
 #  Lancement    : streamlit run finviz_dashboard.py
+#  Arrêt        : touche control (⌃) + C dans le Terminal (sur Mac aussi ; Command + C ne fait que copier)
 #
 #  Sources :
 #   - finviz.com (en ligne) : fiche (ratios, consensus, analystes, initiés, actualités), états financiers
@@ -64,6 +65,54 @@ from bs4 import BeautifulSoup
 
 import edgar_sec as ES
 
+
+def _raise_file_limit(target=4096):
+    """macOS : 256 fichiers ouverts par défaut ; la limite est relevée (jusqu'au maximum autorisé) au démarrage."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        new = target if hard == resource.RLIM_INFINITY else min(target, hard)
+        if soft < new:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (new, hard))
+    except Exception:  # noqa: BLE001 — Windows ou droits insuffisants : sans effet
+        pass
+
+
+_raise_file_limit()
+
+
+def _compat_streamlit():
+    """Streamlit < 1.50 (ex. anaconda lancé depuis le terminal) ne connaît pas width="stretch" : on le traduit en
+    use_container_width=True. Sans effet avec une version récente (requirements.txt : streamlit>=1.66)."""
+    try:
+        import functools
+        from streamlit.delta_generator import DeltaGenerator
+        v_ = tuple(int(x) for x in st.__version__.split(".")[:2] if x.isdigit())
+        if v_ >= (1, 50):
+            return                                   # width="stretch" accepté
+
+        def _wrap(fn):
+            @functools.wraps(fn)
+            def inner(self, *a, **kw):
+                w = kw.get("width")
+                if w == "stretch":
+                    kw.pop("width")
+                    kw["use_container_width"] = True
+                elif w == "content":
+                    kw.pop("width")
+                return fn(self, *a, **kw)
+            return inner
+        for n_ in ("dataframe", "data_editor", "plotly_chart", "altair_chart", "pyplot", "image", "button",
+                   "download_button", "link_button", "form_submit_button"):
+            f_ = getattr(DeltaGenerator, n_, None)
+            if f_ is not None:
+                setattr(DeltaGenerator, n_, _wrap(f_))
+    except Exception:  # noqa: BLE001 — l'adaptation est facultative
+        pass
+
+
+_compat_streamlit()
+
 TODAY = datetime.now()
 CACHE_DIR = "./cache_finviz"
 CACHE_HOURS = 2                       # durée de validité du cache des pages en ligne
@@ -116,7 +165,7 @@ def read_xlsx_stdlib(file):
     import zipfile
     import xml.etree.ElementTree as ET
     ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-    data = file.read() if hasattr(file, "read") else open(file, "rb").read()
+    data = file.read() if hasattr(file, "read") else Path(file).read_bytes()
     z = zipfile.ZipFile(io.BytesIO(data))
     shared = []
     if "xl/sharedStrings.xml" in z.namelist():
@@ -187,13 +236,23 @@ def load_portfolio(file, only_nyse=False, all_ccy=False):
 # ============================================================
 #  COLLECTE (en ligne, avec cache disque)
 # ============================================================
+_TLS = __import__("threading").local()
+
+
 def _session():
+    """Une session HTTP par thread, réutilisée : en créer une par valeur laissait des centaines de connexions ouvertes
+    (macOS limite à 256 fichiers ouverts -> « Too many open files »)."""
+    s = getattr(_TLS, "s", None)
+    if s is not None:
+        return s
     try:
         import cloudscraper
-        return cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "darwin", "mobile": False})
+        s = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "darwin", "mobile": False})
     except ImportError:
         import requests
-        return requests.Session()
+        s = requests.Session()
+    _TLS.s = s
+    return s
 
 
 class FinvizBlocked(RuntimeError):
@@ -303,7 +362,7 @@ def parse_dataroma(html):
         for tr in grid.select("tbody tr"):
             c = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
             if len(c) >= 4:
-                out["rows"].append({"Gérant": c[1].split(" - ")[0], "% portefeuille": num(c[2]),
+                out["rows"].append({"Gérant": c[1].split(" - ")[0], "Fonds": c[1], "% portefeuille": num(c[2]),
                                     "Mouvement": c[3] or "=", "Actions": num(c[4]) if len(c) > 4 else None})
     return out
 
@@ -441,7 +500,7 @@ def clear_caches():
                     pass
     # toutes les lectures gardées en mémoire (pages, Reddit, grilles Dataroma, AMF, Yahoo…)
     for name_ in ("parse_zonebourse_cached", "raws_from_finviz_pages_cached", "fetch_apewisdom", "fund_grid",
-                  "amf_company_tx", "afm_company_tx", "fetch_yahoo_news", "_yf_history_cached", "_inv_load", "_inv_conviction",
+                  "amf_company_tx", "afm_company_tx", "fetch_yahoo_news", "_yf_history_cached", "_inv_load", "_inv_conviction", "_ref_load",
                   "_amf_load", "fetch_fear_greed"):
         try:
             globals()[name_].clear()
@@ -480,7 +539,7 @@ def parse_zonebourse_cached(htmls, name="", version=6):      # version : à augm
     return parse_zonebourse(list(htmls), name)
 
 
-PAGE_PARSE_VERSION = 6          # à augmenter quand la lecture des pages change (invalide la mémoire)
+PAGE_PARSE_VERSION = 7          # à augmenter quand la lecture des pages change (invalide la mémoire)
 
 
 @st.cache_data(show_spinner=False, max_entries=1000)
@@ -923,7 +982,10 @@ def parse_zonebourse(htmls, name=""):
          "insiders": None,
          "dataroma": {"n": None, "rows": []}, "ratings": [], "options": [],
          "zb": {"N": N, "L": L, "bna": bna, "ca": ca, "ebitda": eb, "capex": capex, "fcf": fcf, "nd": net_debt,
-                "div": div, "titres": titres, "bvps": bvps, "roe": roe, "rn": rn}}
+                "div": div, "titres": titres, "bvps": bvps, "roe": roe, "rn": rn,
+                "pubL": (pub.get(L) or "").strip(),                       # publication du dernier exercice (jj/mm/aa)
+                "fy_month": (lambda m_: m_.group(1).lower() if m_ else None)(
+                    re.search(r"Période Fiscale\s*:\s*([A-Za-zéûÉ]+)", txt))}}
     f["fx_note"] = fx_note
     st_ = zb_stamp(htmls[0])                       # date de la page la plus récente (en-tête Zonebourse)
     f["zb_date"] = f"{st_[2]}/{st_[1]}/{st_[0]}" if st_[0] else None
@@ -2418,7 +2480,7 @@ def zb_fetch_progress(log_path):
     """Avancement du téléchargement Zonebourse (journal relu toutes les 3 s, sans relancer le dashboard)."""
     proc = st.session_state.get("zbf_proc")
     try:
-        lines = [l.strip() for l in open(log_path, encoding="utf-8", errors="ignore") if l.strip()]
+        lines = [l.strip() for l in Path(log_path).read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip()]
     except OSError:
         lines = []
     if proc is not None and proc.poll() is None:
@@ -2449,7 +2511,7 @@ def zb_status_badge():
         return
     log_path = Path(ZF.PAGES_DIR) / "_run.log"
     try:
-        lines = [l.strip() for l in open(log_path, encoding="utf-8", errors="ignore") if l.strip()]
+        lines = [l.strip() for l in Path(log_path).read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip()]
     except OSError:
         lines = []
     prog = next((m.group(1) for l in reversed(lines) for m in [re.match(r"(?:OK|ERR)\s+(\d+/\d+)", l)] if m), "")
@@ -3263,6 +3325,144 @@ PREMIUM_NOTE = ("Non mesuré ici : carnet de commandes, thème porteur (IA, rés
                 "consensus et position concurrentielle — à lire dans les publications de la société.")
 
 
+# ---------------------------------------------------------------------------------------------------------------
+#  LECTURE SIMPLE (section 7) : ce que le cours, la juste valeur et l'objectif supposent comme bénéfice
+# ---------------------------------------------------------------------------------------------------------------
+def simple_mults(f):
+    """Trois multiples de bénéfices (bas, central, haut) : 10 / 12 / 15 pour une valeur cyclique ; sinon autour du
+    PER historique médian (ou du PER du marché sur le BNA N+1), bornés entre 8 et 40."""
+    if f.get("cyclical"):
+        return (10, 12, 15)
+    base = f.get("pe_hist") or f.get("fwd_pe") or 15
+    base = int(round(max(10, min(base, 32))))
+    lo, hi = int(round(base * 0.8)), int(round(base * 1.25))
+    return (min(lo, base - 2), base, max(hi, base + 2))
+
+
+def simple_reading(f, fv, cur=""):
+    """Lecture simple de l'écart cours / juste valeur / objectif : BNA « normal » qu'il faut pour justifier chaque
+    niveau, scénarios de BNA × multiples, et multiples des comparables. -> dict ou None (pas de BNA positif)."""
+    price, jv, tgt = f.get("price"), fv.get("JV centrale"), f.get("target")
+    e1, e12 = f.get("eps_next_y"), eps_12m(f)
+    if not price or not ((e1 or 0) > 0 or (e12 or 0) > 0):
+        return None
+    m = simple_mults(f)
+    lv = [(n, v) for n, v in (("Cours", price), ("Juste valeur calculée", jv), ("Objectif des analystes", tgt)) if v]
+    need = [{"Niveau": n, "Valeur": v, **{f"BNA requis à {k}x": v / k for k in m},
+             "PER sur BNA N+1": (v / e1 if (e1 or 0) > 0 else None)} for n, v in lv]
+    # --- scénarios de BNA (données publiées et consensus, pas de prévision maison)
+    zb = f.get("zb") or {}
+    bna = {int(k): v for k, v in (zb.get("bna") or {}).items() if v is not None}
+    N = zb.get("N")
+    hist = [v for y, v in sorted(bna.items()) if N and y < N][-5:] if N else []
+    if not hist:
+        hist = [v for _, v in (f.get("eps_hist") or [])[-5:] if v is not None]
+    sc = []
+    if N and bna.get(N + 2):
+        sc.append((f"Haussier : consensus {N + 2}", bna[N + 2]))
+    if (e1 or 0) > 0:
+        sc.append(("Consensus de l'an prochain (BNA N+1)", e1))
+    if (e12 or 0) > 0:
+        sc.append(("Plateau : rythme actuel (12 derniers mois)", e12))
+    if fv.get("_eps_mid"):
+        sc.append(("Normalisation : BNA de milieu de cycle", fv["_eps_mid"]))
+    elif len(hist) >= 3:
+        sc.append((f"Normalisation : moyenne des {len(hist)} derniers exercices", sum(hist) / len(hist)))
+    if len(hist) >= 3:
+        sc.append((f"Retournement : point bas des {len(hist)} derniers exercices", min(hist)))
+    ref0 = max([x for x in (e12, e1) if (x or 0) > 0])
+    if not f.get("cyclical"):       # valeur de croissance : le passé lointain n'est pas un scénario, une déception oui
+        sc = [x for x in sc if not x[0].startswith(("Normalisation : moyenne", "Retournement")) or x[1] >= 0.5 * ref0]
+        if (e1 or 0) > 0:
+            sc.append(("Déception : BNA N+1 inférieur de 20 % au consensus (hypothèse)", e1 * 0.8))
+    seen, scen = [], []
+    for lab, e in sorted(sc, key=lambda x: -x[1]):
+        if any(abs(e - o) <= 0.03 * max(abs(o), 1e-9) for o in seen):
+            continue
+        seen.append(e)
+        scen.append({"Scénario": lab, "BNA annuel": e,
+                     **{f"{k}x": (e * k if e > 0 else None) for k in m},
+                     **{f"{k}x vs cours (%)": ((e * k / price - 1) * 100 if e > 0 else None) for k in m}})
+    # --- phrase
+    c = m[1]
+    req = price / c
+    u = f" {cur.strip()}" if cur and cur.strip() else ""
+    q = lambda v: (f"{v:,.2f}".replace(",", " ").replace(".", ",") if abs(v) < 100
+                   else f"{v:,.0f}".replace(",", " ")) + u
+    txt = (f"Pour justifier le cours de {q(price)}, il faut un BNA « normal » de "
+           + ", ".join(f"{q(price / k)} à {k}x" for k in m[:-1]) + f" ou {q(price / m[-1])} à {m[-1]}x. ")
+    ref, lab = (e12, "des 12 derniers mois") if (e12 or 0) > 0 else (e1, "attendu l'an prochain")
+    if (e12 or 0) > 0 and (e1 or 0) > 0:
+        txt += f"Le BNA des 12 derniers mois est de {q(e12)} et le consensus de l'an prochain de {q(e1)}. "
+    else:
+        txt += f"Le BNA {lab} est de {q(ref)}. "
+    hi_ref = max(x for x in (e12, e1) if (x or 0) > 0)
+    lo_ref = min(x for x in (e12, e1) if (x or 0) > 0)
+    if req > hi_ref * 1.1:
+        txt += (f"Autrement dit, à {c}x le cours suppose des bénéfices supérieurs à tout ce qui est publié ou attendu "
+                f"({(req / hi_ref - 1) * 100:+.0f} %) : il se paie plus cher que {c}x, ou parie sur une hausse au-delà "
+                "du consensus.")
+    elif req > lo_ref * 1.1:
+        txt += (f"Autrement dit, à {c}x le cours suppose que la hausse des bénéfices attendue se réalise ; il n'est pas "
+                "à l'abri d'un recul si elle n'arrive pas.")
+    elif req >= lo_ref * 0.9:
+        txt += (f"Autrement dit, à {c}x le cours suppose que les bénéfices actuels se maintiennent à peu près ; il "
+                "n'est pas pour autant à l'abri d'un recul s'ils baissent.")
+    else:
+        txt += (f"Autrement dit, à {c}x le cours supporterait une baisse des bénéfices d'environ "
+                f"{(1 - req / lo_ref) * 100:.0f} % : il intègre déjà de la prudence.")
+    pc = lambda v: f"{v:+.0f} %".replace("-", "−")
+    if jv and tgt:
+        txt2 = (f"À {c}x, notre juste valeur ({q(jv)}) correspond à un BNA de {q(jv / c)} et l'objectif des analystes "
+                f"({q(tgt)}) à un BNA de {q(tgt / c)}")
+        if (e1 or 0) > 0:
+            txt2 += (f", soit {pc((jv / c / e1 - 1) * 100)} et {pc((tgt / c / e1 - 1) * 100)} par rapport au "
+                     "consensus de l'an prochain")
+        txt2 += (". L'écart entre les deux vient donc du bénéfice jugé durable (ou du multiple accepté), pas d'un "
+                 "calcul différent.")
+    else:
+        txt2 = ""
+    # --- comparables : multiple payé par le cours
+    comps, src = [], None
+    pr = [x for x in (f.get("peers") or []) if x.get("fpe") or x.get("pe")]
+    if pr:
+        src = "Finviz"
+        comps = [{"Société": x["ticker"], "PER 12 derniers mois": x.get("pe"), "PER sur BNA N+1": x.get("fpe")}
+                 for x in pr[:8]]
+    elif f.get("zb_peers"):
+        src = "Zonebourse"
+        comps = [{"Société": x["name"], "PER 12 derniers mois": None, "PER sur BNA N+1": x.get("pe")}
+                 for x in f["zb_peers"][:8] if x.get("pe")]
+    own = {"Société": f"► {f.get('ticker') or f.get('name')}",
+           "PER 12 derniers mois": (price / e12 if (e12 or 0) > 0 else None),
+           "PER sur BNA N+1": (price / e1 if (e1 or 0) > 0 else None)}
+    ctxt = ""
+    fx = lambda v: f"{v:.1f}x".replace(".", ",")
+    if comps:
+        med = _med([x["PER sur BNA N+1"] for x in comps if x.get("PER sur BNA N+1") and x["PER sur BNA N+1"] > 0])
+        if med and own["PER sur BNA N+1"]:
+            o = own["PER sur BNA N+1"]
+            if o > med * 1.2:
+                ctxt = (f"Le cours paie {fx(o)} les bénéfices attendus, contre {fx(med)} pour la médiane des "
+                        "comparables : il exige que les bénéfices tiennent mieux que ceux des pairs.")
+            elif o < med / 1.2:
+                ctxt = (f"Le cours paie {fx(o)} les bénéfices attendus, contre {fx(med)} pour la médiane des "
+                        "comparables : il est déjà payé avec prudence (le marché doute des bénéfices).")
+            else:
+                ctxt = (f"Le cours paie {fx(o)} les bénéfices attendus, proche de la médiane des comparables "
+                        f"({fx(med)}).")
+            comps.append({"Société": "Médiane des comparables", "PER 12 derniers mois":
+                          _med([x["PER 12 derniers mois"] for x in comps if x.get("PER 12 derniers mois")]),
+                          "PER sur BNA N+1": med})
+        comps.insert(0, own)
+    return {"mults": m, "need": need, "scen": scen, "txt": txt, "txt2": txt2, "comps": comps, "ctxt": ctxt,
+            "src": src, "cyc": bool(f.get("cyclical"))}
+
+
+SIMPLE_NOTE = ("Scénarios : bénéfices publiés et consensus, pas des prévisions ; les multiples sont une hypothèse "
+               "(10 à 15x pour une valeur cyclique, autour du PER historique sinon).")
+
+
 def gap_causes(f, fv, lev=None):
     """Raisons probables de l'écart juste valeur / objectif des analystes (fiche à l'écran et export PDF / Word)."""
     causes = []
@@ -3423,6 +3623,32 @@ def analyst_stats(f, days=180):
 SELL_WORDS = ("Reduce", "Sell")
 
 
+# Gérants de référence (≤ 60 lignes, sélection Baggr : surperformance de SPY) — repérés dans les fiches Dataroma.
+def ref_funds(rows):
+    """Lignes Dataroma détenues par les gérants de référence -> [(nom court, ligne)]."""
+    out = []
+    keys_all = ref_keys()
+    for r in rows or []:
+        low = f"{r.get('Gérant', '')} {r.get('Fonds', '')}".lower()
+        for nom, keys in keys_all.items():
+            if any(k in low for k in keys):
+                out.append((nom, r))
+                break
+    return out
+
+
+def ref_funds_txt(rows):
+    """« ⭐ Ackman 8,2 % (renforce 15 %) · Spier 12,0 % (inchangé) » ; « — » si aucun ne détient la valeur."""
+    parts = []
+    for nom, r in ref_funds(rows):
+        mv = (r.get("Mouvement") or "=").strip()
+        mv = {"=": "inchangé"}.get(mv, mv.replace("Add", "renforce").replace("Reduce", "allège")
+                                     .replace("Buy", "nouveau").replace("Sell", "sort"))
+        w = r.get("% portefeuille")
+        parts.append(f"{nom} {w:.1f} % ({mv})".replace(".", ",") if w is not None else f"{nom} ({mv})")
+    return "⭐ " + " · ".join(parts) if parts else "—"
+
+
 def superinvestor_stats(d, price=None):
     """Super investors (Dataroma, 13F du dernier trimestre) : nouveaux entrants, renforcements, allègements,
     sorties, pondérés par la conviction (part du portefeuille du gérant), et cours vs prix de détention moyen."""
@@ -3439,7 +3665,7 @@ def superinvestor_stats(d, price=None):
            "Allègent": len(red), "Sortent": len(out_),
            "Achats/renforts": len(new) + len(add), "Allègements": len(red) + len(out_),
            "Nouveaux entrants": ", ".join(r["Gérant"] for r in new) or "—",
-           "Prix de détention moyen": hold,
+           "Prix de détention moyen": hold, "Références": ref_funds_txt(rows),
            "Cours vs prix moyen (%)": round((price / hold - 1) * 100) if price and hold else None, "Lignes": rows}
     up = len(new) + len(add)
     down = len(red) + len(out_)
@@ -4325,6 +4551,284 @@ def _inv_conviction(tickers):
     return out, hold
 
 
+
+# ---------------------------------------------------------------------------------------------------------------
+#  ⭐ GÉRANTS DE RÉFÉRENCE : titres détenus, poids, renforcement / allègement, achats et ventes d'initiés
+# ---------------------------------------------------------------------------------------------------------------
+REF_DEFAULT = {"Bill Ackman · Pershing Square": "psc", "Glenn Greenberg · Brave Warrior": "CCM",
+               "David Rolfe · Wedgewood": "WP", "Guy Spier · Aquamarine": "aq",
+               "Greg Abel · Berkshire Hathaway": "BRK"}
+REF_FILE = Path(__file__).resolve().parent / "data" / "ref_managers.json"
+_STOP = {"capital", "management", "partners", "advisors", "investment", "investments", "group", "fund", "the", "and"}
+
+
+def ref_managers_get():
+    """Liste suivie {nom: code Dataroma} : fichier data/ref_managers.json s'il existe, sinon les 5 d'origine."""
+    try:
+        d = json.loads(REF_FILE.read_text(encoding="utf-8"))
+        if isinstance(d, dict) and d:
+            return {str(k): str(v) for k, v in d.items()}
+    except Exception:  # noqa: BLE001
+        pass
+    return dict(REF_DEFAULT)
+
+
+def ref_managers_save(d):
+    try:
+        REF_FILE.parent.mkdir(exist_ok=True)
+        REF_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def ref_keys(mgrs=None):
+    """Mots qui repèrent chaque gérant dans les fiches Dataroma : nom de famille + début du nom du fonds."""
+    out = {}
+    for nom, code in (mgrs or ref_managers_get()).items():
+        who, _, fund = nom.partition(" · ")
+        keys = [who.split()[-1].lower()] if who.split() else []
+        fw = [w for w in re.findall(r"[A-Za-z']+", fund) if w.lower() not in _STOP][:2]
+        if fw:
+            keys.append(" ".join(fw).lower())
+        if code.upper() == "BRK":
+            keys += ["buffett", "berkshire"]
+        out[who.split()[-1] if who.split() else nom] = tuple(dict.fromkeys(k for k in keys if len(k) > 2))
+    return out
+
+
+def parse_dataroma_manager(html):
+    """Page « holdings » d'un gérant Dataroma -> {"date", "n", "value", "rows"} ; une ligne par titre :
+    ticker, société, % portefeuille, mouvement du dernier trimestre, actions, cours déclaré, cours actuel."""
+    soup = BeautifulSoup(html, "html.parser")
+    txt = re.sub(r"\s+", " ", soup.get_text(" "))
+    out = {"date": None, "n": None, "value": None, "rows": []}
+    m = re.search(r"Portfolio date:\s*([0-9]{1,2} \w{3} \d{4})", txt)
+    out["date"] = m.group(1) if m else None
+    m = re.search(r"No\. of stocks:\s*(\d+)", txt)
+    out["n"] = int(m.group(1)) if m else None
+    m = re.search(r"Portfolio value:\s*\$([\d,]+)", txt)
+    out["value"] = num(m.group(1)) if m else None
+    grid = soup.select_one("#grid") or soup.find("table")
+    if not grid:
+        return out
+    # en-tête Dataroma : cellules <td> (pas <th>) ; à défaut, positions habituelles des colonnes
+    head = [re.sub(r"\s+", " ", th.get_text(" ", strip=True)).lower() for th in grid.select("thead th, thead td")]
+
+    def col(default, *keys):
+        for i, h in enumerate(head):
+            if any(h.startswith(k) for k in keys):
+                return i
+        return default
+    i_pct, i_mv, i_sh = col(2, "% of"), col(3, "recent"), col(4, "shares")
+    i_rep, i_cur = col(5, "reported"), col(8, "current")
+    for tr in grid.select("tbody tr"):
+        tds = tr.find_all("td")
+        a = tr.select_one("a[href*='stock.php']")
+        if not a or len(tds) < 4:
+            continue
+        c = [td.get_text(" ", strip=True) for td in tds]
+        sym = a["href"].split("sym=")[-1].split("&")[0]
+        label = a.get_text(" ", strip=True)
+        g = lambda i: c[i] if i is not None and i < len(c) else None
+        out["rows"].append({"Ticker": sym, "Société": label.split(" - ", 1)[-1].strip(),
+                            "% portefeuille": num(g(i_pct)), "Mouvement": (g(i_mv) or "").strip() or "=",
+                            "Actions": num(g(i_sh)), "Cours déclaré": num(re.sub(r"[^\d.,]", "", g(i_rep) or "")),
+                            "Cours actuel": num(re.sub(r"[^\d.,]", "", g(i_cur) or ""))})
+    return out
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _ref_load(mgrs=None):
+    """Portefeuilles (dernier 13F) des gérants de référence -> {nom: parse_dataroma_manager}.
+    mgrs : tuple de (nom, code Dataroma) ; clé du cache."""
+    out, errs = {}, []
+    for nom, code in (mgrs or tuple(ref_managers_get().items())):
+        try:
+            out[nom] = parse_dataroma_manager(_get(_session(), f"https://www.dataroma.com/m/holdings.php?m={code}",
+                                                   (0.3, 0.7)))
+        except Exception as e:  # noqa: BLE001
+            errs.append(f"{nom} : {e}")
+    return out, errs
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def _ref_catalog():
+    """Superinvestors suivis par Dataroma -> {« Nom · Fonds » : code} (page managers.php)."""
+    soup = BeautifulSoup(_get(_session(), "https://www.dataroma.com/m/managers.php", (0.3, 0.7)), "html.parser")
+    out = {}
+    for a in soup.select("a[href*='holdings.php?m=']"):
+        t = re.sub(r"\s+", " ", a.get_text(" ", strip=True))
+        code = a["href"].split("m=")[-1].split("&")[0]
+        if t and code and " - " in t:
+            who, fund = t.split(" - ", 1)
+            out.setdefault(f"{who.strip()} · {fund.strip()}", code)
+    return dict(sorted(out.items()))
+
+
+def _ref_mv(mv):
+    """« Add 12.40% » -> ('🟢 renforce', 12.4) ; « Buy » -> ('🟢 nouveau', None) ; « Reduce » -> ('🟠 allège', x)."""
+    mv = (mv or "=").strip()
+    k = mv.split()[0].capitalize() if mv != "=" else "="
+    n = num(mv.split()[-1]) if len(mv.split()) > 1 else None
+    lab = {"Buy": "🟢 nouveau", "Add": "🟢 renforce", "Reduce": "🟠 allège", "Sell": "🔴 sorti"}.get(k, "⚪ inchangé")
+    return lab + (f" {n:.0f} %" if n is not None else "")
+
+
+@st.fragment
+def render_ref_managers(use_cache):
+    """Onglet « Gérants de référence » : titres détenus, poids, mouvement du dernier trimestre et achats / ventes des
+    dirigeants (OpenInsider, 12 mois) sur chacun de ces titres."""
+    import signaux as sg
+    an, oi, grids = _ins_modules()
+    st.caption(f"{len(st.session_state.get('ref_mgrs') or ref_managers_get())} gérants concentrés, choisis par vos soins "
+               "(à l'origine : Ackman, Greenberg, Rolfe, Spier, Abel/Berkshire ; modifiables ci-dessus). "
+               "Source : dernier 13F lu sur Dataroma (trimestre clos, publié ~45 jours après) ; initiés : OpenInsider, "
+               "12 mois, hors levées d'options. Les titres hors États-Unis n'ont pas de données d'initiés.")
+    cur = st.session_state.get("ref_mgrs") or ref_managers_get()
+    with st.expander(f"⚙️ Gérants suivis ({len(cur)}) — retirer, ajouter, remplacer", expanded=False):
+        keep = st.multiselect("Gérants suivis", list(cur), default=list(cur), key="ref_keep",
+                              help="Retirez un gérant en le supprimant de la liste.")
+        try:
+            cat = _ref_catalog()
+        except Exception as e:  # noqa: BLE001
+            cat, _e = {}, e
+            st.caption(f"Liste Dataroma indisponible ({e}) : saisie manuelle ci-dessous.")
+        add = st.multiselect("Ajouter depuis la liste Dataroma (≈ 80 superinvestors)",
+                             [k for k in cat if k not in cur], key="ref_add",
+                             help="Tapez le nom du gérant ou du fonds pour filtrer.")
+        m1, m2 = st.columns(2)
+        man_nom = m1.text_input("Ou saisie manuelle : nom · fonds", key="ref_man_nom",
+                                placeholder="Mohnish Pabrai · Dalal Street")
+        man_code = m2.text_input("Code Dataroma", key="ref_man_code", placeholder="DS",
+                                 help="Dans l'adresse de la fiche : dataroma.com/m/holdings.php?m=XXXX")
+        b1, b2, _ = st.columns([1, 1, 3])
+        if b1.button("Appliquer", type="primary", key="ref_apply"):
+            new = {k: cur[k] for k in keep}
+            new.update({k: cat[k] for k in add if k in cat})
+            if man_nom.strip() and man_code.strip():
+                new[man_nom.strip()] = man_code.strip()
+            if new:
+                ref_managers_save(new)
+                st.session_state["ref_mgrs"] = new
+                st.session_state.pop("ref_ins_data", None)
+                for k_ in ("ref_keep", "ref_add", "ref_man_nom", "ref_man_code"):
+                    st.session_state.pop(k_, None)
+                st.session_state["ref_on"] = True
+                st.rerun()
+            else:
+                st.warning("Gardez au moins un gérant.")
+        if b2.button("Rétablir les 5 d'origine", key="ref_reset"):
+            ref_managers_save(dict(REF_DEFAULT))
+            st.session_state["ref_mgrs"] = dict(REF_DEFAULT)
+            st.session_state.pop("ref_ins_data", None)
+            for k_ in ("ref_keep", "ref_add", "ref_man_nom", "ref_man_code"):
+                st.session_state.pop(k_, None)
+            st.rerun()
+        st.caption("Seuls les gérants suivis par Dataroma (13F américains) peuvent être ajoutés ; la liste est gardée "
+                   "dans data/ref_managers.json et alimente aussi la colonne « Gérants de référence » du screener "
+                   "investors et des fiches.")
+    c = st.columns([1, 1, 1])
+    min_w = c[0].number_input("Poids minimum (%)", 0.0, 50.0, 1.0, 0.5, key="ref_minw",
+                              help="Masque les lignes très petites (reliquats, ETF).")
+    min_sig = c[1].select_slider("Montant significatif (initiés)", [25_000, 50_000, 100_000, 250_000, 500_000],
+                                 100_000, key="ref_minsig", format_func=lambda v: f"{v:,.0f} $".replace(",", " "))
+    with_ins = c[2].checkbox("Ajouter les initiés (OpenInsider)", value=True, key="ref_ins",
+                             help="Un téléchargement par titre : ≈ 1 minute. Décoché : portefeuilles seuls.")
+    if c[2].button("Charger / actualiser", type="primary", key="ref_go"):
+        if not use_cache:
+            _ref_load.clear()
+        st.session_state.pop("ref_ins_data", None)
+        st.session_state["ref_on"] = True
+    if not st.session_state.get("ref_on"):
+        st.info("Cliquez sur **Charger / actualiser**.")
+        return
+    port, errs = _ref_load(tuple(cur.items()))
+    for e in errs:
+        st.warning(e)
+    vides = [n for n, d in port.items() if not d.get("rows")]
+    if vides:                       # page lue mais tableau non reconnu : ne pas garder ce résultat 6 h
+        _ref_load.clear()
+        st.warning("Portefeuille non lu sur Dataroma pour : " + ", ".join(vides)
+                   + " (code Dataroma erroné, ou page indisponible). Cliquez de nouveau sur « Charger / actualiser ».")
+    if not port:
+        return
+    rows = []
+    for nom, d in port.items():
+        for r in d["rows"]:
+            rows.append({"Gérant": nom, **r, "Date 13F": d["date"]})
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    df = df[df["% portefeuille"].fillna(0) >= min_w]
+    if df.empty:
+        st.info("Aucune ligne au-dessus du poids minimum : baissez « Poids minimum (%) ».")
+        return
+    # --- initiés
+    sigs = {}
+    if with_ins and an is not None and not df.empty:
+        tick = sorted(df["Ticker"].unique())
+        if st.session_state.get("ref_ins_data", {}).get("tick") != tick:
+            try:
+                bar = st.progress(0.0, text="OpenInsider (12 mois)…")
+                raw, log = an.fetch_openinsider(pd.DataFrame({"ticker": [t.replace("-", ".") for t in tick]}), 365,
+                                                include_oe=True, progress=lambda i, n, t: bar.progress(
+                                                    i / max(n, 1), text=f"OpenInsider {i}/{n}"))
+                bar.empty()
+                st.session_state["ref_ins_data"] = {"tick": tick, "raw": raw, "log": log}
+            except Exception as e:  # noqa: BLE001
+                st.warning(f"OpenInsider indisponible ({e}) : portefeuilles sans initiés.")
+        d_ = st.session_state.get("ref_ins_data")
+        if d_ is not None and not d_["raw"].empty:
+            tx, _oe = an.split_oe(an.filter_tx(d_["raw"], False, 0))
+            sm = sg.summarize(an.signal_tx(tx), today=TODAY.date(), min_sig=min_sig, cur="$")
+            sigs = sm.set_index("key")[["signal", "achats_txt", "ventes_txt", "net12"]].to_dict("index")
+        elif d_ is not None:
+            st.caption("Aucune transaction d'initié reçue (site indisponible ou aucune opération).")
+    df["_k"] = df["Ticker"].str.replace("-", ".")
+    df["Dirigeants · signal"] = df["_k"].map(lambda t: (sigs.get(t) or {}).get("signal", "—"))
+    df["Dirigeants · achats 6 mois"] = df["_k"].map(lambda t: (sigs.get(t) or {}).get("achats_txt", ""))
+    df["Dirigeants · ventes 6 mois"] = df["_k"].map(lambda t: (sigs.get(t) or {}).get("ventes_txt", ""))
+    df["Dirigeants · net 12 mois"] = df["_k"].map(lambda t: (sigs.get(t) or {}).get("net12"))
+    df["Mouvement 13F"] = df["Mouvement"].map(_ref_mv)
+    df["Écart cours / déclaré (%)"] = (df["Cours actuel"] / df["Cours déclaré"] - 1) * 100
+    nb = df.groupby("Ticker")["Gérant"].transform("nunique")
+    df["Nb gérants"] = nb
+    t1, t2, t3 = st.tabs(["Par gérant", "Titres en commun / mouvements", "Tout"])
+    cfg = {"% portefeuille": st.column_config.NumberColumn("% portefeuille", format="%.2f"),
+           "Écart cours / déclaré (%)": st.column_config.NumberColumn(format="%+.1f",
+               help="Cours actuel vs cours du 13F (30 sept.) : négatif = moins cher que le gérant au dernier trimestre."),
+           "Dirigeants · net 12 mois": st.column_config.NumberColumn(format="%.0f $")}
+    cols = ["Ticker", "Société", "% portefeuille", "Mouvement 13F", "Écart cours / déclaré (%)", "Dirigeants · signal",
+            "Dirigeants · achats 6 mois", "Dirigeants · ventes 6 mois", "Dirigeants · net 12 mois", "Nb gérants"]
+    with t1:
+        for nom, d in port.items():
+            sub = df[df["Gérant"] == nom].sort_values("% portefeuille", ascending=False)
+            up = int(sub["Mouvement"].str.match(r"^(Buy|Add)").sum())
+            dn = int(sub["Mouvement"].str.match(r"^(Reduce|Sell)").sum())
+            with st.expander(f"**{nom}** — {d['n']} titres · 13F du {d['date']} · ▲ {up} ▼ {dn}", expanded=False):
+                st.dataframe(sub[cols], hide_index=True, column_config=cfg, height=min(38 * len(sub) + 40, 520))
+    with t2:
+        st.markdown("**Achats et renforcements** (dernier trimestre, tous gérants)")
+        buy = df[df["Mouvement"].str.match(r"^(Buy|Add)")].sort_values("% portefeuille", ascending=False)
+        st.dataframe(buy[["Gérant"] + cols], hide_index=True, column_config=cfg)
+        st.markdown("**Allègements et sorties**")
+        sell = df[df["Mouvement"].str.match(r"^(Reduce|Sell)")].sort_values("% portefeuille", ascending=False)
+        st.dataframe(sell[["Gérant"] + cols], hide_index=True, column_config=cfg)
+        st.markdown("**Titres détenus par plusieurs gérants**")
+        multi = (df[df["Nb gérants"] >= 2].groupby(["Ticker", "Société"])
+                 .agg(Gérants=("Gérant", lambda x: " · ".join(g.split(" · ")[0].split()[-1] for g in x)),
+                      Nb=("Gérant", "nunique"), Poids_total=("% portefeuille", "sum"))
+                 .reset_index().sort_values(["Nb", "Poids_total"], ascending=False))
+        st.dataframe(multi, hide_index=True)
+    with t3:
+        st.dataframe(df[["Gérant"] + cols + ["Date 13F"]].sort_values(["Gérant", "% portefeuille"],
+                                                                      ascending=[True, False]),
+                     hide_index=True, column_config=cfg)
+    st.caption("Dirigeants : 🟢 achats récents significatifs · 🔴 ventes marquées · ⚪ rien de notable ; « — » : pas de "
+               "donnée (titre hors États-Unis ou OpenInsider indisponible). Un 13F ne montre que les actions : "
+               "ni ventes à découvert ni dérivés.")
+
+
 @st.fragment      # un clic dans cet onglet ne relance que l'onglet, pas le portefeuille
 def render_investors_screener(max_days, use_cache, use_oi):
     """Onglet « Screener investors » : valeurs du S&P 500 détenues par les superinvestors (grille Dataroma
@@ -4389,6 +4893,7 @@ def render_investors_screener(max_days, use_cache, use_oi):
     if conv_rows:                          # conviction (poids des lignes) : même calcul que l'analyse des valeurs
         cv = {t: sg.conviction_signal(r)["txt"] for t, r in conv_rows.items() if r}
         final["fonds"] = final["ticker"].map(cv).fillna(final["fonds"])
+    final["refs"] = final["ticker"].map({t: ref_funds_txt(r) for t, r in (conv_rows or {}).items()})
     final["hold"] = final["ticker"].map(st.session_state.get("inv_hold") or {})   # prix moyen des fonds (fiches lues)
     final["fonds_dot"] = final["fonds"].str[:1]
     qs = [sg.fund_quarters(*r) for r in final[["add_q", "red_q", "add_6m", "red_6m"]].itertuples(index=False)]
@@ -4445,6 +4950,7 @@ def render_investors_screener(max_days, use_cache, use_oi):
         "Fonds · signal": view["fonds"], "Fonds · dernier trimestre": view["fonds_q"],
         "Fonds · trimestre précédent": view["fonds_p"],
         "Fonds · détenteurs": view["owners"], "Fonds · prix moyen ($)": view["hold"],
+        "Gérants de référence": view["refs"],
         "Dataroma": dr_link(view["ticker"]), "OpenInsider": "http://openinsider.com/" + view["ticker"]})
     t1, t2, t3 = st.tabs(["Tableau", "Transactions", "Diagnostic"])
     with t1:
@@ -4471,6 +4977,9 @@ def render_investors_screener(max_days, use_cache, use_oi):
             "Fonds · trimestre précédent": st.column_config.TextColumn(help="même lecture, trimestre d'avant (grille "
                                                                             "« 6 mois » moins le dernier trimestre)"),
             "Fonds · détenteurs": st.column_config.NumberColumn(help="nb de superinvestors qui détiennent la valeur"),
+            "Gérants de référence": st.column_config.TextColumn(help="⭐ parmi vos gérants de référence (onglet « Gérants de "
+                "référence » ; à l'origine Ackman, Greenberg, Rolfe, Spier, Abel/Berkshire) : ceux qui détiennent la valeur, leur poids "
+                "et leur dernier mouvement. Demande la lecture des fiches Dataroma (case « pondérer par la conviction »)."),
             "Fonds · prix moyen ($)": st.column_config.NumberColumn(format="%.2f", help=(
                 "prix de détention moyen des superinvestors (« Hold Price » de la fiche Dataroma) ; lu avec la fiche de "
                 "chaque valeur : case « Fonds : pondérer par la conviction » cochée")),
@@ -4706,6 +5215,312 @@ def reverse_txt(fv):
     return f"{dot} {gi:+.0f} %{lim} / {ga:+.0f} %"
 
 
+PL_SHOW = False          # méthode Peter Lynch masquée (écran, tableau, PDF) : perturbait la lecture ; True pour la réafficher
+PL_G_MIN = 10.0          # en dessous, la méthode Peter Lynch ne s'applique pas (valeur non affichée)
+PL_CAP_MIN, PL_CAP_MAX, PL_CAP_SLOPE = 20.0, 30.0, 0.5   # plafond (%) de la méthode Peter Lynch : 20 à 30 selon la croissance
+
+
+def pl_cap(g_raw):
+    """Plafond de croissance : 20 % ; relevé de 0,5 pt par point de croissance réelle au-delà de 20 %, jusqu'à 30 %
+    (atteint à 40 % de croissance). Une croissance ≤ 20 % n'est pas plafonnée."""
+    return min(PL_CAP_MAX, max(PL_CAP_MIN, PL_CAP_MIN + PL_CAP_SLOPE * (g_raw - PL_CAP_MIN)))
+
+
+_MOIS_FR = {"janvier": 1, "février": 2, "fevrier": 2, "mars": 3, "avril": 4, "mai": 5, "juin": 6, "juillet": 7,
+            "août": 8, "aout": 8, "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12, "decembre": 12}
+
+
+def fiscal_elapsed(f):
+    """Part (0 à 1) de l'exercice en cours déjà écoulée à la date des pages : depuis la clôture du dernier exercice
+    publié = dernière fin du mois de clôture (« Période Fiscale : Janvier ») avant sa date de publication ; à défaut
+    publication − 35 jours. None si la date de publication est inconnue."""
+    from datetime import date, timedelta
+    zb = f.get("zb") or {}
+    try:
+        j, m, a = (int(x) for x in (zb.get("pubL") or "").split("/"))
+        pub = date(2000 + a if a < 100 else a, m, j)
+    except (ValueError, TypeError):
+        return None
+    try:
+        j, m, a = (int(x) for x in (f.get("zb_date") or "").split("/"))
+        today = date(a, m, j)
+    except (ValueError, TypeError):
+        today = TODAY.date()
+    mm = _MOIS_FR.get(zb.get("fy_month") or "")
+    if mm:
+        y = pub.year
+        end = lambda yy: (date(yy + (mm == 12), mm % 12 + 1, 1) - timedelta(days=1))    # dernier jour du mois mm
+        fye = end(y) if end(y) <= pub else end(y - 1)
+    else:
+        fye = pub - timedelta(days=35)
+    return min(max((today - fye).days / 365.0, 0.0), 1.0)
+
+
+# ---------- Révisions du consensus : un relevé par valeur et par date de pages Zonebourse (data/consensus_hist.csv)
+CONS_FILE = Path(__file__).resolve().parent / "data" / "consensus_hist.csv"
+CONS_COLS = ["key", "ticker", "date", "an", "bna", "ca", "titres", "cur"]
+CONS_WINDOW, CONS_MIN_DAYS, CONS_SEUIL = 100, 5, 2.0     # fenêtre (jours), ancienneté mini du relevé de référence, seuil %
+_CONS = {"df": None, "lock": __import__("threading").Lock()}
+
+
+def _cons_load():
+    if _CONS["df"] is None:
+        try:
+            _CONS["df"] = pd.read_csv(CONS_FILE, sep=";", dtype={"key": str, "ticker": str, "date": str, "cur": str})
+        except Exception:  # noqa: BLE001 — premier lancement ou fichier illisible : historique vide
+            _CONS["df"] = pd.DataFrame(columns=CONS_COLS)
+    return _CONS["df"]
+
+
+def _cons_key(f):
+    return str(f.get("isin") or f.get("ticker") or "")
+
+
+def _cons_date(f):
+    try:
+        j, m, a = (int(x) for x in (f.get("zb_date") or "").split("/"))
+        return f"{a:04d}-{m:02d}-{j:02d}"
+    except (ValueError, TypeError):
+        return None
+
+
+def cons_record(f):
+    """Enregistre le consensus lu dans les pages Zonebourse (BNA et CA des exercices N à N+2) à la date des pages.
+    Un seul relevé par valeur et par date ; sans effet hors pages Zonebourse."""
+    zb, key, day = f.get("zb") or {}, _cons_key(f), _cons_date(f)
+    if not zb or not key or not day or zb.get("N") is None:
+        return
+    with _CONS["lock"]:
+        df = _cons_load()
+        if ((df["key"] == key) & (df["date"] == day)).any():
+            return
+        g = lambda s, y: (zb.get(s) or {}).get(y)
+        rows = [{"key": key, "ticker": f.get("ticker"), "date": day, "an": y, "bna": g("bna", y), "ca": g("ca", y),
+                 "titres": g("titres", y) or g("titres", zb["N"]), "cur": f.get("currency")}
+                for y in (zb["N"], zb["N"] + 1, zb["N"] + 2) if g("bna", y) is not None or g("ca", y) is not None]
+        if not rows:
+            return
+        _CONS["df"] = pd.concat([df, pd.DataFrame(rows, columns=CONS_COLS)], ignore_index=True)
+        try:
+            CONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _CONS["df"].to_csv(CONS_FILE, sep=";", index=False)
+        except OSError:
+            pass                                     # dossier non inscriptible : historique gardé en mémoire
+
+
+def cons_revisions(f):
+    """Révision du consensus depuis le plus ancien relevé des CONS_WINDOW derniers jours (d'au moins CONS_MIN_DAYS
+    jours), pour le même exercice : BNA et CA de N+1 (à défaut N).
+    -> {an, bna_pct, ca_pct, ref (jj/mm), n, dot} ; {na: motif} si pas encore de relevé antérieur ; None hors Zonebourse."""
+    zb, key, day = f.get("zb") or {}, _cons_key(f), _cons_date(f)
+    if not zb or not key or not day or zb.get("N") is None:
+        return None
+    df = _cons_load()
+    h = df[(df["key"] == key) & (df["date"] < day)]
+    if h.empty:
+        return {"na": "1er relevé"}
+    t0 = pd.Timestamp(day)
+    age = (t0 - pd.to_datetime(h["date"])).dt.days
+    h = h[(age >= CONS_MIN_DAYS) & (age <= CONS_WINDOW)]
+    if h.empty:
+        return {"na": f"relevé précédent de moins de {CONS_MIN_DAYS} j ou de plus de {CONS_WINDOW} j"}
+    ref_day = h["date"].min()
+    ref = h[h["date"] == ref_day].set_index("an")
+    n = df[(df["key"] == key) & (df["date"] >= ref_day) & (df["date"] <= day)]["date"].nunique() + \
+        (0 if ((df["key"] == key) & (df["date"] == day)).any() else 1)
+    cur = lambda s, y: (zb.get(s) or {}).get(y)
+    pct = lambda new, old: (new / old - 1) * 100 if new is not None and old is not None and pd.notna(old) and old > 0 else None
+    for y in (zb["N"] + 1, zb["N"]):
+        if y not in ref.index:
+            continue
+        r = ref.loc[y]
+        t_new, t_old = cur("titres", y) or cur("titres", zb["N"]), r["titres"]
+        if t_new and pd.notna(t_old) and t_old and abs(t_new / t_old - 1) > 0.2:
+            return {"na": "nombre d'actions modifié (division du titre ?)"}
+        b, c = pct(cur("bna", y), r["bna"]), pct(cur("ca", y), r["ca"])
+        if b is None and c is None:
+            continue
+        lead = b if b is not None else c
+        dot = "🟢" if lead >= CONS_SEUIL else "🔴" if lead <= -CONS_SEUIL else "⚪"
+        return {"an": y, "bna_pct": b, "ca_pct": c, "ref": f"{ref_day[8:10]}/{ref_day[5:7]}", "n": n, "dot": dot}
+    return {"na": "exercice non comparable"}
+
+
+def cons_txt(f, long=False):
+    """« 🟢 BNA 2027 +3,2 % · CA +1,1 % depuis le 20/10 » ; version longue pour la fiche."""
+    r = cons_revisions(f)
+    if r is None:
+        return "" if not long else None
+    if r.get("na"):
+        return f"n.d. ({r['na']})" if not long else (
+            f"Révisions du consensus : pas encore mesurables — {r['na']}. Le dashboard garde un relevé du consensus à "
+            "chaque nouvelle date de pages Zonebourse ; la comparaison apparaîtra au prochain téléchargement "
+            f"(au moins {CONS_MIN_DAYS} jours plus tard).")
+    p = lambda v: ("0,0 %" if abs(v) < 0.05 else f"{v:+.1f} %".replace(".", ",").replace("-", "−"))
+    parts = ([f"BNA {r['an']} {p(r['bna_pct'])}"] if r["bna_pct"] is not None else []) + \
+            ([f"CA {p(r['ca_pct'])}"] if r["ca_pct"] is not None else [])
+    s = f"{r['dot']} " + " · ".join(parts) + f" depuis le {r['ref']}"
+    if not long:
+        return s
+    sens = {"🟢": "les analystes relèvent leurs prévisions : la juste valeur repose sur un consensus qui se renforce",
+            "🔴": "les analystes abaissent leurs prévisions : la juste valeur repose sur un consensus qui s'effrite",
+            "⚪": "prévisions stables"}[r["dot"]]
+    return (f"Révisions du consensus : {s} ({r['n']} relevés) — {sens}. Seuil ±{CONS_SEUIL:.0f} % ; même exercice comparé "
+            "d'une date de pages Zonebourse à l'autre.")
+
+
+def eps_12m(f):
+    """BNA des 12 derniers mois : dernier exercice publié, avancé vers l'exercice en cours au prorata du temps écoulé
+    depuis sa clôture (pages Zonebourse) ; sinon BNA 12 mois de la fiche Finviz."""
+    zb = f.get("zb") or {}
+    bna = {int(k): v for k, v in (zb.get("bna") or {}).items() if v is not None}
+    L, N = zb.get("L"), zb.get("N")
+    eps = f.get("eps_ttm")
+    if (eps is None or eps <= 0) and L in bna:
+        eps = bna[L]
+    if eps is not None and eps > 0 and L in bna and N in bna and N == L + 1 and bna[N] is not None:
+        frac = fiscal_elapsed(f)                     # part de l'exercice N écoulée (exercices décalés compris)
+        if frac is not None:
+            eps = bna[L] + frac * (bna[N] - bna[L])
+    return eps
+
+
+GF_SHOW = True           # repère « DCF GuruFocus (bénéfices) » dans la section 6 de la fiche (écran, PDF, Word)
+
+
+def gf_dcf(f, rf=None):
+    """DCF de GuruFocus sur les bénéfices (formule de leur calculateur, réglages par défaut), appliqué à nos données :
+    valeur = somme de 10 ans de BNA croissant à g1, puis 10 ans à 4 %, actualisés au taux d ; rien au-delà de 20 ans,
+    dette ignorée. g1 = croissance du BNA sur 10 ans (ici : plus longue période publiée, 3 à 10 ans), bornée 5–20 % ;
+    d = taux d'État à 10 ans arrondi au point supérieur + 6 %. BNA de départ = BNA 12 mois, ramené au BNA N+1 du
+    consensus quand l'exercice en cours le dépasse (bénéfice gonflé par de l'exceptionnel ; GuruFocus retire les
+    éléments non récurrents). -> {val, e0, g1, g1_raw, yrs, d, adj} ou None (BNA ≤ 0)."""
+    import math
+    zb = f.get("zb") or {}
+    bna = {int(k): v for k, v in (zb.get("bna") or {}).items() if v is not None}
+    L, N = zb.get("L"), zb.get("N")
+    e0 = eps_12m(f)
+    if not e0 or e0 <= 0:
+        return None
+    adj = False
+    if N in bna and bna.get(N + 1) and bna[N] > bna[N + 1] > 0 and e0 > bna[N + 1]:
+        e0, adj = bna[N + 1], True
+    g_raw, yrs = None, None
+    if L in bna and bna[L] > 0:
+        for n in range(10, 2, -1):
+            if bna.get(L - n) and bna[L - n] > 0:
+                g_raw, yrs = _cagr(bna[L - n], bna[L], n) / 100, n
+                break
+    g1 = min(max(g_raw if g_raw is not None else 0.05, 0.05), 0.20)
+    rf = DEFAULT_P["rf"] if rf is None else rf
+    dr = math.ceil(rf * 100 - 1e-9) / 100 + 0.06
+    x, y = (1 + g1) / (1 + dr), 1.04 / (1 + dr)
+    val = e0 * x * (1 - x ** 10) / (1 - x) + e0 * x ** 10 * y * (1 - y ** 10) / (1 - y)
+    return {"val": val, "e0": e0, "g1": g1, "g1_raw": g_raw, "yrs": yrs, "d": dr, "adj": adj}
+
+
+def gf_dcf_hyp(g):
+    return f"BNA {g['e0']:.2f} · +{g['g1'] * 100:.0f} %/an 10 ans puis 4 % · taux {g['d'] * 100:.0f} %"
+
+
+def gf_dcf_phrase(f, cur):
+    """Phrase de la fiche (écran, PDF, Word) : repère DCF GuruFocus et détail du calcul."""
+    g = gf_dcf(f) if GF_SHOW else None
+    if not g:
+        return None
+    ec = f" ({(g['val'] / f['price'] - 1) * 100:+.0f} % vs cours)" if f.get("price") else ""
+    hist = (f"croissance passée du BNA {g['g1_raw'] * 100:+.0f} %/an sur {g['yrs']} ans" if g["g1_raw"] is not None
+            else "historique du BNA insuffisant")
+    return (f"DCF GuruFocus (bénéfices) — repère, hors JV : {g['val']:.0f} {cur}{ec} = BNA 12 mois {g['e0']:.2f}"
+            + (" (ramené au BNA N+1 : exercice en cours gonflé)" if g["adj"] else "")
+            + f" croissant de {g['g1'] * 100:.0f} %/an pendant 10 ans ({hist}, bornée entre 5 et 20 %), puis 4 % "
+            f"pendant 10 ans, actualisé à {g['d'] * 100:.0f} % (taux d'État 10 ans arrondi + 6 %) ; rien au-delà de "
+            "20 ans, dette ignorée. Formule publiée par GuruFocus appliquée aux données Zonebourse : peut différer du "
+            "site (BNA hors éléments exceptionnels, calcul de la croissance).")
+
+
+def peter_lynch(f):
+    """Peter Lynch Fair Value (PEG = 1) = BNA des 12 derniers mois × croissance (%), croissance plafonnée entre 20 et 30 % selon la croissance réelle (`pl_cap`).
+    Croissance (comme GuruFocus) = croissance de l'EBITDA par action : moyenne de la croissance annuelle prévue
+    (consensus Zonebourse, 3 ans) et de la croissance passée (jusqu'à 5 ans) ; sans EBITDA, celle du BNA.
+    BNA 12 mois = dernier exercice publié, avancé vers l'exercice en cours au prorata de l'année écoulée.
+    -> {val, g, g_raw, g_prev, g_pass, eps, capped, cap, base} ; {na: motif} si la méthode ne s'applique pas (cyclique,
+    rebond > 100 %/an, bénéfices attendus en baisse, croissance < PL_G_MIN) ; None sans données (BNA ≤ 0…)."""
+    zb = f.get("zb") or {}
+    bna = {int(k): v for k, v in (zb.get("bna") or {}).items() if v is not None}
+    eb = {int(k): v for k, v in (zb.get("ebitda") or {}).items() if v}
+    ti = {int(k): v for k, v in (zb.get("titres") or {}).items() if v}
+    L, N = zb.get("L"), zb.get("N")
+    eps = eps_12m(f)
+    if not eps or eps <= 0:
+        return None
+
+    def growth(series, per_share):
+        s = {y: (v / ti[y] if per_share and y in ti else v) for y, v in series.items() if (not per_share or y in ti)}
+        if L not in s:
+            return None, None
+        g_pr = g_ps = None
+        n = min(max(s) - L, 3)
+        if n >= 1:
+            g_pr = _cagr(s[L], s.get(L + n), n)
+        for n in (5, 4, 3, 2):
+            if s.get(L - n) and s[L - n] > 0:
+                g_ps = _cagr(s[L - n], s[L], n)
+                break
+        return g_pr, g_ps
+
+    g_prev, g_pass = growth(eb, True)
+    base = "EBITDA / action"
+    if g_prev is None and g_pass is None:
+        g_prev, g_pass = growth(bna, False)
+        base = "BNA"
+    if g_prev is None and g_pass is None and f.get("eps_5y") is not None:
+        g_prev, base = f["eps_5y"], "BNA (fiche Finviz)"
+    if f.get("cyclical"):
+        return {"na": "cyclique"}                    # bénéfice de haut ou de bas de cycle : méthode inadaptée (Lynch)
+    g_eps_prev = growth(bna, False)[0] if bna else None
+    if (g_eps_prev is not None and g_eps_prev > 100) or (g_prev is not None and g_prev > 100):
+        return {"na": "rebond des bénéfices"}        # départ très bas : la croissance n'est pas une tendance
+    if g_prev is not None and g_prev <= 0:
+        return {"na": "bénéfices attendus en baisse"}
+    gs = [g for g in (g_prev, g_pass) if g is not None]
+    if not gs:
+        return None
+    g_raw = sum(gs) / len(gs)
+    if g_raw < PL_G_MIN:
+        return {"na": f"croissance < {PL_G_MIN:.0f} %"}     # hors du champ de la méthode (PER « juste » < 10)
+    cap = pl_cap(g_raw)
+    g = min(g_raw, cap)
+    return {"val": eps * g, "g": g, "g_raw": g_raw, "g_prev": g_prev, "g_pass": g_pass, "eps": eps,
+            "capped": g_raw > cap, "cap": cap, "base": base}
+
+
+def peter_lynch_txt(f):
+    """« 138 (−17 %) » : valeur Peter Lynch et son écart au cours (>0 : cours inférieur à cette valeur)."""
+    pl = peter_lynch(f)
+    if pl and pl.get("na"):
+        return f"n.d. ({pl['na']})"
+    if not pl or not f.get("price"):
+        return "n.d."
+    return f"{pl['val']:.0f} ({(pl['val'] / f['price'] - 1) * 100:+.0f} %)" + (" ⚠️" if pl["capped"] else "")
+
+
+def peter_lynch_phrase(f, cur):
+    """Phrase de la fiche (écran, PDF, Word) : valeur Peter Lynch et détail du calcul, ou motif de non-calcul."""
+    pl = peter_lynch(f)
+    if not pl:
+        return None
+    if pl.get("na"):
+        return (f"Peter Lynch (GuruFocus) — recoupement, hors JV : non calculée — {pl['na']} (méthode réservée aux croissances "
+                f"régulières d'au moins {PL_G_MIN:.0f} % par an).")
+    ec = f" ({(pl['val'] / f['price'] - 1) * 100:+.0f} % vs cours)" if f.get("price") else ""
+    det = (f" : prévue {pl['g_prev']:+.0f} % / passée {pl['g_pass']:+.0f} %, moyenne"
+           if pl["g_prev"] is not None and pl["g_pass"] is not None else "")
+    cap = f", plafonnée à {pl['cap']:.1f} % — valeur minorée" if pl["capped"] else ""
+    return (f"Peter Lynch (GuruFocus) — recoupement, hors JV : {pl['val']:.0f} {cur}{ec} = BNA 12 mois {pl['eps']:.2f} × croissance "
+            f"{pl['g']:.1f} % ({pl['base']}{det}{cap}).")
+
+
 def bna_evol(e0, e1):
     """« 4,44 (▲ +32 %) » : BNA N+1 et sa progression par rapport au BNA de l'exercice en cours."""
     if e1 is None:
@@ -4888,6 +5703,8 @@ def concord_funds(si, tk):
 
 def analyze(f, p, ov=None):
     fv, an = fair_value(f, p), analyst_stats(f)
+    rev_ = cons_txt(f)                               # révisions mesurées avant d'ajouter le relevé du jour
+    cons_record(f)
     si, pc, ins = superinvestor_stats(f["dataroma"], f["price"]), put_call_stats(f["options"]), f["insiders"]
     ins = concord_insiders(ins, f.get("ticker") or "")
     if not ins and f.get("isin") and not str(f["isin"]).startswith("US"):    # valeur européenne (Zonebourse)
@@ -4909,6 +5726,7 @@ def analyze(f, p, ov=None):
            "Précision JV": precision_txt(fv) + (" ⚠️" if any(a_.startswith("⚠️") for a_ in fv.get("_alerts") or [])
                                                  else ""),
            "Analystes · objectif": ana,
+           **({"Peter Lynch (GuruFocus)": peter_lynch_txt(f)} if PL_SHOW else {}),
            "Croissance implicite / attendue": reverse_txt(fv),
            "Initiés (12 m)": ins_txt.replace(" · ", " / "),              # « / » : plus lisible dans le tableau
            "Super investors (6 m)": si["Résumé"].replace(" · ", " / ")
@@ -4916,6 +5734,7 @@ def analyze(f, p, ov=None):
            "Put/Call (total / ±10 %)": pcs,
            "BNA N": round(f["eps_this_y"], 2) if f["eps_this_y"] is not None else None,
            "BNA N+1 (évol.)": bna_evol(f["eps_this_y"], f["eps_next_y"]),
+           "Révisions du consensus": rev_,
            "Dette nette/EBITDA": lev,                                # actuel (dette nette du jour / EBITDA 12 mois)
            "Résultats": f["earnings"],
            "Pages Zonebourse": ("📄 " + (f.get("zb_date") or "")) if f.get("zb") else ""}
@@ -4945,6 +5764,12 @@ FMT = {
              "🟢 ≤ 15 % : JV fiable ; 🟠 ≤ 35 % ; 🔴 au-delà : méthodes divergentes, JV incertaine. « DCF écarté » : "
              "méthode à plus de 50 % de la médiane, exclue du calcul — signal de risque (ex. multiples élevés que le "
              "flux de trésorerie ne justifie pas)."),
+    "Peter Lynch (GuruFocus)": st.column_config.TextColumn(
+        help="Méthode « Peter Lynch Fair Value » de GuruFocus. Recoupement, hors JV : BNA des 12 derniers mois × croissance annuelle (PEG = 1, la valeur d'une action est "
+             "son BNA × sa croissance en %). Croissance de l'EBITDA par action (comme GuruFocus) = moyenne de la prévision des analystes (3 ans) et de la "
+             "croissance passée (jusqu'à 5 ans) de l'EBITDA par action, plafonnée entre 20 et 30 % selon cette croissance (30 % à partir de 40 %/an) ; ⚠️ = plafond atteint (valeur minorée). Entre "
+             "parenthèses : écart au cours (> 0 : cours inférieur). Non calculée (motif indiqué) pour les cycliques, les rebonds de "
+             "bénéfices (> +100 %/an prévu), les bénéfices attendus en baisse et les croissances < 10 %/an."),
     "Croissance implicite / attendue": st.column_config.TextColumn(
         help="DCF inversé. Avec états financiers : croissance annuelle moyenne du CA sur 5 ans que suppose le cours / "
              "celle du scénario central (consensus Zonebourse compris). Fiche seule : croissance du flux libre / du BNA "
@@ -4955,6 +5780,11 @@ FMT = {
     "Put/Call (total / ±10 %)": st.column_config.TextColumn(help="encours puts / calls ; >1 prudence, <0,7 optimisme"),
     "BNA N": st.column_config.NumberColumn(format="%.2f", help="BNA de l'exercice en cours (consensus)"),
     "BNA N+1 (évol.)": st.column_config.TextColumn(help="BNA prévu pour l'exercice suivant et sa progression ▲ / régression ▼ par rapport à N"),
+    "Révisions du consensus": st.column_config.TextColumn(help=(
+        "Évolution des prévisions des analystes (BNA et chiffre d'affaires de l'exercice N+1) entre deux dates de pages "
+        "Zonebourse : depuis le plus ancien relevé des 100 derniers jours (5 jours au moins). 🟢 BNA relevé de 2 % ou "
+        "plus : consensus qui se renforce, juste valeur plus crédible · 🔴 abaissé de 2 % ou plus · ⚪ stable. "
+        "« n.d. (1er relevé) » : la comparaison apparaîtra au prochain téléchargement des pages.")),
     "Dette nette/EBITDA": st.column_config.NumberColumn(format="%.1f", help="années d'EBITDA pour rembourser la dette ; négatif = trésorerie nette"),
 }
 
@@ -5130,7 +5960,7 @@ METHODS = [("DCF", "DCF"), ("PER", "PER"), ("Comparables", "Comparables"), ("PER
            ("EBITDA futur", "EBITDA futur actualisé"), ("Marge norm.", "Marge normalisée")]
 
 
-def render_fv_tables(fv, cur):
+def render_fv_tables(fv, cur, f=None):
     """Juste valeur en deux tableaux : 1) valeur par action de chaque méthode (avec le multiple ou le taux utilisé)
     et synthèse ; 2) indicateurs (taux, croissances, précision)."""
     keep = set(fv.get("_keep") or [])
@@ -5154,6 +5984,16 @@ def render_fv_tables(fv, cur):
         rows.append({"Méthode": "Si les bénéfices actuels durent", "Hypothèse": f"multiples sur le BNA N+1 "
                      f"{fv['_eps_peak']:.2f}", f"Basse ({cur})": fv.get("JV si pic basse"),
                      f"Centrale ({cur})": fv["JV si pic"], f"Haute ({cur})": fv.get("JV si pic haute"),
+                     "Retenue": "information"})
+    pl = peter_lynch(f) if f and PL_SHOW else None
+    if pl and pl.get("val"):
+        rows.append({"Méthode": "Peter Lynch (GuruFocus) — recoupement", "Hypothèse": f"BNA 12 mois {pl['eps']:.2f} × croissance "
+                     f"{pl['g']:.1f} %", f"Basse ({cur})": None, f"Centrale ({cur})": pl["val"], f"Haute ({cur})": None,
+                     "Retenue": "information"})
+    gfd = gf_dcf(f) if f and GF_SHOW else None
+    if gfd:
+        rows.append({"Méthode": "DCF GuruFocus (bénéfices) — repère", "Hypothèse": gf_dcf_hyp(gfd),
+                     f"Basse ({cur})": None, f"Centrale ({cur})": gfd["val"], f"Haute ({cur})": None,
                      "Retenue": "information"})
     if rows:
         st.dataframe(pd.DataFrame(rows).round(1), hide_index=True, width="stretch")
@@ -5388,6 +6228,9 @@ def report_model(f, d, t):
                        "non-GAAP (ajusté), utilisé par le PER cible et les comparables."))
     else:
         B.append(("p", "Non disponible pour cette source."))
+    rv_ = cons_txt(f, long=True)
+    if rv_:
+        B.append(("p", rv_))
     # 4
     B.append(("h", "4. DCF"))
     res = fv.get("_dcfx")
@@ -5445,10 +6288,23 @@ def report_model(f, d, t):
     if fv.get("JV si pic"):
         rows.append(["Si les bénéfices actuels durent", f"BNA N+1 {fv['_eps_peak']:.2f}", _fmt(fv.get("JV si pic basse")),
                      _fmt(fv["JV si pic"]), _fmt(fv.get("JV si pic haute")), "information"])
+    plr = peter_lynch(f) if PL_SHOW else None
+    if plr and plr.get("val"):
+        rows.append(["Peter Lynch (GuruFocus) — recoupement", f"BNA 12 mois {plr['eps']:.2f} × croissance {plr['g']:.1f} %", "",
+                     _fmt(plr["val"]), "", "information"])
+    gfd = gf_dcf(f) if GF_SHOW else None
+    if gfd:
+        rows.append(["DCF GuruFocus (bénéfices) — repère", gf_dcf_hyp(gfd), "", _fmt(gfd["val"]), "", "information"])
     if rows:
         B.append(("table", ["Méthode", "Hypothèse", f"Basse ({cur})", f"Centrale ({cur})", f"Haute ({cur})", "Retenue"], rows))
         B.append(("p", f"Valeurs par action en {cur}. Précision : {precision_txt(fv)}. Croissance implicite / attendue : "
                        f"{reverse_txt(fv)}."))
+    pl_ = peter_lynch_phrase(f, cur) if PL_SHOW else None
+    if pl_:
+        B.append(("p", pl_))
+    gf_ = gf_dcf_phrase(f, cur)
+    if gf_:
+        B.append(("p", gf_))
     # 7
     B.append(("h", "7. Juste valeur calculée et objectif des analystes"))
     jv = fv.get("JV centrale")
@@ -5462,6 +6318,30 @@ def report_model(f, d, t):
             rows_.append(["Objectif à 12 mois façon analystes (VE/EBIT moyen 5 ans × EBIT N+1)", _fmt(ast_["target"]),
                           _fmt((ast_["target"] / f["price"] - 1) * 100, 0)])
         B.append(("table", ["Repère", f"Valeur ({cur})", "vs cours (%)"], rows_))
+        sr_ = simple_reading(f, fv, cur)
+        if sr_:
+            B.append(("p", "Lecture simple : quel bénéfice chaque niveau suppose. " + sr_["txt"]))
+            if sr_["txt2"]:
+                B.append(("p", sr_["txt2"]))
+            B.append(("table", ["Niveau", f"Valeur ({cur})"] + [f"BNA requis à {k}x" for k in sr_["mults"]]
+                      + ["PER sur BNA N+1"],
+                      [[r["Niveau"], _fmt(r["Valeur"])] + [_fmt(r[f"BNA requis à {k}x"], 2) for k in sr_["mults"]]
+                       + [(_fmt(r["PER sur BNA N+1"]) + "x") if r["PER sur BNA N+1"] else ""] for r in sr_["need"]]))
+            if sr_["scen"]:
+                B.append(("p", "Scénarios : valeur de l'action selon le bénéfice et le multiple (écart avec le cours "
+                               "entre parenthèses)."))
+                B.append(("table", ["Scénario", "BNA annuel"] + [f"{k}x" for k in sr_["mults"]],
+                          [[r["Scénario"], _fmt(r["BNA annuel"], 2)]
+                           + [("n.s." if r[f"{k}x"] is None else
+                               f"{_fmt(r[f'{k}x'], 0)} ({r[f'{k}x vs cours (%)']:+.0f} %)") for k in sr_["mults"]]
+                           for r in sr_["scen"]]))
+                B.append(("p", SIMPLE_NOTE))
+            if sr_["comps"]:
+                B.append(("p", "Valorisation comparée : ce que le cours suppose. " + sr_["ctxt"]))
+                B.append(("table", ["Société", "PER 12 derniers mois", "PER sur BNA N+1"],
+                          [[r["Société"], (_fmt(r["PER 12 derniers mois"]) + "x") if r["PER 12 derniers mois"] else "",
+                            (_fmt(r["PER sur BNA N+1"]) + "x") if r["PER sur BNA N+1"] else ""]
+                           for r in sr_["comps"]]))
         if ast_:
             B.append(("p", analyst_style_txt(ast_, f, cur)))
         br_ = target_bridge_txt(target_bridge(f, fv), f, cur, fv.get("JV si pic"))
@@ -6331,6 +7211,7 @@ def render_detail(f, d, t=None, ns=""):
     # ---------- 3. Bénéfice par action
     st.markdown("##### 3. Bénéfice par action (BNA)")
     ser = _eps_series(f)
+    rv_ = cons_txt(f, long=True)
     if ser:
         edf = pd.DataFrame(ser, columns=["Exercice", "BNA", "Type"])
         import altair as alt
@@ -6360,6 +7241,8 @@ def render_detail(f, d, t=None, ns=""):
                    "sur le BNA comptable, le DCF part des flux de trésorerie et déduit les rémunérations en actions.")
     else:
         st.caption("Non disponible pour cette source.")
+    if rv_:
+        st.caption(rv_.replace("Révisions du consensus", "**Révisions du consensus**", 1))
     # ---------- 4. DCF
     st.markdown("##### 4. DCF")
     if fv.get("_dcfx"):
@@ -6418,7 +7301,13 @@ def render_detail(f, d, t=None, ns=""):
     # ---------- 6. Synthèse
     st.markdown("##### 6. Synthèse")
     football_field(fv, f, cur)
-    render_fv_tables(fv, cur)
+    render_fv_tables(fv, cur, f)
+    gf_ = gf_dcf_phrase(f, cur)
+    if gf_:
+        st.caption(gf_.replace("DCF GuruFocus (bénéfices)", "**DCF GuruFocus (bénéfices)**", 1))
+    pl_ = peter_lynch_phrase(f, cur) if PL_SHOW else None
+    if pl_:
+        st.caption(pl_.replace("Peter Lynch (GuruFocus)", "**Peter Lynch (GuruFocus)**", 1))
     # ---------- 7. Juste valeur et objectif des analystes
     st.markdown("##### 7. Juste valeur calculée et objectif des analystes")
     if jv and f.get("target"):
@@ -6431,6 +7320,35 @@ def render_detail(f, d, t=None, ns=""):
             cmp_.append({"Repère": "Objectif à 12 mois façon analystes (VE/EBIT moyen 5 ans × EBIT N+1)",
                          "Valeur": round(ast_["target"], 1), "vs cours (%)": (ast_["target"] / f["price"] - 1) * 100})
         st.dataframe(pd.DataFrame(cmp_).round(1), hide_index=True)
+        sr_ = simple_reading(f, fv, cur)
+        if sr_:
+            st.markdown("**Lecture simple : quel bénéfice chaque niveau suppose**")
+            st.markdown(_md(sr_["txt"]))
+            if sr_["txt2"]:
+                st.markdown(_md(sr_["txt2"]))
+            nd_ = pd.DataFrame(sr_["need"])
+            st.dataframe(nd_, hide_index=True, column_config={
+                c_: st.column_config.NumberColumn(format="%.1fx" if c_.startswith("PER") else "%.2f")
+                for c_ in nd_.columns if c_ != "Niveau"})
+            if sr_["scen"]:
+                st.markdown("**Scénarios : valeur de l'action selon le bénéfice et le multiple**")
+                sc_ = pd.DataFrame([{"Scénario": r["Scénario"], "BNA annuel": r["BNA annuel"],
+                                     **{f"{k}x": ("n.s." if r[f"{k}x"] is None else
+                                                  f"{r[f'{k}x']:,.0f} ({r[f'{k}x vs cours (%)']:+.0f} %)".replace(",", " "))
+                                        for k in sr_["mults"]}} for r in sr_["scen"]])
+                st.dataframe(sc_, hide_index=True, column_config={
+                    "BNA annuel": st.column_config.NumberColumn(format="%.2f")})
+                st.caption(SIMPLE_NOTE + " Entre parenthèses : écart avec le cours actuel.")
+            if sr_["comps"]:
+                st.markdown("**Valorisation comparée : ce que le cours suppose**")
+                if sr_["ctxt"]:
+                    st.markdown(_md(sr_["ctxt"]))
+                st.dataframe(pd.DataFrame(sr_["comps"]), hide_index=True, column_config={
+                    "PER 12 derniers mois": st.column_config.NumberColumn(format="%.1fx"),
+                    "PER sur BNA N+1": st.column_config.NumberColumn(format="%.1fx")})
+                st.caption(f"Comparables : {sr_['src']}. Un multiple bas signale que le marché doute de la tenue des "
+                           "bénéfices ; un multiple élevé, qu'il les croit durables ou en hausse.")
+            st.markdown("**Analyse détaillée**")
         if ast_:
             st.caption(analyst_style_txt(ast_, f, cur.strip()))
         br_ = target_bridge_txt(target_bridge(f, fv), f, cur.strip(), fv.get("JV si pic"))
@@ -6526,7 +7444,12 @@ def render_detail(f, d, t=None, ns=""):
                 st.caption(f"Prix de détention moyen des fonds : {si['Prix de détention moyen']:.2f} — cours "
                            f"{si['Cours vs prix moyen (%)']:+d} % " + ("(sous leur prix : vous achèteriez moins cher qu'eux)"
                                                                        if si['Cours vs prix moyen (%)'] < 0 else "(au-dessus de leur prix)"))
+            if si.get("Références", "—") != "—":
+                st.markdown("**Gérants de référence** : " + si["Références"])
+            else:
+                st.caption("Aucun des gérants de référence (" + ", ".join(ref_keys()) + ") ne détient la valeur.")
             lg = pd.DataFrame(si["Lignes"]).sort_values("% portefeuille", ascending=False)
+            lg = lg.drop(columns=["Fonds"], errors="ignore")
             st.dataframe(lg, hide_index=True, height=230, column_config={
                 "% portefeuille": st.column_config.NumberColumn(format="%.2f", help="poids de l'action dans le portefeuille du gérant : conviction")})
             st.caption("Données trimestrielles (déclarations 13F publiées ~45 jours après la fin du trimestre) : un signal lent.")
@@ -6890,9 +7813,9 @@ def main():
     st.session_state["wl_errs"] = list(st.session_state.get("wl_errs_pages") or []) + \
         list(st.session_state.get("wl_errs_scr") or [])
 
-    tab1, tab2, tab4, tab5, tab6, tab7, tab8, tab3 = st.tabs(
+    tab1, tab2, tab4, tab5, tab6, tab7, tab9, tab8, tab3 = st.tabs(
         ["📋 Portefeuille", "🛒 Valeurs à étudier", "😨 Fear & Greed", "🔥 Sentiment screener", "🔎 Screener JV",
-         "🇺🇸 Screener investors", "🇫🇷 Screener AMF", "ℹ️ Méthode"])
+         "🇺🇸 Screener investors", "⭐ Gérants de référence", "🇫🇷 Screener AMF", "ℹ️ Méthode"])
 
     # ---------- calculs (avant les onglets : une erreur n'empêche pas l'affichage des autres onglets)
     pf_res, pf_err, pf_notes = None, None, []
@@ -6990,6 +7913,8 @@ def main():
 
     with tab7:
         render_investors_screener(max_days, use_cache, use_oi)
+    with tab9:
+        render_ref_managers(use_cache)
     with tab8:
         render_amf_screener()
 
@@ -7100,7 +8025,7 @@ S&P 500, résumé de la fiche Dataroma (dernier mouvement déclaré par chaque f
 trimestre). **Put/Call** : encours (open interest) puts / calls, toutes échéances jusqu'à N jours ;
 > 1 = couverture ou prudence, < 0,7 = positionnement haussier ; la version ± 10 % ne garde que les prix d'exercice proches du cours.
 
-**Scénarios** : EBITDA N+1 = EBITDA TTM × (1 + croissance du CA sur 12 mois, plafonnée à 50 %), N+2 = croissance à 5 ans plafonnée à 25 % ;
+**Scénarios** : EBITDA N+1 = EBITDA TTM × (1 + croissance du CA sur 12 mois, plafonnée à 50 %), N+2 = croissance à 5 ans plafonnée entre 20 et 30 % selon cette croissance (30 % à partir de 40 %/an) ;
 pessimiste −10 pts (−25 pts si cyclique), optimiste +8 pts (+15 pts). Capex = intensité actuelle (capex / CA) × CA projeté (+20 % en
 pessimiste, −10 % en optimiste). Dette nette = dette nette actuelle − (EBITDA × conversion en flux d'exploitation − capex)
 + rachats et dividendes. BNA = consensus N+1, puis croissance à 5 ans ; ± 10 % (± 25 % si cyclique), élargi en N+2.
