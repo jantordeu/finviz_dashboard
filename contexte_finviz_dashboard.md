@@ -337,3 +337,30 @@ Colonne « Indice », case « Nasdaq 100 seulement », titres d'export selon l'u
 - Non applicable aux banques / assurances. Critères non mesurables = ligne absente.
 - Screener (idée, non implémentée) : pré-tri par les colonnes Finviz (ROIC, Debt/Eq, croissance BNA/CA, PEG) puis grille
   complète sur les 20–30 meilleures seulement.
+
+## Screener JV : filtres de croissance Finviz + grille
+- `SCREENER_URL` par défaut : BNA et CA trimestriels > 0, ratio de liquidité > 1, ROIC > 10 %, dette/fonds propres < 1 (court + long terme), CA 5 ans > 10 %, croissance BNA
+  attendue > 10 %, PEG < 2, BNA N+1 > 10 %, capitalisation moyenne et plus ; pas de filtre de place (NYSE + Nasdaq).
+- `screen_values` ajoute « Grille croissance » (ex. « 6/8 · ✅ Candidate ») et « Points faibles (grille) » (fiche Finviz seule,
+  CMPC 9 % par défaut) ; case « Seulement les candidates » dans l'onglet.
+
+## Screener investors : croisement fonds × dirigeants
+- `cross_label(fonds_dot, dirigeants_dot, net12)` -> colonne « Croisement fonds × dirigeants » : 🟢🟢 double confirmation ;
+  🟢🟠 confirmation partielle (🟠 dirigeants à net acheteur) ; 🟢⚪ / 🟢🔴 fonds seuls (les ventes de dirigeants sont la norme :
+  ~65 % des valeurs, autant avec fonds 🟢 qu'avec fonds ⚪) ; 🔴🟢 divergence ; « dirigeants seuls (achats) ».
+- Filtres (rangée de pastilles « Croisement fonds × dirigeants », sous les filtres dirigeants ; Secteur et Nasdaq 100 sur la ligne suivante) : « 🟢 fonds sans vente de dirigeants » (fonds 🟢, dirigeants ≠ 🔴), « 🟢 fonds + achats de dirigeants » (🟢🟢 + 🟢🟠).
+
+## Correctifs DCF (cas Marvell, 24/11/2026) — fiche Finviz + Zonebourse
+- `asset_light` élargi : incorporels ≥ 40 % de l'actif, capex < 8 % du CA (avant : 3 %) et < la moitié des amortissements.
+  Avant, pour une société bâtie par acquisitions avec 5 % de capex (Marvell : amortissements 13 % du CA, surtout des
+  incorporels rachetés), le capex projeté montait jusqu'aux amortissements (14 % du CA en année 10) : flux en baisse
+  alors que le CA triplait, valeur terminale 28 % de la VE, DCF 37 $. Après : capex terminal = 1,25 × capex → DCF 88 $.
+- `merge_facts` : quand les 12 derniers mois Finviz débordent sur l'exercice N (q > 0), la dernière année du consensus
+  n'était lue qu'en partie (2 années sur 3). Le consensus est prolongé d'un point (même croissance, plafonnée à 25 %,
+  5 % si cyclique) pour reprendre les 3 années.
+- Marvell : JV 76 $ → 101 $ (55–119). Reste prudent : CMPC 13,6 % (bêta 2,40), rémunération en actions déduite des flux,
+  PER historique sur BNA N+1.
+
+## Screener investors : reprise après interruption
+- `_dr_store()` (cache_resource) garde chaque fiche Dataroma lue 6 h : si le chargement est interrompu (clic dans un autre
+  onglet), la relecture reprend où elle s'était arrêtée. `st.empty()` avant la relecture : plus de double barre.

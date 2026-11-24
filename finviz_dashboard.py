@@ -500,7 +500,7 @@ def clear_caches():
                     pass
     # toutes les lectures gardées en mémoire (pages, Reddit, grilles Dataroma, AMF, Yahoo…)
     for name_ in ("parse_zonebourse_cached", "raws_from_finviz_pages_cached", "fetch_apewisdom", "fund_grid",
-                  "amf_company_tx", "afm_company_tx", "fetch_yahoo_news", "_yf_history_cached", "_inv_load", "_inv_conviction", "_ref_load",
+                  "amf_company_tx", "afm_company_tx", "fetch_yahoo_news", "_yf_history_cached", "_inv_load", "_inv_conviction", "_dr_store", "_ref_load",
                   "_amf_load", "fetch_fear_greed"):
         try:
             globals()[name_].clear()
@@ -1300,6 +1300,14 @@ def merge_facts(fv, zb):
                 return math.exp(math.log(a) * (1 - w_) + math.log(b) * w_) if log and a > 0 and b > 0 \
                     else a * (1 - w_) + b * w_
             n = len(revs) - (1 if q > 0 else 0)                     # années complètes couvertes
+            if q > 0 and len(pts) >= 3 and pts[-2] > 0 and len(revs) < 4:
+                # les 12 derniers mois débordent sur l'exercice N : la dernière année du consensus n'était lue qu'en
+                # partie. On la prolonge d'un point (même croissance, plafonnée à 25 % — 5 % si cyclique — comme
+                # la décroissance qui suit le consensus) pour que toute l'année prévue soit reprise.
+                g_x = min(max(pts[-1] / pts[-2] - 1, 0.0), 0.05 if f["cyclical"] else 0.25)
+                pts = pts + [pts[-1] * (1 + g_x)]
+                ms = ms + [ms[-1]]
+                n = len(revs)
             # scission / cession : le consensus ne compte plus l'activité sortie, les 12 derniers mois si -> le DCF
             # repart du CA et des marges du consensus de l'exercice N (pro forma)
             spin = (x0.get("disc_ops") and not f["cyclical"] and len(revs) >= 2 and revs[0] < 0.97 * x0["rev0"]
@@ -1688,10 +1696,11 @@ def disc_ops(IA):
 
 
 def asset_light(x):
-    """Société peu consommatrice d'investissements dont les amortissements sont surtout ceux d'incorporels rachetés
-    (incorporels ≥ 40 % de l'actif, investissements < 3 % du CA et < la moitié des amortissements)."""
+    """Société dont les amortissements sont surtout ceux d'incorporels rachetés (acquisitions), qui ne sont pas des
+    investissements à renouveler : incorporels ≥ 40 % de l'actif, investissements < 8 % du CA et < la moitié des
+    amortissements (éditeurs de logiciels, mais aussi semi-conducteurs sans usine bâtis par acquisitions, ex. Marvell)."""
     cap = max(x.get("capex0") or 0.0, x.get("capex_norm") or 0.0)
-    return (x.get("intang") or 0) >= 0.4 and cap < 0.03 and (x.get("da_pct") or 0) > 2 * cap
+    return (x.get("intang") or 0) >= 0.4 and cap < 0.08 and (x.get("da_pct") or 0) > 2 * cap
 
 
 def dcfx_from_zonebourse(z, ca, eb, ebit, capex, nd, act, est, shares, fcf=None):
@@ -3546,6 +3555,8 @@ def growth_grid(f, fv, cur=""):
     cheap = bool(jv and pr and jv > pr)
     weak = [r[1] for r in rows if r[4] < 0]
     solid = pos / n >= 0.7 and not red_sol and not red_roic
+    lab = ("✅ Candidate" if cheap and solid else "À étudier" if cheap else "Attendre le prix" if solid and jv
+           else "Non démontré")
     if cheap and solid:
         v = (f"✅ Candidate : {pos} critères favorables sur {n}, aucun point faible sur la solidité ni sur le ROIC, "
              f"et la juste valeur ({jv:.0f} {cur}) dépasse le cours ({pr:.0f} {cur}).")
@@ -3561,7 +3572,7 @@ def growth_grid(f, fv, cur=""):
              + (f" ; points faibles : {', '.join(weak)}" if weak else "") + ").")
     if f.get("cyclical"):
         v += " ⚠️ Valeur cyclique : croissance et marges de haut de cycle, à lire avec prudence."
-    return {"rows": rows, "verdict": v, "pos": pos, "neg": neg, "n": n}
+    return {"rows": rows, "verdict": v, "pos": pos, "neg": neg, "n": n, "label": lab, "weak": weak}
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -4577,9 +4588,11 @@ def render_reddit_top(p, use_cache, max_days=200, use_oi=True):
 
 
 # ---------- Screener JV : liste d'un screener Finviz -> juste valeur rapide sur fiche seule
-SCREENER_URL = ("https://finviz.com/screener/stocks?v=111&f=an_recom_buybetter%2Ccap_midover%2Cfa_debteq_u1%2C"
-                "fa_estltgrowth_o10%2Cfa_fpe_u25%2Cfa_opermargin_o10%2Cfa_pfcf_u25%2Cfa_roi_o10%2Csh_avgvol_o200%2C"
-                "ta_sma200_pa&ft=4&preset=s154743054")
+SCREENER_URL = ("https://finviz.com/screener/stocks?v=111&ft=4&f=cap_midover%2Cfa_debteq_u1%2Cfa_ltdebteq_u1%2C"
+                "fa_sales5years_o10%2Cfa_estltgrowth_o10%2Cfa_peg_u2%2Cfa_roi_o10%2Cfa_epsyoy1_o10%2Cfa_epsqoq_pos%2C"
+                "fa_salesqoq_pos%2Cfa_curratio_o1")
+# filtres : ROIC > 10 %, dette / fonds propres < 1, CA 5 ans > 10 %, croissance BNA attendue > 10 %, PEG < 2, BNA N+1 > 10 %,
+# BNA et CA trimestriels en hausse, ratio de liquidité > 1, capitalisation ≥ 2 Md$ ; aucun filtre de place de cotation (NYSE et Nasdaq)
 CYCLICAL_INDUSTRIES = re.compile(r"Gold|Silver|Precious Metals|Copper|Aluminum|Steel|Coal|Uranium|Industrial Metals")
 
 
@@ -4636,6 +4649,10 @@ def screen_values(tickers, p, use_cache=True, progress=None, log=print):
         except Exception as e:
             log(f"{t} : {type(e).__name__} — {e}")
             continue
+        try:
+            gg = growth_grid(f, fv, "")
+        except Exception:  # noqa: BLE001
+            gg = None
         ana = f"{an['Consensus'] or '?'} · {f['target']:.0f}" if f.get("target") else (an.get("Consensus") or "n.d.")
         if an.get("Potentiel (%)") is not None:
             ana += f" ({an['Potentiel (%)']:+.0f} %)"
@@ -4644,6 +4661,8 @@ def screen_values(tickers, p, use_cache=True, progress=None, log=print):
                      "Juste valeur (fourchette)": (f"{fv['JV centrale']:.0f} ({fv['JV basse']:.0f}–{fv['JV haute']:.0f})"
                                                    if fv.get("JV centrale") else "n.d."),
                      "Écart JV (%)": fv.get("Écart (%)"),
+                     "Grille croissance": (f"{gg['pos']}/{gg['n']} · {gg['label']}" if gg else "n.d."),
+                     "Points faibles (grille)": (", ".join(gg["weak"]) if gg and gg["weak"] else "—"),
                      "JV si bénéfices actuels durent": peak_txt(fv, f.get("price")),
                      "Précision JV": precision_txt(fv),
                      "Lecture de l'écart": divergence_txt(f, fv),
@@ -4713,13 +4732,16 @@ def render_screener(p, use_cache, max_days, use_oi):
                             help="Méthodes concordantes à ± 35 % près : une forte marge avec des méthodes divergentes "
                                  "est souvent un piège.")
     v = res[res["Écart JV (%)"].fillna(-999) >= marge]
+    if st.checkbox("Seulement les candidates de la grille croissance (✅ Candidate)", value=False, key="scr_grid",
+                   help="Au moins 70 % de critères favorables, aucun point faible sur la solidité ni le ROIC."):
+        v = v[v["Grille croissance"].astype(str).str.contains("Candidate")]
     if no_cyc:
         v = v[~v["_cyc"]]
     if only_prec:
         v = v[v["Précision JV"].astype(str).str.startswith(("🟢", "🟠"))]
     v = v.sort_values("Écart JV (%)", ascending=False)
     cols = ["Ticker", "Société", "Industrie", "Cours", "Juste valeur (fourchette)", "Écart JV (%)",
-            "JV si bénéfices actuels durent", "Précision JV",
+            "Grille croissance", "Points faibles (grille)", "JV si bénéfices actuels durent", "Précision JV",
             "Lecture de l'écart", "Croissance implicite / attendue", "Analystes · objectif", "BNA N+1 (évol.)", "Résultats"]
     st.dataframe(v[cols], hide_index=True, width="stretch", column_config=FMT)
     st.caption(f"Calcul du {when} : {len(v)} action(s) sur {len(res)} avec une marge ≥ {marge} %. Juste valeur rapide "
@@ -4764,6 +4786,23 @@ def _sig_filter(df, picks, col="signal", dot_col="dot"):
     if "achats répétés (≥ 2 mois)" in picks:
         m &= (df["months6"].fillna(0) >= 2) | (df["buyers6"].fillna(0) >= 2)
     return df[m]
+
+
+def cross_label(fd, dd, net):
+    """Croisement du rond des fonds (Dataroma) et du rond des dirigeants (OpenInsider). Un 🟠 dirigeants dont le net est
+    acheteur compte comme un achat ; les ventes de dirigeants, très fréquentes, ne disqualifient pas un fonds 🟢."""
+    buy = dd == "🟢" or (dd == "🟠" and (net or 0) > 0)
+    if fd == "🟢":
+        if dd == "🟢":
+            return "🟢🟢 double confirmation"
+        if buy:
+            return "🟢🟠 confirmation partielle (achats nets de dirigeants)"
+        if dd == "🔴":
+            return "🟢🔴 fonds seuls — dirigeants vendeurs (souvent fiscal)"
+        return "🟢⚪ fonds seuls — dirigeants sans opération"
+    if buy:
+        return "🔴🟢 divergence : dirigeants acheteurs, fonds vendeurs" if fd == "🔴" else "dirigeants seuls (achats)"
+    return "—"
 
 
 def _sig_fill(df):
@@ -4863,14 +4902,27 @@ def _inv_load(min_si, univers="S&P 500"):
     return uni, raw_tx, log
 
 
+@st.cache_resource(show_spinner=False)
+def _dr_store():
+    """Fiches Dataroma déjà lues {ticker: (heure, lignes, prix moyen)} : une lecture interrompue (clic ailleurs dans le
+    dashboard pendant le chargement) reprend là où elle s'était arrêtée au lieu de repartir de zéro."""
+    return {}
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def _inv_conviction(tickers):
     """Fiches Dataroma (détenteurs, poids, dernier mouvement) des valeurs de l'univers -> {ticker: lignes}."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
     bar = st.progress(0.0, text="Fiches Dataroma (conviction des fonds)…")
 
+    store, t0 = _dr_store(), time.time()
+
     def one(t):
+        c_ = store.get(t)
+        if c_ and t0 - c_[0] < 6 * 3600:                   # déjà lue (analyse interrompue ou récente)
+            return t, c_[1], c_[2]
         p_ = parse_dataroma(_get(_session(), f"https://www.dataroma.com/m/stock.php?sym={t}", (0.2, 0.5)))
+        store[t] = (time.time(), p_["rows"], p_.get("hold"))
         return t, p_["rows"], p_.get("hold")
     out, hold = {}, {}
     with ThreadPoolExecutor(4) as ex:
@@ -5215,7 +5267,8 @@ def render_investors_screener(max_days, use_cache, use_oi):
         except Exception as e:  # noqa: BLE001
             st.error(f"Erreur : {e}")
     if use_conv and "inv_data" in st.session_state and st.session_state.get("inv_hold") is None:
-        try:      # analyse faite avant l'ajout du prix moyen (ou sans conviction) : fiches relues, gardées 6 h
+        try:      # analyse interrompue ou faite sans conviction : fiches (re)lues, celles déjà lues sont reprises
+            st.empty()                                   # même emplacement que la barre de la 1re lecture (pas de doublon)
             conv_ = _inv_conviction(tuple(st.session_state["inv_data"][0]["ticker"]))
             st.session_state["inv_conv_rows"], st.session_state["inv_hold"] = conv_
         except Exception as e:  # noqa: BLE001
@@ -5245,6 +5298,8 @@ def render_investors_screener(max_days, use_cache, use_oi):
     if "indice" in final.columns:                   # Nasdaq 100 hors S&P 500 : pas de grille « trimestre précédent »
         final.loc[final["indice"] == "Nasdaq 100", "fonds_p"] = "n.d."
     final["concord"] = (final["dot"] == "🟢") & (final["fonds_dot"] == "🟢")
+    final["croise"] = [cross_label(a_, b_, n_) for a_, b_, n_ in zip(final["fonds_dot"], final["dot"],
+                                                                      final["net12"].fillna(0))]
     final = final.sort_values(["rank", "concord", "net12"], ascending=[True, False, False]).reset_index(drop=True)
     if raw_tx.empty:
         st.warning("OpenInsider n'a renvoyé aucune transaction : voir l'onglet **Diagnostic**.")
@@ -5275,16 +5330,26 @@ def render_investors_screener(max_days, use_cache, use_oi):
             st.caption("Les ventes dépassent toujours largement les achats dans les grandes capitalisations : "
                        "c'est l'évolution qui compte, pas le niveau.")
 
+    CROSS_PICKS = ["🟢 dirigeants + 🟢 fonds", "🟢 fonds + achats de dirigeants", "🟢 fonds sans vente de dirigeants"]
+    picks = st.pills("Filtrer (dirigeants)", SIG_FILTERS + ["⚠️ sortie PDG / DAF"], selection_mode="multi",
+                     key="inv_pills") or []
+    picks_x = st.pills("Croisement fonds × dirigeants", CROSS_PICKS, selection_mode="multi", key="inv_pills_x",
+                       help="🟢 dirigeants + 🟢 fonds : double confirmation · 🟢 fonds + achats de dirigeants : "
+                            "double confirmation ou dirigeants 🟠 à net acheteur · 🟢 fonds sans vente de dirigeants : "
+                            "dirigeants non 🔴 (ventes de dirigeants = norme, souvent fiscales)") or []
+    picks = list(picks) + list(picks_x)
     f1, f2 = st.columns([3, 1])
-    picks = f1.pills("Filtrer (dirigeants)", SIG_FILTERS + ["⚠️ sortie PDG / DAF", "🟢 dirigeants + 🟢 fonds"],
-                     selection_mode="multi", key="inv_pills") or []
-    sect = f2.multiselect("Secteur", sorted(final["sector"].dropna().unique()), key="inv_sector")
+    sect = f1.multiselect("Secteur", sorted(final["sector"].dropna().unique()), key="inv_sector")
     if "indice" not in final.columns:               # analyse faite avant l'ajout du Nasdaq 100
         final["indice"] = "S&P 500"
     ndx_only = final["indice"].str.contains("Nasdaq").any() and f2.checkbox(
         "Nasdaq 100 seulement", key="inv_ndx_only", help="N'affiche que les valeurs du Nasdaq 100 (dont celles qui "
                                                          "sont aussi dans le S&P 500).")
-    view = _sig_filter(final, [p for p in picks if p not in ("🟢 dirigeants + 🟢 fonds", "⚠️ sortie PDG / DAF")])
+    view = _sig_filter(final, [p for p in picks if p not in ["⚠️ sortie PDG / DAF"] + CROSS_PICKS])
+    if "🟢 fonds sans vente de dirigeants" in picks:
+        view = view[(view["fonds_dot"] == "🟢") & (view["dot"] != "🔴")]
+    if "🟢 fonds + achats de dirigeants" in picks:
+        view = view[view["croise"].str.startswith(("🟢🟢", "🟢🟠"))]
     if ndx_only:
         view = view[view["indice"].str.contains("Nasdaq")]
     if "⚠️ sortie PDG / DAF" in picks:
@@ -5295,7 +5360,7 @@ def render_investors_screener(max_days, use_cache, use_oi):
         view = view[view["sector"].isin(sect)]
     show = pd.DataFrame({
         "Alerte 7 j": view["alerte"], "Ticker": view["ticker"], "Société": view["name"], "Secteur": view["sector"],
-        "Indice": view["indice"], "Sortie PDG / DAF": view["sortie"],
+        "Indice": view["indice"], "Croisement fonds × dirigeants": view["croise"], "Sortie PDG / DAF": view["sortie"],
         "Dirigeants · signal": view["signal"], "Dirigeants · achats 6 mois": view["achats_txt"],
         "Dirigeants · ventes 6 mois": view["ventes_txt"], "Dirigeants · net 12 mois": view["net12"],
         "Dirigeants · 12 derniers mois": view["frise"], "Dirigeants · dernière opération": view["derniere_txt"],
@@ -5310,6 +5375,10 @@ def render_investors_screener(max_days, use_cache, use_oi):
                for k, v in _sig_columns("$").items()}
         st.dataframe(show, width="stretch", hide_index=True, height=min(600, 38 + 35 * max(len(show), 1)),
                      column_config=cfg | {
+            "Croisement fonds × dirigeants": st.column_config.TextColumn(width="large", help=(
+                "Fonds 🟢 + dirigeants 🟢 = double confirmation · fonds 🟢 + dirigeants 🟠 acheteurs nets = confirmation "
+                "partielle · fonds 🟢 + dirigeants ⚪ ou 🔴 = fonds seuls (les ventes de dirigeants sont la norme : levées "
+                "d'options, impôts, plans programmés, 6 valeurs sur 10) · fonds 🔴 + dirigeants acheteurs = divergence")),
             "Sortie PDG / DAF": st.column_config.TextColumn(help=(
                 "⚠️ un PDG, DAF, président ou fondateur a vendu au moins la moitié de sa détention dans les 6 derniers "
                 "mois, en lien avec une levée d'options — hors signal 🟢/🟠/🔴/⚪")),
