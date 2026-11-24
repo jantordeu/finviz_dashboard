@@ -1214,6 +1214,7 @@ def build_facts(raw):
                if x is not None]
     f["sales_g"] = sorted(sales_g)[len(sales_g) // 2] if sales_g else None
     f["bvps"], f["roe_ttm"] = g("Book/sh"), g("ROE")
+    f["roic_fv"] = g("ROIC") if g("ROIC") is not None else g("ROI")      # rentabilité du capital investi (Finviz, %)
     # banque / courtier / assureur : pas d'EBITDA ni de flux libre significatif -> modèle bancaire (actif net, PER)
     f["bank"] = f["sector"] == "Financial" and bool(
         re.search(r"Bank|Capital Markets|Insurance|Mortgage", f["industry"]) or f["ebitda"] is None)
@@ -1269,6 +1270,13 @@ def merge_facts(fv, zb):
     if not f.get("dataroma"):
         f["dataroma"] = {"n": None, "rows": []}
     f["cyclical"] = bool(fv.get("cyclical") or zb.get("cyclical")) and not zb.get("steady_note")
+    # redressement reconnu sur l'historique Zonebourse (pertes puis BNA qui remonte) : le bond du BNA vu par Finviz est
+    # une sortie de crise, pas un pic de cycle — sauf PER prévisionnel < 7 (le marché juge les bénéfices non durables)
+    if zb.get("turnaround") and not fv.get("low_fpe"):
+        f["cyclical"] = False
+    for k in ("turnaround", "recovery", "recovery_note", "zb_sector"):
+        if zb.get(k):
+            f[k] = zb[k]
     if zb.get("steady_note"):
         f["steady_note"] = zb["steady_note"]
     if fv.get("dcfx") and (zb.get("dcfx") or {}).get("fc"):          # DCF Finviz + consensus Zonebourse (CA, marges, capex)
@@ -2285,6 +2293,18 @@ def fair_value(f, p):
             out["_alerts"].append("⚠️ DCF non retenu : investissements massifs sans consensus (JV = multiples)")
             res, f = None, dict(f, fcf_hist=[])
             out["_no_dcf_debt"] = True
+        tr0 = recent_losses(f) if res else ""
+        sv_ = [sc_.get("Valeur / action") for sc_ in res["scen"]] if res else []
+        if tr0 and len(sv_) == 3 and None not in sv_ and (sv_[2] < sv_[1] or sv_[1] < sv_[0]):
+            # redressement : flux actuels négatifs (pertes, investissements lourds) ; le DCF les prolonge au point que
+            # le scénario optimiste (plus de croissance) vaut moins que le central — il ne mesure rien d'utile
+            out["notes"].append(f"⚠️ DCF non significatif en redressement ({res['central']:.0f} ; scénarios pessimiste "
+                                f"{sv_[0]:.0f} / central {sv_[1]:.0f} / optimiste {sv_[2]:.0f} dans le désordre) : les "
+                                "flux actuels, négatifs, sont prolongés — non retenu, juste valeur = multiples")
+            out["_alerts"].append("⚠️ DCF non retenu : flux actuels négatifs (redressement), scénarios incohérents "
+                                  "(JV = multiples)")
+            res, f = None, dict(f, fcf_hist=[])
+            out["_no_dcf_trough"] = True
         if res and res["central"] <= 0:
             lev_ = (f["net_debt"] / f["ebitda"] if f.get("net_debt") is not None and f.get("ebitda")
                     and f["ebitda"] > 0 else None)
@@ -2402,8 +2422,13 @@ def fair_value(f, p):
         out["_alerts"].append("ℹ️ redressement : PER cible sur le BNA N+2 actualisé")
     if eps and eps > 0:
         if f["cyclical"]:
-            # BNA de milieu de cycle (déjà normalisé) : multiple « normalisé » 10–12x ; BNA N+1 (pic possible) : 8x
-            pe = p.get("pe_cyc_mid", 11.0) if eps_mid else p["pe_cyc"]
+            # BNA de milieu de cycle (déjà normalisé) : multiple « normalisé » 10–12x ; BNA N+1 (pic possible) : 8x ;
+            # sortie de pertes : le BNA N+1 est un creux, pas un pic -> multiple normalisé aussi
+            tr_ = recent_losses(f)
+            pe = p.get("pe_cyc_mid", 11.0) if (eps_mid or tr_) else p["pe_cyc"]
+            if tr_ and not eps_mid:
+                out["notes"].append(f"cyclique en sortie de pertes ({tr_}) : le BNA N+1 est un bénéfice de creux, "
+                                    f"multiple normalisé {pe:.0f}x au lieu du multiple de pic")
         else:
             pe = clamp(p["pe_base"] + 0.4 * (min(g5, 25) - 10), p["pe_min"], p["pe_max"])
         if f.get("pe_hist") and pe > 1.25 * f["pe_hist"]:
@@ -2436,6 +2461,12 @@ def fair_value(f, p):
         if comp.get("peak"):
             out["_comp_peak"] = comp["peak"]
     # --- synthèse ---
+    tr_ = recent_losses(f)
+    if tr_:                                    # bénéfices encore déprimés : aucune méthode sur les bénéfices n'est sûre
+        out["_trough"] = tr_
+        out["_alerts"].append(f"⚠️ société en redressement (pertes : {tr_}) : juste valeur peu fiable — elle repose "
+                              "sur des bénéfices encore déprimés ; le cours et l'objectif des analystes parient sur "
+                              "un retour à des bénéfices bien plus élevés")
     add_hist_pe(f, out)
     if out.get("_eps_mid"):                    # même synthèse, multiples sur le BNA N+1 : « si les bénéfices durent »
         k = out["_eps_peak"] / out["_eps_mid"]
@@ -2466,6 +2497,7 @@ def fair_value(f, p):
     if sum(1 for m in ("DCF", "PER", "PER hist.", "Comparables") if out.get(m)) == 1:
         out["notes"].append("⚠️ une seule méthode disponible : juste valeur fragile " + (
             "(DCF écarté : dette trop élevée)" if out.get("_no_dcf_debt") else
+            "(DCF écarté : redressement)" if out.get("_no_dcf_trough") else
             "(pour une page Zonebourse, ajoutez l'onglet Finances pour le DCF)"))
     if out.get("JV centrale") and f["price"]:
         out["Écart (%)"] = (out["JV centrale"] / f["price"] - 1) * 100
@@ -2725,6 +2757,21 @@ def cycle_eps(f):
     if len(vals) < 3 or (len(vals) < 4 and not f["_cyc_excl"]):
         return None, len(vals), n_pub
     return sum(vals) / len(vals), len(vals), n_pub
+
+
+def recent_losses(f):
+    """Pertes récentes : dernier exercice publié ou exercice en cours (consensus) en perte, ou BNA des 12 derniers mois
+    négatif, alors que le BNA N+1 est positif -> « 2024 : -4,38, 2025 : -0,06 » ; "" sinon."""
+    if not (f.get("eps_next_y") or 0) > 0:
+        return ""
+    z = f.get("zb") or {}
+    b, N, L = z.get("bna") or {}, z.get("N"), z.get("L")
+    neg = [(y, b[y]) for y in sorted(b) if N and L and L - 1 <= y <= N and b.get(y) is not None and b[y] <= 0]
+    if neg and (b.get(L) is not None and b[L] <= 0 or b.get(N) is not None and b[N] <= 0):
+        return ", ".join(f"{y} : {v:.2f}".replace(".", ",") for y, v in neg)
+    if not b and (f.get("eps_ttm") is not None and f["eps_ttm"] <= 0):
+        return f"12 derniers mois : {f['eps_ttm']:.2f}".replace(".", ",")
+    return ""
 
 
 def recovery_eps(f, p):
@@ -3326,6 +3373,198 @@ PREMIUM_NOTE = ("Non mesuré ici : carnet de commandes, thème porteur (IA, rés
 
 
 # ---------------------------------------------------------------------------------------------------------------
+#  GRILLE « CROISSANCE DE QUALITÉ » (fiche, après « En bref ») : lecture rapide d'une valeur de croissance
+# ---------------------------------------------------------------------------------------------------------------
+GRID_NOTE = ("Seuils : ROIC − CMPC ≥ 3 pts ✅ (< 0 ⚠️) · dette nette/EBITDA ≤ 2x ✅ (> 3,5x ⚠️) · couverture des intérêts "
+             "≥ 8x ✅ (< 4x ⚠️) · CA ≥ 10 %/an ✅ (< 5 % ⚠️) · BNA ≥ 12 %/an ✅ (< 6 % ⚠️), ⚠️ si la moitié vient des rachats "
+             "· FCF au moins aussi dynamique que le BNA ✅ · FCF / résultat net ≥ 80 % ✅ · PEG ≤ 1,2 ✅ (> 2 ⚠️) · "
+             "rendement du FCF ≥ 4 % ✅. Indicatif : à confirmer dans les publications ; non applicable aux banques / assurances.")
+
+
+def _cagr(a, b, n):
+    return ((b / a) ** (1 / n) - 1) * 100 if a and b and a > 0 and b > 0 and n and n > 0 else None
+
+
+def growth_grid(f, fv, cur=""):
+    """Grille de lecture rapide d'une valeur de croissance, en 4 blocs (qualité, solidité, croissance, prix) :
+    ROIC contre CMPC, marge, conversion en trésorerie, dette nette/EBITDA, couverture des intérêts, croissance du CA,
+    du BNA (hors rachats) et du FCF, PEG, rendement du FCF. -> dict(rows[(bloc, critère, valeur, lecture, signe)],
+    verdict, pos, neg, n) ou None."""
+    if f.get("bank") or f.get("insurer"):
+        return None
+    z = f.get("zb") or {}
+    N, L = z.get("N"), z.get("L")
+    x = f.get("dcfx") or {}
+    fx_ = lambda v, d=1: f"{v:.{d}f}".replace(".", ",")
+    rows = []
+    add = lambda b, c, v, t, s: rows.append((b, c, v, t, s))
+    # ---- qualité : ROIC contre CMPC
+    wacc, w_est = fv.get("CMPC (%)"), False
+    if wacc is None:
+        wacc, w_est = 9.0, True
+    roic, rsrc = f.get("roic_fv"), "Finviz"
+    if roic is None and z.get("ebit") and L and z["ebit"].get(L) is not None and (z.get("bvps") or {}).get(L) \
+            and (z.get("titres") or {}).get(L):
+        ic = z["bvps"][L] * z["titres"][L] / 1e3 + ((z.get("nd") or {}).get(L) or 0.0)
+        if ic > 0:
+            roic, rsrc = z["ebit"][L] * (1 - 0.25) / ic * 100, f"Zonebourse, estimé (EBIT {L} × 0,75 ÷ fonds propres + dette nette)"
+    if roic is None and x.get("ebit") and f.get("bvps") and f.get("shares"):
+        ic = f["bvps"] * f["shares"] + (x.get("net_debt") or 0.0)
+        if ic > 0:
+            roic, rsrc = x["ebit"] * (1 - (x.get("tax") or 0.21)) / ic * 100, "estimé (EBIT après impôt ÷ fonds propres + dette nette)"
+    if roic is not None:
+        sp = roic - wacc
+        add("Qualité", "ROIC − CMPC", f"{fx_(roic)} % − {fx_(wacc)} % = {sp:+.1f} pt".replace(".", ","),
+            ("crée de la valeur : chaque euro investi rapporte plus que son coût" if sp >= 3 else
+             "juste au-dessus du coût du capital" if sp >= 0 else "détruit de la valeur : la croissance coûte plus qu'elle ne rapporte")
+            + f" (ROIC {rsrc}" + (" ; CMPC 9 % par défaut, DCF non retenu" if w_est else "") + ")",
+            1 if sp >= 3 else (0 if sp >= 0 else -1))
+    # marge d'EBITDA : tendance
+    m_new = m_old = None
+    if z.get("ebitda") and z.get("ca") and L:
+        mm = lambda y: (z["ebitda"].get(y) / z["ca"][y]) if z["ebitda"].get(y) is not None and z["ca"].get(y) else None
+        m_old, m_new = mm(L - 2), (mm(N + 1) if N and mm(N + 1) is not None else mm(L))
+    elif x.get("m_hist") and x.get("m0") is not None:
+        mh = x["m_hist"]
+        m_old, m_new = mh[min(len(mh) - 1, 2)], x["m0"]
+    if m_old is not None and m_new is not None:
+        dm = (m_new - m_old) * 100
+        add("Qualité", "Marge d'EBITDA (tendance)", f"{fx_(m_new * 100)} % ({dm:+.1f} pt)".replace(".", ","),
+            "marges en expansion : la croissance gagne en rentabilité (levier opérationnel)" if dm >= 1 else
+            "marges stables" if dm >= -1 else "marges en recul : la croissance se fait au détriment de la rentabilité",
+            1 if dm >= 1 else (0 if dm >= -1 else -1))
+    # conversion du résultat en trésorerie
+    conv = None
+    bna, rn, fcf = z.get("bna") or {}, z.get("rn") or {}, z.get("fcf") or {}
+    if N and L:
+        yrs = [y for y in range(L - 1, N + 2) if rn.get(y) and rn[y] > 0 and fcf.get(y) is not None]
+        if len(yrs) >= 3:
+            conv = _med([fcf[y] / rn[y] for y in yrs])
+    elif f.get("fcf_hist") and (f.get("eps_ttm") or 0) > 0 and f.get("shares"):
+        conv = f["fcf_hist"][0] / (f["eps_ttm"] * f["shares"])
+    if conv is not None and -1 <= conv <= 3:
+        add("Qualité", "FCF / résultat net", f"{conv * 100:.0f} %",
+            "le bénéfice se transforme en trésorerie" if conv >= 0.8 else
+            "conversion moyenne" if conv >= 0.6 else "flux libre nettement inférieur au bénéfice : qualité à vérifier",
+            1 if conv >= 0.8 else (0 if conv >= 0.6 else -1))
+    # ---- solidité
+    nd = (z.get("nd") or {}).get(N) if N else None
+    nd = nd if nd is not None else f.get("net_debt")
+    eb = (z.get("ebitda") or {}).get(N) if N else None
+    eb = eb or f.get("ebitda")
+    if nd is not None and eb:
+        if nd < 0:
+            add("Solidité", "Dette nette / EBITDA", "trésorerie nette", "bilan sans dette nette", 1)
+        elif eb > 0:
+            lv = nd / eb
+            add("Solidité", "Dette nette / EBITDA", f"{fx_(lv)}x",
+                "confortable" if lv <= 2 else "endettement à surveiller" if lv <= 3.5 else "endettement élevé : fragilise la croissance",
+                1 if lv <= 2 else (0 if lv <= 3.5 else -1))
+        else:
+            add("Solidité", "Dette nette / EBITDA", "EBITDA négatif", "dette non couverte par l'activité", -1)
+    if x.get("ebit") and x.get("interest"):
+        cv = x["ebit"] / abs(x["interest"])
+        add("Solidité", "Couverture des intérêts (EBIT / charges financières)", f"{fx_(cv)}x",
+            "charge de la dette très supportable" if cv >= 8 else "supportable" if cv >= 4 else "charge de la dette lourde",
+            1 if cv >= 8 else (0 if cv >= 4 else -1))
+    # ---- croissance
+    g_ca = None
+    if z.get("ca") and N and L and z["ca"].get(L) and z["ca"].get(N + 1) and N + 1 > L:
+        g_ca, l_ca = _cagr(z["ca"][L], z["ca"][N + 1], N + 1 - L), f"CA {L} → {N + 1}"
+    elif f.get("sales_g") is not None:
+        g_ca, l_ca = f["sales_g"], "médiane des croissances à 3 ans, 5 ans et 12 mois"
+    if g_ca is not None:
+        add("Croissance", "Chiffre d'affaires", f"{g_ca:+.1f} %/an".replace(".", ","), l_ca + (
+            " — croissance soutenue" if g_ca >= 10 else " — modérée" if g_ca >= 5 else " — faible pour une valeur de croissance"),
+            1 if g_ca >= 10 else (0 if g_ca >= 5 else -1))
+    rebound = bool(f.get("cyclical") or f.get("turnaround") or recent_losses(f))
+    g = None
+    if bna.get(L) and bna.get(N + 1 if N else 0) and bna[L] > 0 and N and N + 1 > L:
+        g, l_g = _cagr(bna[L], bna[N + 1], N + 1 - L), f"BNA {L} → {N + 1}"
+    elif f.get("eps_5y") is not None:
+        g, l_g = f["eps_5y"], "croissance annuelle attendue du BNA sur 5 ans (Finviz)"
+    elif f.get("eps_next_y_pct") is not None:
+        g, l_g = f["eps_next_y_pct"], "croissance attendue du BNA l'an prochain (Finviz)"
+    if g is not None:
+        dl = net_dilution(f)
+        bb = max(0.0, -dl["cagr"]) if dl else 0.0
+        s_g = 1 if g >= 12 else (0 if g >= 6 else -1)
+        t_g = l_g + (" — forte" if g >= 12 else " — correcte" if g >= 6 else " — faible")
+        if rebound and g >= 12:
+            s_g, t_g = 0, t_g + " — mais effet de rebond (redressement / cycle) : pas une croissance durable"
+        if dl and g > 0 and bb >= 1:
+            t_g += f" ; dont {fx_(bb)} pt venant des rachats ({dl['y0']}–{dl['y1']})"
+            if bb >= 0.5 * g:
+                s_g, t_g = -1, t_g + " : croissance surtout financière, pas d'activité"
+            elif bb >= 0.25 * g:
+                s_g = min(s_g, 0)
+        elif dl and dl["cagr"] >= 2:
+            t_g += f" ; nombre d'actions en hausse de {fx_(dl['cagr'])} %/an (dilution)"
+            s_g = min(s_g, 0)
+        add("Croissance", "BNA (hors rachats d'actions)", f"{g:+.0f} %/an", t_g, s_g)
+    # FCF contre BNA : même fenêtre
+    gf = gb = None
+    if z.get("fcf") and N and L and fcf.get(L) and fcf.get(N + 1) and N + 1 > L:
+        gf, wnd = _cagr(fcf[L], fcf[N + 1], N + 1 - L), f"{L} → {N + 1}"
+        gb = _cagr(bna.get(L), bna.get(N + 1), N + 1 - L) if bna.get(L) else None
+    elif len(f.get("fcf_hist") or []) >= 3:
+        fh, n_ = f["fcf_hist"], len(f["fcf_hist"]) - 1
+        gf, wnd = _cagr(fh[-1], fh[0], n_), f"12 derniers mois contre il y a {n_} ans"
+        eh = [v for _, v in (f.get("eps_hist") or []) if v is not None]
+        gb = _cagr(eh[-(n_ + 1)], eh[-1], n_) if len(eh) > n_ else None
+    if gf is not None:
+        ref = gb if gb is not None else g
+        s_f = 1 if ref is not None and gf >= ref - 2 else (0 if gf >= 0 else -1)
+        add("Croissance", "Croissance du FCF contre BNA", f"FCF {gf:+.0f} %/an".replace(".", ",")
+            + (f" · BNA {ref:+.0f} %/an" if ref is not None else ""),
+            f"fenêtre {wnd} — " + ("le flux libre suit le bénéfice : croissance de qualité" if s_f == 1 else
+                                   "le flux libre progresse moins vite que le bénéfice" if s_f == 0 else
+                                   "le flux libre recule : bénéfices pas encore convertis en trésorerie"), s_f)
+    # ---- prix
+    gp = f.get("eps_5y") if f.get("eps_5y") and f["eps_5y"] > 0 else (g if g and g > 0 else None)
+    if f.get("fwd_pe") and gp:
+        peg = f["fwd_pe"] / gp
+        s_p = 1 if peg <= 1.2 else (-1 if peg > 2 else 0)
+        t_p = (f"PER N+1 {fx_(f['fwd_pe'])}x ÷ croissance {fx_(gp, 0)} %")
+        if rebound:
+            s_p, t_p = 0, t_p + " — peu fiable : la croissance vient d'un rebond (cycle ou redressement)"
+        else:
+            t_p += (" — bas" if peg <= 1.2 else " — élevé" if peg > 2 else " — neutre")
+        add("Prix", "PEG", fx_(peg, 2), t_p, s_p)
+    fy = (f.get("fcf_hist") or [None])[0]
+    if fy is not None and f.get("mcap"):
+        y_ = fy / f["mcap"] * 100
+        add("Prix", "Rendement du FCF", f"{fx_(y_)} %", "flux libre / capitalisation" + (
+            " — bon rendement pour une valeur de croissance" if y_ >= 4 else " — rendement modeste" if y_ >= 2
+            else " — le cours paie surtout la croissance future"), 1 if y_ >= 4 else (0 if y_ >= 2 else -1))
+    if not rows:
+        return None
+    pos, neg, n = sum(r[4] > 0 for r in rows), sum(r[4] < 0 for r in rows), len(rows)
+    red_sol = [r[1] for r in rows if r[0] == "Solidité" and r[4] < 0]
+    red_roic = any(r[1] == "ROIC − CMPC" and r[4] < 0 for r in rows)
+    jv, pr = fv.get("JV centrale"), f.get("price")
+    cheap = bool(jv and pr and jv > pr)
+    weak = [r[1] for r in rows if r[4] < 0]
+    solid = pos / n >= 0.7 and not red_sol and not red_roic
+    if cheap and solid:
+        v = (f"✅ Candidate : {pos} critères favorables sur {n}, aucun point faible sur la solidité ni sur le ROIC, "
+             f"et la juste valeur ({jv:.0f} {cur}) dépasse le cours ({pr:.0f} {cur}).")
+    elif cheap:
+        v = (f"À étudier : la juste valeur ({jv:.0f} {cur}) dépasse le cours ({pr:.0f} {cur}) mais le profil de croissance est "
+             f"incomplet ({pos} favorables sur {n}" + (f" ; points faibles : {', '.join(weak)}" if weak else "") + ").")
+    elif solid:
+        v = (f"Belle valeur de croissance ({pos} critères favorables sur {n}) mais la juste valeur "
+             f"({jv:.0f} {cur}) ne dépasse pas le cours : attendre un meilleur prix." if jv else
+             f"Profil de croissance de qualité ({pos} favorables sur {n}) mais juste valeur non calculée.")
+    else:
+        v = (f"Profil de croissance de qualité non démontré ({pos} favorables sur {n}"
+             + (f" ; points faibles : {', '.join(weak)}" if weak else "") + ").")
+    if f.get("cyclical"):
+        v += " ⚠️ Valeur cyclique : croissance et marges de haut de cycle, à lire avec prudence."
+    return {"rows": rows, "verdict": v, "pos": pos, "neg": neg, "n": n}
+
+
+# ---------------------------------------------------------------------------------------------------------------
 #  LECTURE SIMPLE (section 7) : ce que le cours, la juste valeur et l'objectif supposent comme bénéfice
 # ---------------------------------------------------------------------------------------------------------------
 def simple_mults(f):
@@ -3595,6 +3834,8 @@ def precision_txt(fv):
         return "🔴 multiples du seul BNA de pic" + tail
     if fv.get("_low_conf") is not None:
         return f"🔴 peu fiable (cycle : {fv['_low_conf']} exercice(s) publié(s))" + tail
+    if fv.get("_trough"):
+        return "🔴 peu fiable (redressement : pertes récentes)" + (f" ±{d:.0f} %" if d is not None else "") + tail
     if fv.get("_mode") == "dcf" and d is not None:
         return ("🟢" if d <= 15 else "🟠" if d <= 35 else "🔴") + f" ±{d:.0f} % (DCF / multiples)" + tail
     if d is None:
@@ -3830,7 +4071,35 @@ FIN_LEXICON = {"upgrade": 2.0, "upgraded": 2.0, "upgrades": 2.0, "downgrade": -2
                "underperform": -1.5, "underperforms": -1.5, "outperforms": 1.5, "slides": -1.0, "gains": 1.0, "overweight": 1.2, "underweight": -1.2, "bullish": 2.0, "bearish": -2.0,
                "raises": 1.0, "raised": 1.0, "lowers": -1.0, "lowered": -1.0, "cut": -1.5, "cuts": -1.5,
                "lawsuit": -2.0, "probe": -1.5, "investigation": -1.5, "layoffs": -1.5, "record": 1.0,
-               "buyback": 1.2, "dividend": 0.5, "guidance": 0.0, "volatile": -0.5}
+               "buyback": 1.2, "dividend": 0.5, "guidance": 0.0, "volatile": -0.5,
+               # baisses de cours absentes du lexique général
+               "fall": -1.5, "fell": -1.5, "falling": -1.5, "fallen": -1.5, "drop": -1.5, "dropped": -1.5,
+               "dropping": -1.5, "decline": -1.5, "declines": -1.5, "declined": -1.5, "declining": -1.5,
+               "dip": -1.0, "dips": -1.0, "dipped": -1.0, "sink": -1.8, "sank": -1.8, "sinking": -1.8,
+               "slide": -1.2, "slid": -1.2, "sliding": -1.2, "slip": -1.0, "slips": -1.0, "slipped": -1.0,
+               "tumbled": -2.0, "tumbling": -2.0, "plunged": -2.5, "plunging": -2.5, "plummet": -2.5,
+               "plummets": -2.5, "plummeted": -2.5, "slumped": -2.0, "crash": -2.5, "crashes": -2.5,
+               "crashed": -2.5, "dive": -2.0, "dives": -2.0, "nosedive": -2.5, "retreat": -1.0, "retreats": -1.0,
+               "selloff": -2.0, "sell-off": -2.0, "rout": -2.2, "skid": -1.5, "skids": -1.5, "sheds": -1.2,
+               "shed": -1.2, "erases": -1.2, "wipes": -1.5, "weaken": -1.2, "weakens": -1.2, "weakened": -1.2,
+               "lower": -0.8, "downturn": -1.5, "headwinds": -1.2, "headwind": -1.2, "shortfall": -1.8,
+               "warns": -1.5, "warning": -1.5, "warned": -1.5, "slash": -1.8, "slashes": -1.8, "slashed": -1.8,
+               "fined": -1.8, "fine": -1.2, "fines": -1.5, "penalty": -1.5, "clawback": -1.8, "recall": -1.5,
+               "recalls": -1.5, "halt": -1.2, "halts": -1.2, "delay": -1.0, "delays": -1.0, "delayed": -1.0,
+               "bankruptcy": -3.0, "default": -2.0, "fraud": -3.0, "subpoena": -1.8, "antitrust": -1.2,
+               "overpayments": -1.2, "overpayment": -1.2, "short-seller": -1.5, "writedown": -1.8,
+               "impairment": -1.5, "dilution": -1.2, "threatens": -1.6,
+               # hausses de cours
+               "rise": 1.2, "rises": 1.2, "rose": 1.2, "rising": 1.0, "climb": 1.2, "climbs": 1.2, "climbed": 1.2,
+               "jumped": 1.5, "soared": 2.0, "surged": 2.0, "rallied": 1.5, "rebound": 1.3, "rebounds": 1.3,
+               "rebounded": 1.3, "gain": 1.0, "gained": 1.0, "boost": 1.2, "boosts": 1.2, "boosted": 1.2,
+               "skyrockets": 2.5, "spikes": 1.2, "tanks": -2.2, "tanked": -2.2, "tanking": -2.2, "higher": 0.8, "tailwind": 1.2, "tailwinds": 1.2}
+# mots notés positifs par le lexique général mais neutres en bourse (« shares », « Medicare Advantage », noms propres)
+FIN_NEUTRAL = ("share", "shares", "advantage", "securities", "security", "united", "trust", "care", "interest",
+               "interests", "credit", "asset", "assets", "yield", "yields", "equity", "premium", "premiums",
+               "value", "natural", "energy", "vice", "gross", "treasury", "holding", "holdings", "partner",
+               "partners", "novel", "play", "plays", "chip", "chips", "giant", "giants", "freedom", "liberty",
+               "sharp", "kind", "like", "party", "moody", "arm", "arms", "tank")
 
 
 def _vader():
@@ -3839,6 +4108,8 @@ def _vader():
     except ImportError:
         return None
     a = SentimentIntensityAnalyzer()
+    for w in FIN_NEUTRAL:
+        a.lexicon.pop(w, None)
     a.lexicon.update(FIN_LEXICON)
     return a
 
@@ -4523,11 +4794,69 @@ def _sig_columns(cur):
     }
 
 
+NDX_FILE = Path(__file__).resolve().parent / "nasdaq100.csv"
+INV_UNIVERSES = ["S&P 500 + Nasdaq 100", "S&P 500", "Nasdaq 100"]
+
+
+def ndx_list():
+    """Composants du Nasdaq 100 (fichier nasdaq100.csv : ticker;nom;secteur — à mettre à jour après la révision
+    annuelle de décembre) -> DataFrame ticker, name, sector ; vide si le fichier manque."""
+    try:
+        df = pd.read_csv(NDX_FILE, sep=";", dtype=str).fillna("")
+        df = df.rename(columns={"nom": "name", "secteur": "sector"})
+        df["ticker"] = df["ticker"].str.strip().str.upper()
+        return df[df["ticker"] != ""].drop_duplicates("ticker")[["ticker", "name", "sector"]]
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame(columns=["ticker", "name", "sector"])
+
+
+def _ndx_extra(tickers, names, progress=None):
+    """Valeurs du Nasdaq 100 absentes de la grille S&P 500 de Dataroma : fiche Dataroma de chaque valeur ->
+    nb de superinvestors détenteurs, renforcements / allègements (dernier mouvement déclaré par chaque fonds).
+    Le trimestre précédent n'est pas connu pour ces valeurs (colonnes « 6 mois » = dernier trimestre)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def one(t):
+        d = parse_dataroma(_get(_session(), f"https://www.dataroma.com/m/stock.php?sym={t}", (0.2, 0.5)))
+        mv = [(r.get("Mouvement") or "=") for r in d["rows"]]
+        up = sum(1 for m in mv if m.startswith(("Buy", "Add")))
+        dn = sum(1 for m in mv if m.startswith(("Reduce", "Sell")))
+        return {"ticker": t, "name": names.get(t, (t, ""))[0], "sector": names.get(t, ("", ""))[1],
+                "owners": int(d.get("n") or len(d["rows"])), "add_q": up, "red_q": dn, "add_6m": up, "red_6m": dn}
+    out = []
+    with ThreadPoolExecutor(4) as ex:
+        futs = [ex.submit(one, t) for t in tickers]
+        for i, fu in enumerate(as_completed(futs), 1):
+            try:
+                out.append(fu.result())
+            except Exception:  # noqa: BLE001 — fiche absente de Dataroma : valeur ignorée
+                pass
+            if progress:
+                progress(i, len(futs))
+    return pd.DataFrame(out, columns=["ticker", "name", "sector", "owners", "add_q", "red_q", "add_6m", "red_6m"])
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def _inv_load(min_si):
+def _inv_load(min_si, univers="S&P 500"):
     an_, oi_, _ = _ins_modules()
     bar = st.progress(0.0, text="Grilles Dataroma…")
-    uni = an_.investors_universe(min_si, progress=lambda i, n, t: bar.progress(0.04 * i, text=f"Dataroma : {t}"))
+    uni = an_.investors_universe(1, progress=lambda i, n, t: bar.progress(0.04 * i, text=f"Dataroma : {t}"))
+    uni["indice"] = "S&P 500"
+    if "Nasdaq" in univers:
+        ndx = ndx_list()
+        nset = set(ndx["ticker"])
+        uni.loc[uni["ticker"].isin(nset), "indice"] = "S&P 500 · Nasdaq 100"
+        miss = [t for t in ndx["ticker"] if t not in set(uni["ticker"])]
+        if miss:
+            names = {r.ticker: (r.name_, r.sector) for r in ndx.rename(columns={"name": "name_"}).itertuples()}
+            extra = _ndx_extra(miss, names, progress=lambda i, n: bar.progress(
+                0.16 + 0.04 * i / n, text=f"Dataroma, Nasdaq 100 hors S&P 500 : {i}/{n}"))
+            if not extra.empty:
+                extra["indice"] = "Nasdaq 100"
+                uni = pd.concat([uni, extra], ignore_index=True)
+        if univers == "Nasdaq 100":
+            uni = uni[uni["ticker"].isin(nset)]
+    uni = uni[uni["owners"] >= min_si].reset_index(drop=True)
     raw_tx, log = an_.fetch_openinsider(uni, 365, include_oe=True, progress=lambda i, n, t: bar.progress(
         0.2 + 0.8 * i / n, text=f"OpenInsider (12 mois) {i}/{n}"))
     bar.empty()
@@ -4847,10 +5176,15 @@ def render_investors_screener(max_days, use_cache, use_oi):
         st.error(f"Modules du screener introuvables ({grids}) : placez analyse.py, openinsider.py, "
                  "dataroma_scraper.py, exports.py et signaux.py dans le dossier du dashboard.")
         return
-    st.caption("Univers : valeurs du S&P 500 détenues par les superinvestors (grille Dataroma « Ownership »). "
+    st.caption("Univers : valeurs du S&P 500 et / ou du Nasdaq 100 détenues par les superinvestors (Dataroma). "
                "Deux signaux côte à côte : les dirigeants (OpenInsider, 12 mois, levées d'options exclues) et les "
                "fonds (renforcements / allègements, Dataroma).")
     with st.expander("⚙️ Réglages", expanded="inv_data" not in st.session_state):
+        univers = st.radio("Univers", INV_UNIVERSES, horizontal=True, key="inv_univers_sel",
+                           help="Nasdaq 100 : liste du fichier nasdaq100.csv (composition d'octobre 2026, à mettre à "
+                                "jour après la révision de décembre). Les valeurs du Nasdaq 100 hors S&P 500 "
+                                "(ARM, ASML, MRVL, PDD…) sont lues une à une sur Dataroma : ≈ 20 s de plus, et le "
+                                "trimestre précédent des fonds n'est pas disponible pour elles.")
         c = st.columns(3)
         min_si = c[0].number_input("Nb minimum de superinvestors détenteurs", 1, 50, 1, key="inv_min_si",
                                    help="1 ≈ 430 valeurs, 3 ≈ 250, 5 ≈ 150 (novembre 2026).")
@@ -4874,7 +5208,8 @@ def render_investors_screener(max_days, use_cache, use_oi):
         try:
             if not use_cache:
                 _inv_load.clear()
-            st.session_state["inv_data"] = _inv_load(int(min_si))
+            st.session_state["inv_data"] = _inv_load(int(min_si), univers)
+            st.session_state["inv_univers"] = univers
             conv_ = (_inv_conviction(tuple(st.session_state["inv_data"][0]["ticker"])) if use_conv else (None, None))
             st.session_state["inv_conv_rows"], st.session_state["inv_hold"] = conv_
         except Exception as e:  # noqa: BLE001
@@ -4907,6 +5242,8 @@ def render_investors_screener(max_days, use_cache, use_oi):
     qs = [sg.fund_quarters(*r) for r in final[["add_q", "red_q", "add_6m", "red_6m"]].itertuples(index=False)]
     final["fonds_q"] = [f"▲ {a}  ▼ {r}" for a, r, _, _ in qs]
     final["fonds_p"] = [f"▲ {a}  ▼ {r}" for _, _, a, r in qs]
+    if "indice" in final.columns:                   # Nasdaq 100 hors S&P 500 : pas de grille « trimestre précédent »
+        final.loc[final["indice"] == "Nasdaq 100", "fonds_p"] = "n.d."
     final["concord"] = (final["dot"] == "🟢") & (final["fonds_dot"] == "🟢")
     final = final.sort_values(["rank", "concord", "net12"], ascending=[True, False, False]).reset_index(drop=True)
     if raw_tx.empty:
@@ -4942,7 +5279,14 @@ def render_investors_screener(max_days, use_cache, use_oi):
     picks = f1.pills("Filtrer (dirigeants)", SIG_FILTERS + ["⚠️ sortie PDG / DAF", "🟢 dirigeants + 🟢 fonds"],
                      selection_mode="multi", key="inv_pills") or []
     sect = f2.multiselect("Secteur", sorted(final["sector"].dropna().unique()), key="inv_sector")
+    if "indice" not in final.columns:               # analyse faite avant l'ajout du Nasdaq 100
+        final["indice"] = "S&P 500"
+    ndx_only = final["indice"].str.contains("Nasdaq").any() and f2.checkbox(
+        "Nasdaq 100 seulement", key="inv_ndx_only", help="N'affiche que les valeurs du Nasdaq 100 (dont celles qui "
+                                                         "sont aussi dans le S&P 500).")
     view = _sig_filter(final, [p for p in picks if p not in ("🟢 dirigeants + 🟢 fonds", "⚠️ sortie PDG / DAF")])
+    if ndx_only:
+        view = view[view["indice"].str.contains("Nasdaq")]
     if "⚠️ sortie PDG / DAF" in picks:
         view = view[view["sortie"] != ""]
     if "🟢 dirigeants + 🟢 fonds" in picks:
@@ -4951,7 +5295,7 @@ def render_investors_screener(max_days, use_cache, use_oi):
         view = view[view["sector"].isin(sect)]
     show = pd.DataFrame({
         "Alerte 7 j": view["alerte"], "Ticker": view["ticker"], "Société": view["name"], "Secteur": view["sector"],
-        "Sortie PDG / DAF": view["sortie"],
+        "Indice": view["indice"], "Sortie PDG / DAF": view["sortie"],
         "Dirigeants · signal": view["signal"], "Dirigeants · achats 6 mois": view["achats_txt"],
         "Dirigeants · ventes 6 mois": view["ventes_txt"], "Dirigeants · net 12 mois": view["net12"],
         "Dirigeants · 12 derniers mois": view["frise"], "Dirigeants · dernière opération": view["derniere_txt"],
@@ -5015,9 +5359,9 @@ def render_investors_screener(max_days, use_cache, use_oi):
                          default=list(view["ticker"])[:5], key="inv_sel")
     if st.button("➜ Analyse complète", key="inv_full", disabled=not sel):
         send_to_watchlist(sel, "Screener investors", max_days, use_cache, use_oi)
-    _sig_exports(show, "investors", "Screener investors (S&P 500 × superinvestors)", {"Dirigeants · net 12 mois"},
+    _sig_exports(show, "investors", f"Screener investors ({st.session_state.get('inv_univers', 'S&P 500')} × superinvestors)", {"Dirigeants · net 12 mois"},
                  {"Dataroma", "OpenInsider"}, "inv",
-                 f"Univers : S&P 500 détenu par ≥ {int(min_si)} superinvestor(s) (Dataroma) ; dirigeants : OpenInsider "
+                 f"Univers : {st.session_state.get('inv_univers', 'S&P 500')} détenu par ≥ {int(min_si)} superinvestor(s) (Dataroma) ; dirigeants : OpenInsider "
                  f"12 mois, seuil significatif {min_sig:,.0f} $.".replace(",", " "))
 
 
@@ -6224,6 +6568,12 @@ def report_model(f, d, t):
     B.append(("p", en_bref(f, d, cur)))
     if fv.get("_alerts"):
         B.append(("ul", list(fv["_alerts"])))
+    gg_ = growth_grid(f, fv, cur)
+    if gg_:
+        B.append(("p", "Grille croissance de qualité : " + gg_["verdict"]))
+        B.append(("table", ["", "Bloc", "Critère", "Valeur", "Lecture"],
+                  [[ICON_P[r[4]], r[0], r[1], r[2], r[3]] for r in gg_["rows"]]))
+        B.append(("p", GRID_NOTE))
     # 3
     B.append(("h", "3. Bénéfice par action (BNA)"))
     ser = _eps_series(f)
@@ -7216,6 +7566,13 @@ def render_detail(f, d, t=None, ns=""):
             st.warning(a_)
         if why_:
             st.warning(_md("Écart entre méthodes — " + why_))
+    gg_ = growth_grid(f, fv, cur.strip())
+    if gg_:
+        with st.expander("🌱 Grille croissance de qualité — lecture rapide", expanded=True):
+            st.markdown(_md(gg_["verdict"]))
+            st.dataframe(pd.DataFrame([{"": ICON_P[r[4]], "Bloc": r[0], "Critère": r[1], "Valeur": r[2], "Lecture": r[3]}
+                                       for r in gg_["rows"]]), hide_index=True, width="stretch")
+            st.caption(GRID_NOTE)
     # ---------- 3. Bénéfice par action
     st.markdown("##### 3. Bénéfice par action (BNA)")
     ser = _eps_series(f)
@@ -8100,7 +8457,9 @@ complète = au moins −0,5 point ; 5 points au plus par fonds, pour qu'un seul 
 🔴 ≤ −0,5, 🟠 achats et ventes significatifs qui se compensent, ⚪ mouvements symboliques. Le poids mesure la conviction du
 gérant, pas le montant investi (0,6 % du portefeuille de Bridgewater = une grosse somme, mais une petite conviction).
 
-**🇺🇸 Screener investors** : univers = valeurs du S&P 500 détenues par au moins N superinvestors (grille Dataroma
+**🇺🇸 Screener investors** : univers au choix — S&P 500, Nasdaq 100 (fichier `nasdaq100.csv`) ou les deux ; les valeurs du
+Nasdaq 100 hors S&P 500 sont lues une à une sur Dataroma (détenteurs et dernier mouvement de chaque fonds ; trimestre
+précédent non disponible). Valeurs détenues par au moins N superinvestors (grille Dataroma
 « Ownership »). Colonne Dirigeants : transactions OpenInsider sur 12 mois (levées d'options exclues, achats sous le montant
 minimum ignorés, ventes toutes comptées). Colonnes Fonds : nombre de superinvestors qui renforcent / allègent la valeur
 au dernier trimestre et au trimestre précédent (grilles « Last qtr buys / sells », et « 6 months » moins le dernier

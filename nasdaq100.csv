@@ -1,0 +1,102 @@
+ticker;nom;secteur
+ADBE;Adobe Inc.;Technology
+AMD;Advanced Micro Devices;Technology
+ABNB;Airbnb;Consumer Discretionary
+ALNY;Alnylam Pharmaceuticals;Health Care
+GOOGL;Alphabet Inc. (Class A);Technology
+GOOG;Alphabet Inc. (Class C);Technology
+AMZN;Amazon;Consumer Discretionary
+AEP;American Electric Power;Utilities
+AMGN;Amgen;Health Care
+ADI;Analog Devices;Technology
+AAPL;Apple Inc.;Technology
+AMAT;Applied Materials;Technology
+APP;AppLovin;Technology
+ARM;Arm Holdings;Technology
+ASML;ASML Holding;Technology
+ALAB;Astera Labs;Technology
+ADSK;Autodesk;Technology
+ADP;Automatic Data Processing;Industrials
+AXON;Axon Enterprise;Industrials
+BKR;Baker Hughes;Energy
+BKNG;Booking Holdings;Consumer Discretionary
+AVGO;Broadcom;Technology
+CDNS;Cadence Design Systems;Technology
+CTAS;Cintas;Industrials
+CSCO;Cisco;Telecommunications
+CCEP;Coca-Cola Europacific Partners;Consumer Staples
+CMCSA;Comcast;Telecommunications
+CEG;Constellation Energy;Utilities
+CPRT;Copart;Consumer Discretionary
+CRWV;CoreWeave;Technology
+COST;Costco;Consumer Discretionary
+CRWD;CrowdStrike;Technology
+CSX;CSX Corporation;Industrials
+DDOG;Datadog;Technology
+DXCM;DexCom;Health Care
+FANG;Diamondback Energy;Energy
+DASH;DoorDash;Technology
+EXC;Exelon;Utilities
+FAST;Fastenal;Industrials
+FER;Ferrovial;Industrials
+FTNT;Fortinet;Technology
+GEHC;GE HealthCare;Health Care
+GILD;Gilead Sciences;Health Care
+HONA;Honeywell Aerospace;Industrials
+HON;Honeywell Technologies;Industrials
+IDXX;Idexx Laboratories;Health Care
+INTC;Intel;Technology
+INTU;Intuit;Technology
+ISRG;Intuitive Surgical;Health Care
+KDP;Keurig Dr Pepper;Consumer Staples
+KLAC;KLA Corporation;Technology
+LRCX;Lam Research;Technology
+LIN;Linde plc;Basic Materials
+LITE;Lumentum;Technology
+MAR;Marriott International;Consumer Discretionary
+MRVL;Marvell Technology;Technology
+MELI;Mercado Libre;Consumer Discretionary
+META;Meta Platforms;Technology
+MCHP;Microchip Technology;Technology
+MU;Micron Technology;Technology
+MSFT;Microsoft;Technology
+MSTR;MicroStrategy;Technology
+MRNA;Moderna;Health Care
+MDLZ;Mondelez International;Consumer Staples
+MPWR;Monolithic Power Systems;Technology
+MNST;Monster Beverage;Consumer Staples
+NBIS;Nebius Group;Technology
+NFLX;Netflix, Inc.;Consumer Discretionary
+NVDA;Nvidia;Technology
+NXPI;NXP Semiconductors;Technology
+ORLY;O'Reilly Automotive;Consumer Discretionary
+ODFL;Old Dominion Freight Line;Industrials
+PCAR;Paccar;Consumer Discretionary
+PLTR;Palantir Technologies;Technology
+PANW;Palo Alto Networks;Technology
+PAYX;Paychex;Industrials
+PYPL;PayPal;Industrials
+PDD;PDD Holdings;Technology
+PEP;PepsiCo;Consumer Staples
+QCOM;Qualcomm;Technology
+REGN;Regeneron Pharmaceuticals;Health Care
+RKLB;Rocket Lab;Industrials
+ROP;Roper Technologies;Technology
+ROST;Ross Stores;Consumer Discretionary
+SNDK;Sandisk;Technology
+STX;Seagate Technology;Technology
+SHOP;Shopify;Technology
+SPCX;SpaceX;Telecommunications
+SBUX;Starbucks;Consumer Discretionary
+SNPS;Synopsys;Technology
+TMUS;T-Mobile US;Telecommunications
+TTWO;Take-Two Interactive;Consumer Discretionary
+TER;Teradyne;Technology
+TSLA;Tesla, Inc.;Consumer Discretionary
+TXN;Texas Instruments;Technology
+TRI;Thomson Reuters;Technology
+VRTX;Vertex Pharmaceuticals;Health Care
+WMT;Walmart;Consumer Discretionary
+WDC;Western Digital;Technology
+WDAY;Workday, Inc.;Technology
+XEL;Xcel Energy;Utilities

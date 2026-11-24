@@ -302,3 +302,38 @@ phrase « pour justifier le cours il faut un BNA normal de … », tableau BNA r
 (consensus N+2, N+1, 12 derniers mois, milieu de cycle ou moyenne, point bas ; non cyclique : « déception −20 % » à la place de l'historique lointain),
 valorisation comparée (PER 12 mois et N+1 de la valeur et de ses pairs Finviz / Zonebourse + médiane). Écran, PDF et Word. `SIMPLE_NOTE`.
 L'ancienne analyse (pont, repères, prime, causes) suit sous « Analyse détaillée ».
+
+## Sentiment des actualités : vocabulaire boursier élargi
+`FIN_LEXICON` complété (fall, decline, dip, sink, slide, plunge, fine, clawback… / rise, climb, rebound…) et `FIN_NEUTRAL` : mots que VADER note
+positifs à tort en bourse (« shares », « advantage » de Medicare Advantage, « united », « trust », « care », « securities »…) retirés du lexique.
+Cas d'origine : « UnitedHealth, Humana and CVS Shares Fall as Medicare Advantage… Threaten $107 Billion » noté +15, désormais −62.
+Limite : seul le titre est noté ; pas de compréhension du sujet (« yields fall » compte comme une baisse).
+
+## Redressement après pertes (cas Intel, 23/11/2026)
+Problème : fiche fusionnée Finviz + Zonebourse classée « cyclique » par Finviz (bond du BNA) alors que Zonebourse reconnaissait un
+redressement -> PER de pic 8x sur un BNA de creux, JV 18 $ affichée ±18 %. Corrections : `merge_facts` — `zb["turnaround"]` l'emporte
+(sauf `low_fpe`), clés turnaround/recovery/recovery_note/zb_sector reportées ; `recent_losses(f)` (dernier exercice publié ou exercice
+en cours en perte, BNA N+1 > 0) -> alerte « société en redressement… JV peu fiable », `out["_trough"]`, précision 🔴
+« peu fiable (redressement : pertes récentes) » ; cyclique en sortie de pertes : multiple normalisé (pe_cyc_mid 11x) au lieu de 8x.
+Intel pages Zonebourse seules : JV 25,6 (DCF 29, PER 16x × 1,37 = 22, PER hist. 17,5 ; comparables 44 écartés).
+Suite (même jour) : fiche fusionnée INTC, DCF Finviz 3 $ (pessimiste 0,6 / central 9,1 / optimiste −5,9, CMPC 12,9 %) pesait 50 % -> JV 16.
+Règle ajoutée dans `fair_value` : en redressement (`recent_losses`), si les 3 scénarios du DCF ne sont pas dans l'ordre
+(optimiste < central ou central < pessimiste), DCF non retenu (`_no_dcf_trough`), JV = multiples. Attendu INTC fusionné : ~28 $ (🔴 peu fiable).
+
+## Screener investors élargi au Nasdaq 100 (24/11/2026)
+`nasdaq100.csv` (ticker;nom;secteur — 101 lignes, composition Wikipédia au 22/10/2026, à réviser après la reconstitution de décembre) ;
+`ndx_list()`, `INV_UNIVERSES` (défaut « S&P 500 + Nasdaq 100 »), `_inv_load(min_si, univers)` : grilles Dataroma S&P 500 + pour les valeurs
+du Nasdaq 100 absentes de la grille, `_ndx_extra` lit stock.php?sym=… (détenteurs, ▲ Buy/Add, ▼ Reduce/Sell ; trimestre précédent « n.d. »).
+Colonne « Indice », case « Nasdaq 100 seulement », titres d'export selon l'univers. Testé avec des pages simulées uniquement.
+
+## Grille « croissance de qualité » (fiche, sous « 2. En bref » ; aussi dans l'export PDF/Word)
+- `growth_grid(f, fv, cur)` : 4 blocs (Qualité : ROIC − CMPC, tendance de la marge d'EBITDA, FCF / résultat net ;
+  Solidité : dette nette / EBITDA, couverture des intérêts ; Croissance : CA, BNA hors rachats d'actions, FCF contre BNA ;
+  Prix : PEG, rendement du FCF). Chaque critère ✅ / ➖ / ⚠️ (seuils dans `GRID_NOTE`), verdict : « Candidate » si
+  JV > cours, ≥ 70 % de critères favorables, aucun ⚠️ sur la solidité ni sur le ROIC.
+- ROIC : champ Finviz `ROIC` (`f["roic_fv"]`), sinon estimé (Zonebourse : EBIT × 0,75 ÷ (fonds propres + dette nette) ;
+  Finviz : EBIT après impôt ÷ (actif net + dette nette)). CMPC = celui du DCF, sinon 9 % par défaut (signalé).
+- Effet de rebond (cyclique, redressement, pertes récentes) : BNA et PEG neutralisés (➖) avec une note.
+- Non applicable aux banques / assurances. Critères non mesurables = ligne absente.
+- Screener (idée, non implémentée) : pré-tri par les colonnes Finviz (ROIC, Debt/Eq, croissance BNA/CA, PEG) puis grille
+  complète sur les 20–30 meilleures seulement.
