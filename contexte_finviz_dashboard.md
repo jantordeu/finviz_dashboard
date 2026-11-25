@@ -364,3 +364,19 @@ Colonne « Indice », case « Nasdaq 100 seulement », titres d'export selon l'u
 ## Screener investors : reprise après interruption
 - `_dr_store()` (cache_resource) garde chaque fiche Dataroma lue 6 h : si le chargement est interrompu (clic dans un autre
   onglet), la relecture reprend où elle s'était arrêtée. `st.empty()` avant la relecture : plus de double barre.
+
+## Grille banques / assurances (`growth_grid_fin`)
+- `growth_grid` renvoie la grille financière quand `f["bank"]` ou `f["insurer"]` : ROE − coût des fonds propres (`_ke_bank`,
+  stocké par `fair_value_bank`), régularité du ROE (5 exercices, Zonebourse), BNA hors rachats, revenus, actif net par action
+  (3 ans), rendement · distribution, P/B payé contre P/B justifié (`_pb_just`), PER N+1 contre son historique.
+- Non disponibles : CET1 / Solvabilité II, ratio coûts / revenus, ratio combiné, qualité des actifs (rappelés dans le verdict).
+- Note propre à chaque grille dans `gg["note"]` (GRID_NOTE / GRID_NOTE_FIN). Le Screener JV utilise aussi cette grille (🏦).
+
+## Vérification d'ensemble du 25/11/2026
+- Analyse statique (pyflakes, ruff, pylint -E) sur les 10 fichiers : aucune erreur bloquante (noms indéfinis, appels
+  incorrects) ; restes sans effet : quelques variables et imports inutilisés.
+- Corrigé : doublon de `_cagr` (une seule définition gardée) ; grille croissance : pertes sur l'un des 3 derniers exercices
+  publiés = effet de rebond (BNA et PEG neutralisés, ex. Marvell PEG 0,29 n'est plus ✅).
+- Tests d'exécution hors ligne : 13 cas (Intel, Marvell, ASML, STMicro ; Finviz seul, Zonebourse seul, fusion ; cyclique
+  inversé ; banque / assureur forcés) × calcul, fiche à l'écran, PDF, Word ; application entière et 9 onglets ; Screener JV,
+  Screener investors (filtres de croisement), Gérants de référence avec pages simulées. Scripts : /tmp/zbt (non livrés).

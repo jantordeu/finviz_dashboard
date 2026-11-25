@@ -1530,6 +1530,7 @@ def fair_value_bank(f, p):
         v = lambda kk: bv * max(r - g, 0) / (kk - g)
         out.update({"P/B bas": v(k + 0.01), "P/B": v(k), "P/B haut": v(k - 0.01)})
         out.setdefault("_mult", {})["P/B"] = f"P/B justifié {v(k) / bv:.2f} × actif net {bv:.1f}"
+        out.update({"_ke_bank": k, "_pb_just": v(k) / bv, "_roe_bank": roe, "_bv_bank": bv, "_g_bank": g})   # grille financière
         out["notes"].append(f"Actif net {bv:.1f} × P/B justifié {v(k) / bv:.2f} (ROE {roe:.1f} %, coût des fonds propres "
                             f"{k * 100:.1f} %, g {g * 100:.1f} %)")
     eps = f["eps_next_y"]
@@ -3390,17 +3391,13 @@ GRID_NOTE = ("Seuils : ROIC − CMPC ≥ 3 pts ✅ (< 0 ⚠️) · dette nette/E
              "rendement du FCF ≥ 4 % ✅. Indicatif : à confirmer dans les publications ; non applicable aux banques / assurances.")
 
 
-def _cagr(a, b, n):
-    return ((b / a) ** (1 / n) - 1) * 100 if a and b and a > 0 and b > 0 and n and n > 0 else None
-
-
 def growth_grid(f, fv, cur=""):
     """Grille de lecture rapide d'une valeur de croissance, en 4 blocs (qualité, solidité, croissance, prix) :
     ROIC contre CMPC, marge, conversion en trésorerie, dette nette/EBITDA, couverture des intérêts, croissance du CA,
     du BNA (hors rachats) et du FCF, PEG, rendement du FCF. -> dict(rows[(bloc, critère, valeur, lecture, signe)],
-    verdict, pos, neg, n) ou None."""
+    verdict, pos, neg, n) ou None. Banques et assurances : grille financière (growth_grid_fin)."""
     if f.get("bank") or f.get("insurer"):
-        return None
+        return growth_grid_fin(f, fv, cur)
     z = f.get("zb") or {}
     N, L = z.get("N"), z.get("L")
     x = f.get("dcfx") or {}
@@ -3486,7 +3483,12 @@ def growth_grid(f, fv, cur=""):
         add("Croissance", "Chiffre d'affaires", f"{g_ca:+.1f} %/an".replace(".", ","), l_ca + (
             " — croissance soutenue" if g_ca >= 10 else " — modérée" if g_ca >= 5 else " — faible pour une valeur de croissance"),
             1 if g_ca >= 10 else (0 if g_ca >= 5 else -1))
-    rebound = bool(f.get("cyclical") or f.get("turnaround") or recent_losses(f))
+    # pertes sur l'un des 3 derniers exercices publiés : la croissance du BNA part d'une base déprimée (redressement)
+    if L:
+        loss3 = any(bna.get(y) is not None and bna[y] <= 0 for y in (L - 2, L - 1, L))
+    else:
+        loss3 = any(v is not None and v <= 0 for _, v in (f.get("eps_hist") or [])[-3:])
+    rebound = bool(f.get("cyclical") or f.get("turnaround") or recent_losses(f) or loss3)
     g = None
     if bna.get(L) and bna.get(N + 1 if N else 0) and bna[L] > 0 and N and N + 1 > L:
         g, l_g = _cagr(bna[L], bna[N + 1], N + 1 - L), f"BNA {L} → {N + 1}"
@@ -3572,7 +3574,146 @@ def growth_grid(f, fv, cur=""):
              + (f" ; points faibles : {', '.join(weak)}" if weak else "") + ").")
     if f.get("cyclical"):
         v += " ⚠️ Valeur cyclique : croissance et marges de haut de cycle, à lire avec prudence."
-    return {"rows": rows, "verdict": v, "pos": pos, "neg": neg, "n": n, "label": lab, "weak": weak}
+    return {"rows": rows, "verdict": v, "pos": pos, "neg": neg, "n": n, "label": lab, "weak": weak, "note": GRID_NOTE}
+
+
+GRID_NOTE_FIN = ("Grille banques / assurances. Seuils : ROE − coût des fonds propres ≥ 2 pts ✅ (< −1 ⚠️) · ROE le plus bas sur "
+                 "5 exercices ≥ 6 % ✅ (< 0 ⚠️) · BNA ≥ 8 %/an ✅ (< 3 % ⚠️), ⚠️ si la moitié vient des rachats · revenus "
+                 "≥ 5 %/an ✅ (< 2 % ⚠️) · actif net par action ≥ 5 %/an ✅ · dividende : rendement ≥ 3 % et distribution "
+                 "≤ 75 % ✅ (distribution > 100 % ⚠️) · P/B payé ≤ 0,85 × P/B justifié ✅ (> 1,1 ⚠️) · PER N+1 ≤ 0,85 × "
+                 "son niveau historique ✅ (> 1,15 ⚠️). Non disponibles ici : ratio de solvabilité (CET1 / Solvabilité II), "
+                 "ratio coûts / revenus ou ratio combiné, qualité des actifs — à lire dans les publications. Indicatif.")
+
+
+def growth_grid_fin(f, fv, cur=""):
+    """Grille de lecture rapide d'une banque ou d'une assurance : rentabilité (ROE contre coût des fonds propres,
+    régularité), croissance (BNA hors rachats, revenus, actif net par action), dividende, prix (P/B payé contre P/B
+    justifié, PER contre son historique). -> même structure que growth_grid ou None."""
+    z = f.get("zb") or {}
+    N, L = z.get("N"), z.get("L")
+    fx_ = lambda v, d=1: f"{v:.{d}f}".replace(".", ",")
+    rows = []
+    add = lambda b, c, v, t, s_: rows.append((b, c, v, t, s_))
+    # ---- rentabilité
+    ke = fv.get("_ke_bank")
+    roe = fv.get("_roe_bank")
+    if roe is None:
+        roe = (z.get("roe") or {}).get(N + 1) if N else None
+        roe = roe if roe is not None else f.get("roe_ttm")
+    if roe is not None:
+        if ke is None:
+            ke = 0.11 if not f.get("insurer") else 0.09
+        sp = roe - ke * 100
+        add("Rentabilité", "ROE − coût des fonds propres", f"{fx_(roe)} % − {fx_(ke * 100)} % = {sp:+.1f} pt".replace(".", ","),
+            ("crée de la valeur : le capital des actionnaires rapporte plus que son coût" if sp >= 2 else
+             "proche du coût des fonds propres" if sp >= -1 else "détruit de la valeur : rentabilité inférieure au coût du capital"),
+            1 if sp >= 2 else (0 if sp >= -1 else -1))
+    rh = [v for y, v in sorted((z.get("roe") or {}).items()) if v is not None and L and L - 4 <= y <= L]
+    if len(rh) >= 4:
+        lo = min(rh)
+        add("Rentabilité", "Régularité du ROE (5 exercices)", f"de {fx_(lo)} % à {fx_(max(rh))} %",
+            "rentabilité stable, y compris dans les mauvaises années" if lo >= 6 else
+            "rentabilité qui a fortement varié" if lo >= 0 else "au moins un exercice de pertes",
+            1 if lo >= 6 else (0 if lo >= 0 else -1))
+    # ---- croissance
+    bna = z.get("bna") or {}
+    g = l_g = None
+    if N and L and bna.get(L) and bna.get(N + 1) and bna[L] > 0 and N + 1 > L:
+        g, l_g = _cagr(bna[L], bna[N + 1], N + 1 - L), f"BNA {L} → {N + 1}"
+    elif f.get("eps_5y") is not None:
+        g, l_g = f["eps_5y"], "croissance annuelle attendue du BNA sur 5 ans (Finviz)"
+    elif f.get("eps_next_y_pct") is not None:
+        g, l_g = f["eps_next_y_pct"], "croissance attendue du BNA l'an prochain (Finviz)"
+    if g is not None:
+        dl = net_dilution(f)
+        bb = max(0.0, -dl["cagr"]) if dl else 0.0
+        s_g = 1 if g >= 8 else (0 if g >= 3 else -1)
+        t_g = l_g + (" — soutenue" if g >= 8 else " — modérée" if g >= 3 else " — faible")
+        if dl and g > 0 and bb >= 1:
+            t_g += f" ; dont {fx_(bb)} pt venant des rachats ({dl['y0']}–{dl['y1']})"
+            if bb >= 0.5 * g:
+                s_g, t_g = -1, t_g + " : croissance surtout financière"
+            elif bb >= 0.25 * g:
+                s_g = min(s_g, 0)
+        elif dl and dl["cagr"] >= 2:
+            t_g += f" ; nombre d'actions en hausse de {fx_(dl['cagr'])} %/an (dilution)"
+            s_g = min(s_g, 0)
+        add("Croissance", "BNA (hors rachats d'actions)", f"{g:+.0f} %/an", t_g, s_g)
+    g_ca = l_ca = None
+    if z.get("ca") and N and L and z["ca"].get(L) and z["ca"].get(N + 1) and N + 1 > L:
+        g_ca, l_ca = _cagr(z["ca"][L], z["ca"][N + 1], N + 1 - L), f"{L} → {N + 1}"
+    elif f.get("sales_g") is not None:
+        g_ca, l_ca = f["sales_g"], "médiane des croissances à 3 ans, 5 ans et 12 mois"
+    if g_ca is not None:
+        add("Croissance", "Revenus (PNB / primes)", f"{g_ca:+.1f} %/an".replace(".", ","), l_ca + (
+            " — dynamiques" if g_ca >= 5 else " — modérés" if g_ca >= 2 else " — stagnants"),
+            1 if g_ca >= 5 else (0 if g_ca >= 2 else -1))
+    bv = z.get("bvps") or {}
+    if L and bv.get(L) and bv.get(L - 3) and bv[L] > 0 and bv[L - 3] > 0:
+        gb = _cagr(bv[L - 3], bv[L], 3)
+        add("Croissance", "Actif net par action (3 ans)", f"{gb:+.1f} %/an".replace(".", ","),
+            "la valeur comptable par action progresse : les bénéfices sont conservés et valorisés" if gb >= 5 else
+            "progression modeste" if gb >= 0 else "recul de la valeur comptable par action", 1 if gb >= 5 else (0 if gb >= 0 else -1))
+    # ---- dividende
+    px, dv = f.get("price"), f.get("div_ps")
+    eps = f.get("eps_next_y") or f.get("eps_ttm")
+    if px and dv:
+        yl = dv / px * 100
+        pay = dv / eps * 100 if eps and eps > 0 else None
+        s_d = (1 if yl >= 3 and (pay is None or pay <= 75) else -1 if (pay is not None and pay > 100) else 0)
+        add("Dividende", "Rendement · distribution", f"{fx_(yl)} %" + (f" · {pay:.0f} % du BNA" if pay is not None else ""),
+            "dividende élevé et couvert par les bénéfices" if s_d == 1 else
+            "dividende supérieur aux bénéfices : non tenable durablement" if s_d == -1 else "dividende correct ou modeste", s_d)
+    # ---- prix
+    pbj = fv.get("_pb_just")
+    bv0 = fv.get("_bv_bank") or f.get("bvps")
+    if px and bv0 and bv0 > 0:
+        pb = px / bv0
+        if pbj:
+            r_ = pb / pbj
+            add("Prix", "P/B payé contre P/B justifié", f"{fx_(pb, 2)}x contre {fx_(pbj, 2)}x",
+                "le cours est sous la valeur que justifie la rentabilité" if r_ <= 0.85 else
+                "cours proche de la valeur justifiée" if r_ <= 1.1 else "le cours paie plus que la rentabilité ne justifie",
+                1 if r_ <= 0.85 else (0 if r_ <= 1.1 else -1))
+        else:
+            add("Prix", "P/B", f"{fx_(pb, 2)}x", "actif net par action de référence", 0)
+    if f.get("fwd_pe") and f["fwd_pe"] > 0:
+        ph = f.get("pe_hist")
+        if ph:
+            r_ = f["fwd_pe"] / ph
+            add("Prix", "PER N+1 contre PER historique", f"{fx_(f['fwd_pe'])}x contre {fx_(ph)}x",
+                "décote par rapport à son historique" if r_ <= 0.85 else
+                "dans la norme historique" if r_ <= 1.15 else "prime par rapport à son historique",
+                1 if r_ <= 0.85 else (0 if r_ <= 1.15 else -1))
+        else:
+            lim = 10 if not f.get("insurer") else 12
+            add("Prix", "PER N+1", f"{fx_(f['fwd_pe'])}x", "bas" if f["fwd_pe"] <= lim else "élevé pour le secteur",
+                1 if f["fwd_pe"] <= lim else (0 if f["fwd_pe"] <= lim * 1.4 else -1))
+    if not rows:
+        return None
+    pos, neg, n = sum(r[4] > 0 for r in rows), sum(r[4] < 0 for r in rows), len(rows)
+    weak = [r[1] for r in rows if r[4] < 0]
+    red_roe = any(r[1] == "ROE − coût des fonds propres" and r[4] < 0 for r in rows)
+    jv, pr = fv.get("JV centrale"), f.get("price")
+    cheap = bool(jv and pr and jv > pr)
+    solid = pos / n >= 0.7 and not red_roe
+    lab = ("✅ Candidate" if cheap and solid else "À étudier" if cheap else "Attendre le prix" if solid and jv
+           else "Non démontré")
+    if cheap and solid:
+        v = (f"✅ Candidate : {pos} critères favorables sur {n}, rentabilité supérieure au coût du capital, et la juste "
+             f"valeur ({jv:.0f} {cur}) dépasse le cours ({pr:.0f} {cur}).")
+    elif cheap:
+        v = (f"À étudier : la juste valeur ({jv:.0f} {cur}) dépasse le cours ({pr:.0f} {cur}) mais le profil est "
+             f"incomplet ({pos} favorables sur {n}" + (f" ; points faibles : {', '.join(weak)}" if weak else "") + ").")
+    elif solid:
+        v = (f"Profil solide ({pos} critères favorables sur {n}) mais la juste valeur "
+             f"({jv:.0f} {cur}) ne dépasse pas le cours : attendre un meilleur prix." if jv else
+             f"Profil solide ({pos} favorables sur {n}) mais juste valeur non calculée.")
+    else:
+        v = (f"Profil de qualité non démontré ({pos} favorables sur {n}"
+             + (f" ; points faibles : {', '.join(weak)}" if weak else "") + ").")
+    v += " Vérifier la solvabilité (CET1 / Solvabilité II) et le ratio coûts / revenus dans les publications."
+    return {"rows": rows, "verdict": v, "pos": pos, "neg": neg, "n": n, "label": lab, "weak": weak, "note": GRID_NOTE_FIN}
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -6642,7 +6783,7 @@ def report_model(f, d, t):
         B.append(("p", "Grille croissance de qualité : " + gg_["verdict"]))
         B.append(("table", ["", "Bloc", "Critère", "Valeur", "Lecture"],
                   [[ICON_P[r[4]], r[0], r[1], r[2], r[3]] for r in gg_["rows"]]))
-        B.append(("p", GRID_NOTE))
+        B.append(("p", gg_.get("note", GRID_NOTE)))
     # 3
     B.append(("h", "3. Bénéfice par action (BNA)"))
     ser = _eps_series(f)
@@ -7641,7 +7782,7 @@ def render_detail(f, d, t=None, ns=""):
             st.markdown(_md(gg_["verdict"]))
             st.dataframe(pd.DataFrame([{"": ICON_P[r[4]], "Bloc": r[0], "Critère": r[1], "Valeur": r[2], "Lecture": r[3]}
                                        for r in gg_["rows"]]), hide_index=True, width="stretch")
-            st.caption(GRID_NOTE)
+            st.caption(gg_.get("note", GRID_NOTE))
     # ---------- 3. Bénéfice par action
     st.markdown("##### 3. Bénéfice par action (BNA)")
     ser = _eps_series(f)
